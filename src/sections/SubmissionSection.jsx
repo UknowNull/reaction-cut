@@ -1,0 +1,3487 @@
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { invokeCommand } from "../lib/tauri";
+import { formatDateTime } from "../lib/format";
+
+const statusFilters = [
+  { value: "ALL", label: "全部" },
+  { value: "PENDING", label: "待处理" },
+  { value: "CLIPPING", label: "剪辑中" },
+  { value: "MERGING", label: "合并中" },
+  { value: "SEGMENTING", label: "分段中" },
+  { value: "RUNNING", label: "处理中" },
+  { value: "WAITING_UPLOAD", label: "投稿队列中" },
+  { value: "UPLOADING", label: "投稿中" },
+  { value: "COMPLETED", label: "已完成" },
+  { value: "FAILED", label: "失败" },
+  { value: "CANCELLED", label: "已取消" },
+];
+
+const emptySource = (index) => ({
+  sourceFilePath: "",
+  sortOrder: index + 1,
+  startTime: "00:00:00",
+  endTime: "00:00:00",
+  durationSeconds: 0,
+});
+
+const defaultWorkflowConfig = {
+  segmentationConfig: {
+    segmentDurationSeconds: 133,
+    preserveOriginal: true,
+  },
+};
+
+export default function SubmissionSection() {
+  const [taskForm, setTaskForm] = useState({
+    title: "",
+    description: "",
+    partitionId: "",
+    collectionId: "",
+    videoType: "ORIGINAL",
+    segmentPrefix: "",
+  });
+  const [tagInput, setTagInput] = useState("");
+  const [tags, setTags] = useState([]);
+  const [segmentationEnabled, setSegmentationEnabled] = useState(true);
+  const [sourceVideos, setSourceVideos] = useState([emptySource(0)]);
+  const [workflowConfig, setWorkflowConfig] = useState(defaultWorkflowConfig);
+  const [partitions, setPartitions] = useState([]);
+  const [collections, setCollections] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [totalTasks, setTotalTasks] = useState(0);
+  const [selectedTask, setSelectedTask] = useState(null);
+  const [detailTab, setDetailTab] = useState("basic");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
+  const [statusFilter, setStatusFilter] = useState("ALL");
+  const [message, setMessage] = useState("");
+  const [refreshingRemote, setRefreshingRemote] = useState(false);
+  const [submissionView, setSubmissionView] = useState("list");
+  const [deleteTargetId, setDeleteTargetId] = useState("");
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [quickFillOpen, setQuickFillOpen] = useState(false);
+  const [quickFillTasks, setQuickFillTasks] = useState([]);
+  const [quickFillPage, setQuickFillPage] = useState(1);
+  const [quickFillTotal, setQuickFillTotal] = useState(0);
+  const [updateOpen, setUpdateOpen] = useState(false);
+  const [resegmentOpen, setResegmentOpen] = useState(false);
+  const [resegmentTaskId, setResegmentTaskId] = useState("");
+  const [resegmentDefaultSeconds, setResegmentDefaultSeconds] = useState(0);
+  const [resegmentSeconds, setResegmentSeconds] = useState("");
+  const [resegmentSubmitting, setResegmentSubmitting] = useState(false);
+  const [resegmentVideoSeconds, setResegmentVideoSeconds] = useState(0);
+  const [updateTaskId, setUpdateTaskId] = useState("");
+  const [updateSourceVideos, setUpdateSourceVideos] = useState([emptySource(0)]);
+  const [updateSegmentationEnabled, setUpdateSegmentationEnabled] = useState(true);
+  const [updateWorkflowConfig, setUpdateWorkflowConfig] = useState(defaultWorkflowConfig);
+  const [updateSegmentPrefix, setUpdateSegmentPrefix] = useState("");
+  const [updateSubmitting, setUpdateSubmitting] = useState(false);
+  const [retryingSegmentIds, setRetryingSegmentIds] = useState(() => new Set());
+  const [editSegments, setEditSegments] = useState([]);
+  const editSegmentsRef = useRef([]);
+  const [pendingEditUploads, setPendingEditUploads] = useState(0);
+  const [editingSegmentId, setEditingSegmentId] = useState("");
+  const [editingSegmentName, setEditingSegmentName] = useState("");
+  const [draggingSegmentId, setDraggingSegmentId] = useState("");
+  const [submittingEdit, setSubmittingEdit] = useState(false);
+  const lastDetailTaskIdRef = useRef(null);
+  const lastEditTaskIdRef = useRef(null);
+  const dragStateRef = useRef({ activeId: "", overId: "" });
+  const isCreateView = submissionView === "create";
+  const isDetailView = submissionView === "detail";
+  const isEditView = submissionView === "edit";
+  const isReadOnly = isDetailView;
+  const quickFillPageSize = 10;
+
+  useEffect(() => {
+    editSegmentsRef.current = editSegments;
+  }, [editSegments]);
+
+  useEffect(() => {
+    const nextCount = editSegments.filter(
+      (segment) =>
+        segment.uploadStatus === "UPLOADING" ||
+        segment.uploadStatus === "RATE_LIMITED",
+    ).length;
+    setPendingEditUploads((prev) => (prev === nextCount ? prev : nextCount));
+  }, [editSegments]);
+
+  const formatDurationHms = (seconds) => {
+    const totalSeconds = Math.max(0, Math.floor(seconds || 0));
+    const hrs = Math.floor(totalSeconds / 3600);
+    const mins = Math.floor((totalSeconds % 3600) / 60);
+    const secs = totalSeconds % 60;
+    return `${String(hrs).padStart(2, "0")}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+  };
+
+  const parseHmsToSeconds = (value) => {
+    if (!value) {
+      return null;
+    }
+    const parts = value.split(":").map((part) => Number(part));
+    if (parts.length !== 3 || parts.some((item) => Number.isNaN(item))) {
+      return null;
+    }
+    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  };
+
+  const clampTimeSeconds = (seconds, maxSeconds) => {
+    const clamped = Math.max(0, seconds);
+    if (Number.isFinite(maxSeconds) && maxSeconds > 0) {
+      return Math.min(clamped, maxSeconds);
+    }
+    return clamped;
+  };
+
+  const normalizeTimeValue = (value, maxSeconds) => {
+    const parsed = parseHmsToSeconds(value);
+    if (parsed === null) {
+      return null;
+    }
+    const clamped = clampTimeSeconds(parsed, maxSeconds);
+    return formatDurationHms(clamped);
+  };
+
+  const isVideoFilePath = (path) => {
+    if (!path) {
+      return false;
+    }
+    return /\.(mp4|mkv|mov|flv|avi|webm)$/i.test(path);
+  };
+
+  const resetFormState = () => {
+    setTaskForm({
+      title: "",
+      description: "",
+      partitionId: "",
+      collectionId: "",
+      videoType: "ORIGINAL",
+      segmentPrefix: "",
+    });
+    setTagInput("");
+    setTags([]);
+    setSegmentationEnabled(true);
+    setSourceVideos([emptySource(0)]);
+    setWorkflowConfig(defaultWorkflowConfig);
+  };
+
+  const resetUpdateState = () => {
+    setUpdateTaskId("");
+    setUpdateSourceVideos([emptySource(0)]);
+    setUpdateSegmentationEnabled(true);
+    setUpdateWorkflowConfig(defaultWorkflowConfig);
+    setUpdateSegmentPrefix("");
+    setUpdateSubmitting(false);
+  };
+
+  const openCreateView = async () => {
+    setSubmissionView("create");
+    setSelectedTask(null);
+    setMessage("");
+    setQuickFillOpen(false);
+    resetFormState();
+    await loadPartitions();
+    await loadCollections();
+  };
+
+  const openUpdateModal = (task) => {
+    setMessage("");
+    setUpdateOpen(true);
+    setUpdateTaskId(task?.taskId || "");
+    setUpdateSegmentPrefix(task?.segmentPrefix || "");
+    setUpdateSourceVideos([emptySource(0)]);
+    setUpdateSegmentationEnabled(true);
+    setUpdateWorkflowConfig(defaultWorkflowConfig);
+    setUpdateSubmitting(false);
+  };
+
+  const closeUpdateModal = () => {
+    setUpdateOpen(false);
+    resetUpdateState();
+    setMessage("");
+  };
+
+  const openResegmentModal = async (taskId) => {
+    const targetId = String(taskId || "").trim();
+    if (!targetId) {
+      return;
+    }
+    setMessage("");
+    setResegmentOpen(true);
+    setResegmentTaskId(targetId);
+    setResegmentDefaultSeconds(0);
+    setResegmentSeconds("");
+    setResegmentSubmitting(false);
+    setResegmentVideoSeconds(0);
+    try {
+      const detail = await invokeCommand("submission_detail", { taskId: targetId });
+      const seconds = Number(
+        detail?.workflowConfig?.segmentationConfig?.segmentDurationSeconds,
+      );
+      const resolvedSeconds = Number.isFinite(seconds) ? seconds : 0;
+      setResegmentDefaultSeconds(resolvedSeconds);
+      setResegmentSeconds(resolvedSeconds ? String(resolvedSeconds) : "");
+      const mergedPath = detail?.mergedVideos?.[0]?.videoPath || "";
+      if (mergedPath) {
+        const duration = await invokeCommand("video_duration", { path: mergedPath });
+        const durationSeconds = Number(duration);
+        setResegmentVideoSeconds(Number.isFinite(durationSeconds) ? durationSeconds : 0);
+      }
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const closeResegmentModal = () => {
+    setResegmentOpen(false);
+    setResegmentTaskId("");
+    setResegmentDefaultSeconds(0);
+    setResegmentSeconds("");
+    setResegmentSubmitting(false);
+    setResegmentVideoSeconds(0);
+    setMessage("");
+  };
+
+  const clearEditUploadCache = async (taskId) => {
+    const targetId = String(taskId || "").trim();
+    if (!targetId) {
+      return;
+    }
+    try {
+      await invokeCommand("submission_edit_upload_clear", {
+        request: { taskId: targetId },
+      });
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const backToList = () => {
+    if (submissionView === "edit") {
+      const taskId = selectedTask?.task?.taskId || lastEditTaskIdRef.current;
+      if (taskId) {
+        clearEditUploadCache(taskId);
+      }
+    }
+    setSubmissionView("list");
+    setMessage("");
+    setSelectedTask(null);
+    setEditSegments([]);
+    setEditingSegmentId("");
+    setEditingSegmentName("");
+    setDraggingSegmentId("");
+    setSubmittingEdit(false);
+    setQuickFillOpen(false);
+  };
+
+  const loadPartitions = async () => {
+    try {
+      const data = await invokeCommand("bilibili_partitions");
+      setPartitions(data || []);
+      if ((data || []).length) {
+        setTaskForm((prev) => {
+          if (prev.partitionId) {
+            return prev;
+          }
+          return { ...prev, partitionId: String(data[0].tid) };
+        });
+      }
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const loadCollections = async () => {
+    try {
+      await invokeCommand("auth_client_log", {
+        message: "collections_load_start",
+      });
+      const auth = await invokeCommand("auth_status");
+      await invokeCommand("auth_client_log", {
+        message: `collections_auth_status loggedIn=${auth?.loggedIn ? "1" : "0"}`,
+      });
+      if (!auth?.loggedIn) {
+        setCollections([]);
+        return;
+      }
+      const userInfo = auth?.userInfo || {};
+      const level1 = userInfo?.data || userInfo;
+      const level2 = level1?.data || level1;
+      const mid = level2?.mid || level1?.mid || userInfo?.mid || 0;
+      await invokeCommand("auth_client_log", {
+        message: `collections_mid=${mid || 0}`,
+      });
+      const data = await invokeCommand("bilibili_collections", { mid: mid || 0 });
+      const mapped = (data || []).map((item) => ({
+        ...item,
+        seasonId: item.season_id ?? item.seasonId,
+      }));
+      setCollections(mapped);
+      await invokeCommand("auth_client_log", {
+        message: `collections_load_ok count=${mapped.length}`,
+      });
+    } catch (error) {
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `collections_load_fail err=${error?.message || String(error || "")}`,
+        });
+      } catch (_) {
+      }
+      setMessage(error.message);
+    }
+  };
+
+  const loadTasks = async (
+    filter = statusFilter,
+    page = currentPage,
+    size = pageSize,
+    refreshRemote = false,
+  ) => {
+    try {
+      const payload = { page, page_size: size };
+      if (refreshRemote) {
+        payload.refresh_remote = true;
+      }
+      const data =
+        filter === "ALL"
+          ? await invokeCommand("submission_list", payload)
+          : await invokeCommand("submission_list_by_status", {
+              status: filter,
+              ...payload,
+            });
+      const items = data?.items || [];
+      const total = Number(data?.total) || 0;
+      setTasks(items);
+      setTotalTasks(total);
+      const maxPage = Math.max(1, Math.ceil(total / size));
+      if (page > maxPage) {
+        setCurrentPage(maxPage);
+      }
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const loadQuickFillTasks = async (page = quickFillPage) => {
+    try {
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `quick_fill_request page=${page} size=${quickFillPageSize}`,
+        });
+      } catch (_) {}
+      const data = await invokeCommand("submission_list", {
+        page,
+        page_size: quickFillPageSize,
+        pageSize: quickFillPageSize,
+      });
+      const items = data?.items || [];
+      const total = Number(data?.total) || 0;
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `quick_fill_response page=${page} items=${items.length} total=${total}`,
+        });
+      } catch (_) {}
+      setQuickFillTasks(items);
+      setQuickFillTotal(total);
+      const maxPage = Math.max(1, Math.ceil(total / quickFillPageSize));
+      if (page > maxPage) {
+        setQuickFillPage(maxPage);
+      }
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  useEffect(() => {
+    loadPartitions();
+    loadCollections();
+  }, []);
+
+  useEffect(() => {
+    if (!isDetailView && !isEditView) {
+      lastDetailTaskIdRef.current = null;
+      lastEditTaskIdRef.current = null;
+      return;
+    }
+    const taskId = selectedTask?.task?.taskId;
+    if (!taskId) {
+      return;
+    }
+    if (isDetailView) {
+      if (lastDetailTaskIdRef.current === taskId) {
+        return;
+      }
+      lastDetailTaskIdRef.current = taskId;
+      applyDetailToForm(selectedTask);
+      return;
+    }
+    if (isEditView) {
+      if (lastEditTaskIdRef.current === taskId) {
+        return;
+      }
+      lastEditTaskIdRef.current = taskId;
+      applyDetailToForm(selectedTask);
+      initEditSegments(selectedTask);
+    }
+  }, [submissionView, selectedTask, isDetailView, isEditView]);
+
+  useEffect(() => {
+    if (submissionView !== "list") {
+      return undefined;
+    }
+    loadTasks(statusFilter, currentPage, pageSize);
+    return undefined;
+  }, [submissionView, statusFilter, currentPage, pageSize]);
+
+  useEffect(() => {
+    if (submissionView !== "list") {
+      return undefined;
+    }
+    const timer = setInterval(() => {
+      loadTasks(statusFilter, currentPage, pageSize);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [submissionView, statusFilter, currentPage, pageSize]);
+
+  useEffect(() => {
+    if (!quickFillOpen) {
+      return undefined;
+    }
+    loadQuickFillTasks(quickFillPage);
+    return undefined;
+  }, [quickFillOpen, quickFillPage]);
+
+  useEffect(() => {
+    if (!isDetailView || !selectedTask?.task?.taskId) {
+      return undefined;
+    }
+    let active = true;
+    const taskId = selectedTask.task.taskId;
+    const refreshDetail = async () => {
+      try {
+        const detail = await fetchTaskDetail(taskId, { log: false });
+        if (!active) {
+          return;
+        }
+        setSelectedTask(detail);
+      } catch (error) {
+        if (active) {
+          setMessage(error.message);
+        }
+      }
+    };
+    refreshDetail();
+    const timer = setInterval(refreshDetail, 3000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [submissionView, selectedTask?.task?.taskId, isDetailView]);
+
+  useEffect(() => {
+    if (!isEditView || !selectedTask?.task?.taskId || pendingEditUploads === 0) {
+      return undefined;
+    }
+    let active = true;
+    const taskId = selectedTask.task.taskId;
+    const refreshStatus = async () => {
+      const pendingIds = (editSegmentsRef.current || [])
+        .filter(
+          (segment) =>
+            segment.uploadStatus === "UPLOADING" ||
+            segment.uploadStatus === "RATE_LIMITED",
+        )
+        .map((segment) => segment.segmentId);
+      if (!pendingIds.length) {
+        return;
+      }
+      try {
+        const updates = await invokeCommand("submission_edit_upload_status", {
+          request: {
+            taskId,
+            segmentIds: pendingIds,
+          },
+        });
+        if (!active) {
+          return;
+        }
+        setEditSegments((prev) => mergeEditUploadStatus(prev, updates || []));
+      } catch (error) {
+        if (active) {
+          setMessage(error.message);
+        }
+      }
+    };
+    refreshStatus();
+    const timer = setInterval(refreshStatus, 2000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [isEditView, pendingEditUploads, selectedTask?.task?.taskId]);
+
+  const openFileDialog = async (index) => {
+    await handleSelectSourceFile(index);
+  };
+
+  const addSource = () => {
+    setSourceVideos((prev) => [...prev, emptySource(prev.length)]);
+  };
+
+  const updateSource = (index, field, value) => {
+    setSourceVideos((prev) =>
+      prev.map((item, idx) => (idx === index ? { ...item, [field]: value } : item)),
+    );
+  };
+
+  const updateSourceTime = (index, field, value) => {
+    setSourceVideos((prev) =>
+      prev.map((item, idx) => {
+        if (idx !== index) {
+          return item;
+        }
+        return { ...item, [field]: value };
+      }),
+    );
+  };
+
+  const normalizeSourceTime = (index, field) => {
+    setSourceVideos((prev) =>
+      prev.map((item, idx) => {
+        if (idx !== index) {
+          return item;
+        }
+        const normalized = normalizeTimeValue(item[field], item.durationSeconds);
+        if (!normalized) {
+          return { ...item, [field]: formatDurationHms(0) };
+        }
+        return { ...item, [field]: normalized };
+      }),
+    );
+  };
+
+  const removeSource = (index) => {
+    setSourceVideos((prev) =>
+      prev
+        .filter((_, idx) => idx !== index)
+        .map((item, idx) => ({ ...item, sortOrder: idx + 1 })),
+    );
+  };
+
+  const addUpdateSource = () => {
+    setUpdateSourceVideos((prev) => [...prev, emptySource(prev.length)]);
+  };
+
+  const updateUpdateSource = (index, field, value) => {
+    setUpdateSourceVideos((prev) =>
+      prev.map((item, idx) => (idx === index ? { ...item, [field]: value } : item)),
+    );
+  };
+
+  const updateUpdateSourceTime = (index, field, value) => {
+    setUpdateSourceVideos((prev) =>
+      prev.map((item, idx) => {
+        if (idx !== index) {
+          return item;
+        }
+        return { ...item, [field]: value };
+      }),
+    );
+  };
+
+  const normalizeUpdateSourceTime = (index, field) => {
+    setUpdateSourceVideos((prev) =>
+      prev.map((item, idx) => {
+        if (idx !== index) {
+          return item;
+        }
+        const normalized = normalizeTimeValue(item[field], item.durationSeconds);
+        if (!normalized) {
+          return { ...item, [field]: formatDurationHms(0) };
+        }
+        return { ...item, [field]: normalized };
+      }),
+    );
+  };
+
+  const removeUpdateSource = (index) => {
+    setUpdateSourceVideos((prev) =>
+      prev
+        .filter((_, idx) => idx !== index)
+        .map((item, idx) => ({ ...item, sortOrder: idx + 1 })),
+    );
+  };
+
+  const buildWorkflowConfig = () => {
+    return {
+      enableSegmentation: segmentationEnabled,
+      segmentationConfig: {
+        enabled: segmentationEnabled,
+        segmentDurationSeconds: workflowConfig.segmentationConfig.segmentDurationSeconds,
+        preserveOriginal: workflowConfig.segmentationConfig.preserveOriginal,
+      },
+    };
+  };
+
+  const buildUpdateWorkflowConfig = () => {
+    const prefix = updateSegmentPrefix.trim();
+    return {
+      enableSegmentation: updateSegmentationEnabled,
+      segmentationConfig: {
+        enabled: updateSegmentationEnabled,
+        segmentDurationSeconds: updateWorkflowConfig.segmentationConfig.segmentDurationSeconds,
+        preserveOriginal: updateWorkflowConfig.segmentationConfig.preserveOriginal,
+      },
+      segmentPrefix: prefix ? prefix : null,
+    };
+  };
+
+  const addTag = (value) => {
+    const nextTag = value.trim();
+    if (!nextTag) {
+      return;
+    }
+    if (tags.includes(nextTag)) {
+      return;
+    }
+    setTags((prev) => [...prev, nextTag]);
+  };
+
+  const removeTag = (target) => {
+    setTags((prev) => prev.filter((tag) => tag !== target));
+  };
+
+  const handleTagKeyDown = (event) => {
+    if (event.key !== "Enter") {
+      return;
+    }
+    event.preventDefault();
+    addTag(tagInput);
+    setTagInput("");
+  };
+
+  const handleCreate = async () => {
+    setMessage("");
+    if (!taskForm.title.trim()) {
+      setMessage("请输入投稿标题");
+      return;
+    }
+    if (taskForm.title.length > 80) {
+      setMessage("投稿标题不能超过 80 个字符");
+      return;
+    }
+    if (!taskForm.partitionId) {
+      setMessage("请选择B站分区");
+      return;
+    }
+    if (!taskForm.videoType) {
+      setMessage("请选择视频类型");
+      return;
+    }
+    if (taskForm.description && taskForm.description.length > 2000) {
+      setMessage("视频描述不能超过 2000 个字符");
+      return;
+    }
+    const normalizedTags = [...tags];
+    if (tagInput.trim()) {
+      normalizedTags.push(tagInput.trim());
+    }
+    const uniqueTags = Array.from(new Set(normalizedTags));
+    if (uniqueTags.length === 0) {
+      setMessage("请填写至少一个投稿标签");
+      return;
+    }
+    if (segmentationEnabled) {
+      const segmentDuration = workflowConfig.segmentationConfig.segmentDurationSeconds;
+      if (segmentDuration < 30 || segmentDuration > 600) {
+        setMessage("分段时长必须在 30-600 秒之间");
+        return;
+      }
+    }
+    const validSources = sourceVideos.filter((item) => item.sourceFilePath.trim());
+    if (validSources.length === 0) {
+      setMessage("请至少添加一个源视频");
+      return;
+    }
+    const invalidSource = validSources.find(
+      (item) => !isVideoFilePath(item.sourceFilePath),
+    );
+    if (invalidSource) {
+      setMessage("源视频仅支持常见视频格式");
+      return;
+    }
+    const invalidTime = validSources.find((item) => {
+      const start = parseHmsToSeconds(item.startTime);
+      const end = parseHmsToSeconds(item.endTime);
+      if (start === null || end === null) {
+        return true;
+      }
+      if (start < 0 || end < 0) {
+        return true;
+      }
+      if (item.durationSeconds > 0 && end > item.durationSeconds) {
+        return true;
+      }
+      return false;
+    });
+    if (invalidTime) {
+      setMessage("时间范围不合法，请检查开始与结束时间");
+      return;
+    }
+    try {
+      const payload = {
+        request: {
+          task: {
+            title: taskForm.title,
+            description: taskForm.description || null,
+            coverUrl: null,
+            partitionId: Number(taskForm.partitionId),
+            collectionId: taskForm.collectionId ? Number(taskForm.collectionId) : null,
+            tags: uniqueTags.join(","),
+            videoType: taskForm.videoType,
+            segmentPrefix: taskForm.segmentPrefix || null,
+          },
+          sourceVideos: validSources.map((item, index) => ({
+            sourceFilePath: item.sourceFilePath,
+            sortOrder: index + 1,
+            startTime: item.startTime || null,
+            endTime: item.endTime || null,
+          })),
+          workflowConfig: buildWorkflowConfig(),
+        },
+      };
+      await invokeCommand("submission_create", payload);
+      await loadTasks();
+      setSubmissionView("list");
+      setMessage("");
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleUpdateSubmit = async () => {
+    if (updateSubmitting) {
+      return;
+    }
+    setMessage("");
+    const taskId = updateTaskId.trim();
+    if (!taskId) {
+      setMessage("任务ID无效");
+      return;
+    }
+    if (updateSegmentationEnabled) {
+      const segmentDuration = updateWorkflowConfig.segmentationConfig.segmentDurationSeconds;
+      if (segmentDuration < 30 || segmentDuration > 600) {
+        setMessage("分段时长必须在 30-600 秒之间");
+        return;
+      }
+    }
+    const validSources = updateSourceVideos.filter((item) => item.sourceFilePath.trim());
+    if (validSources.length === 0) {
+      setMessage("请至少添加一个源视频");
+      return;
+    }
+    const invalidSource = validSources.find(
+      (item) => !isVideoFilePath(item.sourceFilePath),
+    );
+    if (invalidSource) {
+      setMessage("源视频仅支持常见视频格式");
+      return;
+    }
+    const invalidTime = validSources.find((item) => {
+      const start = parseHmsToSeconds(item.startTime);
+      const end = parseHmsToSeconds(item.endTime);
+      if (start === null || end === null) {
+        return true;
+      }
+      if (start < 0 || end < 0) {
+        return true;
+      }
+      if (item.durationSeconds > 0 && end > item.durationSeconds) {
+        return true;
+      }
+      return false;
+    });
+    if (invalidTime) {
+      setMessage("时间范围不合法，请检查开始与结束时间");
+      return;
+    }
+    setUpdateSubmitting(true);
+    try {
+      const payload = {
+        request: {
+          taskId,
+          sourceVideos: validSources.map((item, index) => ({
+            sourceFilePath: item.sourceFilePath,
+            sortOrder: index + 1,
+            startTime: item.startTime || null,
+            endTime: item.endTime || null,
+          })),
+          workflowConfig: buildUpdateWorkflowConfig(),
+        },
+      };
+      await invokeCommand("submission_update", payload);
+      closeUpdateModal();
+      await loadTasks(statusFilter, currentPage, pageSize);
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setUpdateSubmitting(false);
+    }
+  };
+
+  const handleSelectSourceFile = async (index) => {
+    setMessage("");
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [
+          {
+            name: "视频文件",
+            extensions: ["mp4", "mkv", "mov", "flv", "avi", "webm"],
+          },
+        ],
+      });
+      if (typeof selected !== "string") {
+        return;
+      }
+      const duration = await invokeCommand("video_duration", { path: selected });
+      const durationSeconds = Number(duration) || 0;
+      setSourceVideos((prev) =>
+        prev.map((item, idx) => {
+          if (idx !== index) {
+            return item;
+          }
+          const endTime = durationSeconds
+            ? formatDurationHms(durationSeconds)
+            : item.endTime;
+          const startTime = normalizeTimeValue(item.startTime, durationSeconds) || "00:00:00";
+          return {
+            ...item,
+            sourceFilePath: selected,
+            durationSeconds,
+            startTime,
+            endTime,
+          };
+        }),
+      );
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleUpdateSelectSourceFile = async (index) => {
+    setMessage("");
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [
+          {
+            name: "视频文件",
+            extensions: ["mp4", "mkv", "mov", "flv", "avi", "webm"],
+          },
+        ],
+      });
+      if (typeof selected !== "string") {
+        return;
+      }
+      const duration = await invokeCommand("video_duration", { path: selected });
+      const durationSeconds = Number(duration) || 0;
+      setUpdateSourceVideos((prev) =>
+        prev.map((item, idx) => {
+          if (idx !== index) {
+            return item;
+          }
+          const endTime = durationSeconds
+            ? formatDurationHms(durationSeconds)
+            : item.endTime;
+          const startTime = normalizeTimeValue(item.startTime, durationSeconds) || "00:00:00";
+          return {
+            ...item,
+            sourceFilePath: selected,
+            durationSeconds,
+            startTime,
+            endTime,
+          };
+        }),
+      );
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleOpenBvid = async (bvid) => {
+    if (!bvid) {
+      return;
+    }
+    try {
+      await openUrl(`https://www.bilibili.com/video/${bvid}`);
+    } catch (error) {
+      setMessage(error?.message || "打开视频链接失败");
+    }
+  };
+
+  const applyTaskSummaryToForm = (task) => {
+    if (!task) {
+      return;
+    }
+    const tagList = String(task.tags || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item);
+    setTaskForm((prev) => ({
+      ...prev,
+      title: task.title || "",
+      description: task.description || "",
+      partitionId: task.partitionId ? String(task.partitionId) : "",
+      collectionId: task.collectionId ? String(task.collectionId) : "",
+      videoType: task.videoType || "ORIGINAL",
+    }));
+    setTags(tagList);
+    setTagInput("");
+  };
+
+  const openQuickFill = () => {
+    if (isReadOnly) {
+      return;
+    }
+    setMessage("");
+    setQuickFillTasks([]);
+    setQuickFillTotal(0);
+    setQuickFillPage(1);
+    setQuickFillOpen(true);
+  };
+
+  const closeQuickFill = () => {
+    setQuickFillOpen(false);
+  };
+
+  const handleQuickFillSelect = (task) => {
+    applyTaskSummaryToForm(task);
+    setQuickFillOpen(false);
+  };
+
+  const applyDetailToForm = (detail) => {
+    const task = detail?.task || {};
+    const tagList = String(task.tags || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item);
+    setTaskForm({
+      title: task.title || "",
+      description: task.description || "",
+      partitionId: task.partitionId ? String(task.partitionId) : "",
+      collectionId: task.collectionId ? String(task.collectionId) : "",
+      videoType: task.videoType || "ORIGINAL",
+      segmentPrefix: task.segmentPrefix || "",
+    });
+    setTags(tagList);
+    setTagInput("");
+    const config = detail?.workflowConfig || {};
+    const segmentation = config?.segmentationConfig || {};
+    const enableSegmentation =
+      typeof segmentation.enabled === "boolean"
+        ? segmentation.enabled
+        : Boolean(config?.enableSegmentation);
+    setSegmentationEnabled(enableSegmentation);
+    setWorkflowConfig({
+      segmentationConfig: {
+        segmentDurationSeconds: Number(segmentation.segmentDurationSeconds || 133),
+        preserveOriginal:
+          typeof segmentation.preserveOriginal === "boolean"
+            ? segmentation.preserveOriginal
+            : true,
+      },
+    });
+    const sources = (detail?.sourceVideos || []).map((item, index) => ({
+      sourceFilePath: item.sourceFilePath || "",
+      sortOrder: index + 1,
+      startTime: item.startTime || "00:00:00",
+      endTime: item.endTime || "00:00:00",
+      durationSeconds: 0,
+    }));
+    setSourceVideos(sources.length ? sources : [emptySource(0)]);
+  };
+
+  const initEditSegments = (detail) => {
+    const segments = (detail?.outputSegments || []).map((segment) => ({ ...segment }));
+    setEditSegments(segments);
+    setEditingSegmentId("");
+    setEditingSegmentName("");
+    setDraggingSegmentId("");
+  };
+
+  const mergeEditUploadStatus = (current, updates) => {
+    if (!updates || updates.length === 0) {
+      return current;
+    }
+    const updateMap = new Map(
+      updates.map((segment) => [segment.segmentId, segment]),
+    );
+    return current.map((segment) => {
+      const update = updateMap.get(segment.segmentId);
+      if (!update) {
+        return segment;
+      }
+      return {
+        ...segment,
+        partName: update.partName || segment.partName,
+        segmentFilePath: update.segmentFilePath || segment.segmentFilePath,
+        uploadStatus: update.uploadStatus || segment.uploadStatus,
+        uploadProgress:
+          typeof update.uploadProgress === "number"
+            ? update.uploadProgress
+            : segment.uploadProgress,
+        cid: update.cid ?? segment.cid,
+        fileName: update.fileName ?? segment.fileName,
+        uploadUploadedBytes:
+          typeof update.uploadUploadedBytes === "number"
+            ? update.uploadUploadedBytes
+            : segment.uploadUploadedBytes,
+        uploadTotalBytes:
+          typeof update.uploadTotalBytes === "number"
+            ? update.uploadTotalBytes
+            : segment.uploadTotalBytes,
+      };
+    });
+  };
+
+  const fetchTaskDetail = async (taskId, options = {}) => {
+    const { log = true } = options;
+    if (log) {
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_detail_click taskId=${taskId}`,
+        });
+      } catch (_) {}
+    }
+    let detail = await invokeCommand("submission_detail", { taskId });
+    if (log) {
+      try {
+        const hasTask = detail && typeof detail === "object" && "task" in detail;
+        await invokeCommand("auth_client_log", {
+          message: `submission_detail_result hasTask=${hasTask ? "1" : "0"} keys=${Object.keys(detail || {}).join(",")}`,
+        });
+      } catch (_) {}
+    }
+    if (!detail?.task) {
+      const raw = await invoke("submission_detail", { taskId });
+      if (log) {
+        try {
+          await invokeCommand("auth_client_log", {
+            message: `submission_detail_raw type=${typeof raw} hasCode=${raw && typeof raw.code === "number" ? "1" : "0"}`,
+          });
+        } catch (_) {}
+      }
+      if (raw && typeof raw.code === "number") {
+        if (raw.code !== 0) {
+          throw new Error(raw.message || "读取任务详情失败");
+        }
+        detail = raw.data || null;
+      } else {
+        detail = raw;
+      }
+    }
+    if (!detail?.task) {
+      throw new Error("未读取到投稿任务详情");
+    }
+    return detail;
+  };
+
+  const handleDetail = async (taskId) => {
+    setMessage("");
+    try {
+      setSubmissionView("detail");
+      setSelectedTask(null);
+      const loadPromises = Promise.all([loadPartitions(), loadCollections()]);
+      const detail = await fetchTaskDetail(taskId, { log: true });
+      setSelectedTask(detail);
+      setDetailTab("basic");
+      try {
+        const task = detail?.task || {};
+        const tagCount = String(task.tags || "")
+          .split(",")
+          .map((item) => item.trim())
+          .filter((item) => item).length;
+        await invokeCommand("auth_client_log", {
+          message: `submission_detail_task taskId=${task.taskId || ""} titleLen=${(task.title || "").length} tags=${tagCount} sources=${detail?.sourceVideos?.length || 0}`,
+        });
+      } catch (_) {}
+      applyDetailToForm(detail);
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_detail_apply_ok taskId=${detail?.task?.taskId || ""}`,
+        });
+      } catch (_) {}
+      await loadPromises;
+    } catch (error) {
+      setMessage(error.message);
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_detail_fail err=${error?.message || String(error || "")}`,
+        });
+      } catch (_) {}
+    }
+  };
+
+  const extractPartNameFromPath = (filePath) => {
+    if (!filePath) {
+      return "";
+    }
+    const rawName = filePath.split(/[\\/]/).pop() || "";
+    const dotIndex = rawName.lastIndexOf(".");
+    if (dotIndex > 0) {
+      return rawName.slice(0, dotIndex);
+    }
+    return rawName;
+  };
+
+  const updateEditSegment = (segmentId, patch) => {
+    setEditSegments((prev) =>
+      prev.map((segment) =>
+        segment.segmentId === segmentId ? { ...segment, ...patch } : segment,
+      ),
+    );
+  };
+
+  const handleEdit = async (taskId) => {
+    setMessage("");
+    try {
+      const previousTaskId = lastEditTaskIdRef.current;
+      if (previousTaskId && String(previousTaskId) !== String(taskId)) {
+        await clearEditUploadCache(previousTaskId);
+      }
+      setSubmissionView("edit");
+      setSelectedTask(null);
+      setEditSegments([]);
+      const loadPromises = Promise.all([loadPartitions(), loadCollections()]);
+      const detail = await invokeCommand("submission_edit_prepare", { taskId });
+      if (!detail?.task) {
+        throw new Error("未读取到投稿任务详情");
+      }
+      setSelectedTask(detail);
+      setDetailTab("basic");
+      applyDetailToForm(detail);
+      initEditSegments(detail);
+      await loadPromises;
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleIntegratedExecute = async (taskId) => {
+    setMessage("");
+    try {
+      await invokeCommand("submission_integrated_execute", { taskId });
+      await loadTasks(statusFilter, currentPage, pageSize);
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleResegmentSubmit = async () => {
+    if (!resegmentTaskId || resegmentSubmitting) {
+      return;
+    }
+    const nextSeconds = Number(resegmentSeconds);
+    if (!Number.isFinite(nextSeconds) || nextSeconds <= 0) {
+      setMessage("分段时长必须大于0");
+      return;
+    }
+    setMessage("");
+    setResegmentSubmitting(true);
+    try {
+      await invokeCommand("submission_resegment", {
+        request: {
+          taskId: resegmentTaskId,
+          segmentDurationSeconds: Math.floor(nextSeconds),
+        },
+      });
+      closeResegmentModal();
+      await loadTasks(statusFilter, currentPage, pageSize);
+    } catch (error) {
+      setMessage(error.message);
+      setResegmentSubmitting(false);
+    }
+  };
+
+  const handleEditSubmit = async () => {
+    if (!selectedTask?.task?.taskId || submittingEdit) {
+      return;
+    }
+    setMessage("");
+    let segmentsForSubmit = editSegments;
+    if (editingSegmentId) {
+      const nextName = editingSegmentName.trim();
+      if (nextName) {
+        segmentsForSubmit = editSegments.map((segment) =>
+          segment.segmentId === editingSegmentId
+            ? { ...segment, partName: nextName }
+            : segment,
+        );
+        updateEditSegment(editingSegmentId, { partName: nextName });
+      }
+      setEditingSegmentId("");
+      setEditingSegmentName("");
+    }
+    if (!taskForm.title.trim()) {
+      setMessage("请输入投稿标题");
+      return;
+    }
+    if (taskForm.title.length > 80) {
+      setMessage("投稿标题不能超过 80 个字符");
+      return;
+    }
+    if (!taskForm.partitionId) {
+      setMessage("请选择B站分区");
+      return;
+    }
+    if (!taskForm.videoType) {
+      setMessage("请选择视频类型");
+      return;
+    }
+    if (taskForm.description && taskForm.description.length > 2000) {
+      setMessage("视频描述不能超过 2000 个字符");
+      return;
+    }
+    const normalizedTags = [...tags];
+    if (tagInput.trim()) {
+      normalizedTags.push(tagInput.trim());
+    }
+    const uniqueTags = Array.from(new Set(normalizedTags));
+    if (uniqueTags.length === 0) {
+      setMessage("请填写至少一个投稿标签");
+      return;
+    }
+    if (!segmentsForSubmit.length) {
+      setMessage("至少需要保留一个分P");
+      return;
+    }
+    const incompleteSegment = segmentsForSubmit.find(
+      (segment) => segment.uploadStatus !== "SUCCESS",
+    );
+    if (incompleteSegment) {
+      setMessage("存在未上传成功的分P，请处理后再提交");
+      return;
+    }
+    const emptyNameSegment = segmentsForSubmit.find(
+      (segment) => !segment.partName || !segment.partName.trim(),
+    );
+    if (emptyNameSegment) {
+      setMessage("分P名称不能为空");
+      return;
+    }
+    const emptyPathSegment = segmentsForSubmit.find(
+      (segment) => !segment.segmentFilePath || !segment.segmentFilePath.trim(),
+    );
+    if (emptyPathSegment) {
+      setMessage("分P文件路径不能为空");
+      return;
+    }
+    const missingUploadInfo = segmentsForSubmit.find(
+      (segment) => !segment.cid || !segment.fileName,
+    );
+    if (missingUploadInfo) {
+      setMessage("分P上传信息缺失，请重新上传");
+      return;
+    }
+    const segmentPayload = segmentsForSubmit.map((segment, index) => ({
+      segmentId: segment.segmentId,
+      partName: segment.partName,
+      partOrder: index + 1,
+      segmentFilePath: segment.segmentFilePath,
+      cid: segment.cid ?? null,
+      fileName: segment.fileName ?? null,
+    }));
+    setSubmittingEdit(true);
+    try {
+      await invokeCommand("submission_edit_submit", {
+        request: {
+          taskId: selectedTask.task.taskId,
+          task: {
+            title: taskForm.title,
+            description: taskForm.description || null,
+            partitionId: Number(taskForm.partitionId),
+            collectionId: taskForm.collectionId ? Number(taskForm.collectionId) : null,
+            tags: uniqueTags.join(","),
+            videoType: taskForm.videoType,
+            segmentPrefix: taskForm.segmentPrefix || null,
+          },
+          segments: segmentPayload,
+        },
+      });
+      backToList();
+      await loadTasks(statusFilter, currentPage, pageSize);
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setSubmittingEdit(false);
+    }
+  };
+
+  const handleEditSegmentAdd = async () => {
+    if (!selectedTask?.task?.taskId) {
+      return;
+    }
+    setMessage("");
+    try {
+      await invokeCommand("auth_client_log", {
+        message: `submission_edit_add_segment_click taskId=${selectedTask.task.taskId}`,
+      });
+    } catch (_) {}
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [
+          {
+            name: "视频文件",
+            extensions: ["mp4", "mkv", "mov", "flv", "avi", "webm"],
+          },
+        ],
+      });
+      if (typeof selected !== "string") {
+        return;
+      }
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_edit_add_segment_selected taskId=${selectedTask.task.taskId} path=${selected}`,
+        });
+      } catch (_) {}
+      const defaultName = extractPartNameFromPath(selected);
+      const segment = await invokeCommand("submission_edit_add_segment", {
+        request: {
+          taskId: selectedTask.task.taskId,
+          filePath: selected,
+          partName: defaultName || null,
+        },
+      });
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_edit_add_segment_response taskId=${selectedTask.task.taskId} segmentId=${segment?.segmentId || "unknown"}`,
+        });
+      } catch (_) {}
+      setEditSegments((prev) => [...prev, segment]);
+    } catch (error) {
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_edit_add_segment_error taskId=${selectedTask?.task?.taskId || ""} err=${error.message || String(error)}`,
+        });
+      } catch (_) {}
+      setMessage(error.message);
+    }
+  };
+
+  const handleEditSegmentReupload = async (segmentId) => {
+    setMessage("");
+    const targetId = String(segmentId || "").trim();
+    if (!targetId) {
+      setMessage("分P ID无效");
+      return;
+    }
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [
+          {
+            name: "视频文件",
+            extensions: ["mp4", "mkv", "mov", "flv", "avi", "webm"],
+          },
+        ],
+      });
+      if (typeof selected !== "string") {
+        return;
+      }
+      const segment = await invokeCommand("submission_edit_reupload_segment", {
+        request: {
+          taskId: selectedTask.task.taskId,
+          segmentId: targetId,
+          filePath: selected,
+        },
+      });
+      updateEditSegment(targetId, {
+        partName: segment.partName,
+        segmentFilePath: segment.segmentFilePath,
+        uploadStatus: segment.uploadStatus,
+        uploadProgress: segment.uploadProgress,
+        cid: segment.cid,
+        fileName: segment.fileName,
+        uploadUploadedBytes: segment.uploadUploadedBytes,
+        uploadTotalBytes: segment.uploadTotalBytes,
+      });
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleEditSegmentDelete = (segmentId) => {
+    const targetId = String(segmentId || "").trim();
+    if (!targetId) {
+      return;
+    }
+    setEditSegments((prev) => prev.filter((segment) => segment.segmentId !== targetId));
+    if (editingSegmentId === targetId) {
+      setEditingSegmentId("");
+      setEditingSegmentName("");
+    }
+  };
+
+  const handleSegmentNameStartEdit = (segment) => {
+    setEditingSegmentId(segment.segmentId);
+    setEditingSegmentName(segment.partName || "");
+  };
+
+  const commitSegmentNameEdit = () => {
+    const targetId = editingSegmentId;
+    if (!targetId) {
+      return;
+    }
+    const nextName = editingSegmentName.trim();
+    if (nextName) {
+      updateEditSegment(targetId, { partName: nextName });
+    }
+    setEditingSegmentId("");
+    setEditingSegmentName("");
+  };
+
+  const cancelSegmentNameEdit = () => {
+    setEditingSegmentId("");
+    setEditingSegmentName("");
+  };
+
+  const reorderEditSegments = (sourceId, targetId) => {
+    setEditSegments((prev) => {
+      const fromIndex = prev.findIndex((segment) => segment.segmentId === sourceId);
+      const toIndex = prev.findIndex((segment) => segment.segmentId === targetId);
+      invokeCommand("auth_client_log", {
+        message: `submission_edit_drag_indices sourceId=${sourceId} targetId=${targetId} from=${fromIndex} to=${toIndex}`,
+      }).catch(() => {});
+      if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) {
+        return prev;
+      }
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
+  };
+
+  const handleSegmentPointerDown = (event, segmentId) => {
+    if (event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.currentTarget?.setPointerCapture) {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
+    dragStateRef.current = { activeId: segmentId, overId: segmentId };
+    setDraggingSegmentId(segmentId);
+    invokeCommand("auth_client_log", {
+      message: `submission_edit_drag_pointer_start segmentId=${segmentId}`,
+    }).catch(() => {});
+  };
+
+  const trackPointerOverSegment = (event) => {
+    const { activeId } = dragStateRef.current;
+    if (!activeId) {
+      return;
+    }
+    const { clientX, clientY } = event;
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) {
+      return;
+    }
+    const target = document.elementFromPoint(clientX, clientY);
+    if (!target || typeof target.closest !== "function") {
+      return;
+    }
+    const row = target.closest("tr[data-segment-id]");
+    const overId = row?.dataset?.segmentId || "";
+    if (!overId || overId === dragStateRef.current.overId) {
+      return;
+    }
+    dragStateRef.current.overId = overId;
+    reorderEditSegments(activeId, overId);
+    invokeCommand("auth_client_log", {
+      message: `submission_edit_drag_pointer_over activeId=${activeId} overId=${overId}`,
+    }).catch(() => {});
+  };
+
+  const endPointerDrag = () => {
+    const { activeId, overId } = dragStateRef.current;
+    if (!activeId) {
+      return;
+    }
+    dragStateRef.current = { activeId: "", overId: "" };
+    setDraggingSegmentId("");
+    invokeCommand("auth_client_log", {
+      message: `submission_edit_drag_pointer_end activeId=${activeId} overId=${overId}`,
+    }).catch(() => {});
+  };
+
+  useEffect(() => {
+    if (!draggingSegmentId) {
+      return undefined;
+    }
+    const handleMove = (event) => {
+      trackPointerOverSegment(event);
+    };
+    const handleUp = () => {
+      endPointerDrag();
+    };
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
+    };
+  }, [draggingSegmentId]);
+
+  const handleRetrySegmentUpload = async (segmentId) => {
+    setMessage("");
+    const targetId = String(segmentId || "").trim();
+    if (!targetId) {
+      setMessage("分段ID无效，无法重试");
+      return;
+    }
+    if (retryingSegmentIds.has(targetId)) {
+      return;
+    }
+    setRetryingSegmentIds((prev) => {
+      const next = new Set(prev);
+      next.add(targetId);
+      return next;
+    });
+    try {
+      await invokeCommand("submission_retry_segment_upload", { segmentId: targetId });
+      if (selectedTask?.task?.taskId) {
+        const detail = await fetchTaskDetail(selectedTask.task.taskId, { log: false });
+        setSelectedTask(detail);
+      }
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setRetryingSegmentIds((prev) => {
+        const next = new Set(prev);
+        next.delete(targetId);
+        return next;
+      });
+    }
+  };
+
+  const handleDeleteTask = async (taskId) => {
+    setMessage("");
+    const targetId = String(taskId || "").trim();
+    if (!targetId) {
+      setMessage("任务ID无效，无法删除");
+      return;
+    }
+    setDeleteTargetId(targetId);
+    setDeleteConfirmOpen(true);
+    try {
+      await invokeCommand("auth_client_log", {
+        message: `submission_delete_prompt taskId=${targetId}`,
+      });
+    } catch (_) {}
+  };
+
+  const handleDeleteCancel = async () => {
+    const targetId = deleteTargetId;
+    setDeleteConfirmOpen(false);
+    setDeleteTargetId("");
+    try {
+      await invokeCommand("auth_client_log", {
+        message: `submission_delete_cancel taskId=${targetId}`,
+      });
+    } catch (_) {}
+  };
+
+  const handleDeleteConfirm = async () => {
+    const targetId = deleteTargetId;
+    if (!targetId) {
+      setDeleteConfirmOpen(false);
+      return;
+    }
+    try {
+      await invokeCommand("submission_delete", { taskId: targetId });
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_delete_ok taskId=${targetId}`,
+        });
+      } catch (_) {}
+      if (selectedTask?.task?.taskId === targetId) {
+        setSelectedTask(null);
+      }
+      setTasks((prev) => prev.filter((item) => item.taskId !== targetId));
+      await loadTasks(statusFilter);
+      setDeleteConfirmOpen(false);
+      setDeleteTargetId("");
+    } catch (error) {
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_delete_fail taskId=${targetId} err=${error?.message || String(error || "")}`,
+        });
+      } catch (_) {}
+      setMessage(error.message);
+    }
+  };
+
+  const handleWorkflowPause = async (taskId) => {
+    setMessage("");
+    try {
+      await invokeCommand("workflow_pause", { task_id: taskId });
+      await loadTasks(statusFilter);
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleWorkflowResume = async (taskId) => {
+    setMessage("");
+    try {
+      await invokeCommand("workflow_resume", { task_id: taskId });
+      await loadTasks(statusFilter);
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleWorkflowCancel = async (taskId) => {
+    setMessage("");
+    try {
+      await invokeCommand("workflow_cancel", { task_id: taskId });
+      await loadTasks(statusFilter);
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleWorkflowRefresh = async () => {
+    setRefreshingRemote(true);
+    try {
+      await loadTasks(statusFilter, currentPage, pageSize, true);
+    } finally {
+      setRefreshingRemote(false);
+    }
+  };
+
+  const formatTaskStatus = (status) => {
+    switch (status) {
+      case "PENDING":
+        return "待处理";
+      case "CLIPPING":
+        return "剪辑中";
+      case "MERGING":
+        return "合并中";
+      case "SEGMENTING":
+        return "分段中";
+      case "RUNNING":
+        return "处理中";
+      case "COMPLETED":
+        return "已完成";
+      case "WAITING_UPLOAD":
+        return "投稿队列中";
+      case "UPLOADING":
+        return "投稿中";
+      case "FAILED":
+        return "失败";
+      case "CANCELLED":
+        return "已取消";
+      default:
+        return status || "-";
+    }
+  };
+
+  const formatWorkflowStatus = (status) => {
+    switch (status) {
+      case "PENDING":
+        return "待处理";
+      case "RUNNING":
+        return "运行中";
+      case "PAUSED":
+        return "已暂停";
+      case "COMPLETED":
+        return "已完成";
+      case "FAILED":
+        return "失败";
+      case "CANCELLED":
+        return "已取消";
+      default:
+        return status || "-";
+    }
+  };
+
+  const taskStatusTone = (status) => {
+    if (status === "COMPLETED") return "bg-emerald-500/10 text-emerald-600";
+    if (status === "FAILED" || status === "CANCELLED")
+      return "bg-rose-500/10 text-rose-600";
+    if (["UPLOADING", "WAITING_UPLOAD", "RUNNING"].includes(status)) {
+      return "bg-amber-500/10 text-amber-600";
+    }
+    if (["CLIPPING", "MERGING", "SEGMENTING", "PENDING"].includes(status)) {
+      return "bg-amber-500/10 text-amber-600";
+    }
+    return "bg-slate-500/10 text-slate-600";
+  };
+
+  const remoteStatusTone = (status) => {
+    if (status === "已通过") return "bg-emerald-500/10 text-emerald-600";
+    if (status === "未通过") return "bg-rose-500/10 text-rose-600";
+    return "bg-amber-500/10 text-amber-600";
+  };
+
+  const workflowStatusTone = (status) => {
+    if (status === "COMPLETED") return "bg-emerald-500/10 text-emerald-600";
+    if (status === "FAILED" || status === "CANCELLED")
+      return "bg-rose-500/10 text-rose-600";
+    if (status === "RUNNING") return "bg-amber-500/10 text-amber-600";
+    if (status === "PAUSED") return "bg-slate-500/10 text-slate-600";
+    return "bg-slate-500/10 text-slate-600";
+  };
+
+  const formatWorkflowStep = (step) => {
+    switch (step) {
+      case "CLIPPING":
+        return "剪辑";
+      case "MERGING":
+        return "合并";
+      case "SEGMENTING":
+        return "分段";
+      default:
+        return step || "-";
+    }
+  };
+
+  const resolveRemoteStatus = (task) => {
+    if (!task?.bvid) {
+      return "进行中";
+    }
+    const state = Number(task.remoteState);
+    if (!Number.isFinite(state)) {
+      return "进行中";
+    }
+    if (state === -2) {
+      return "未通过";
+    }
+    if (state === 0) {
+      return "已通过";
+    }
+    if (state === -30) {
+      return "进行中";
+    }
+    return "进行中";
+  };
+
+  const isRemoteRejected = (task) => {
+    return Number(task?.remoteState) === -2;
+  };
+
+  const resolveRejectReason = (task) => {
+    if (!isRemoteRejected(task)) {
+      return "-";
+    }
+    return task?.rejectReason || "-";
+  };
+
+  const formatUploadProgress = (value) => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+      return 0;
+    }
+    return Math.min(100, Math.max(0, Math.round(numeric)));
+  };
+
+  const formatSegmentUploadStatus = (status) => {
+    if (status === "RATE_LIMITED") {
+      return "等待中";
+    }
+    return status || "-";
+  };
+
+  const resolveResegmentCount = (durationSeconds, segmentSecondsValue) => {
+    const duration = Number(durationSeconds);
+    const segmentSeconds = Math.floor(Number(segmentSecondsValue));
+    if (!Number.isFinite(duration) || duration <= 0) {
+      return null;
+    }
+    if (!Number.isFinite(segmentSeconds) || segmentSeconds <= 0) {
+      return null;
+    }
+    return Math.ceil(duration / segmentSeconds);
+  };
+
+  const totalClipSeconds = sourceVideos.reduce((acc, item) => {
+    const start = parseHmsToSeconds(item.startTime) ?? 0;
+    const endRaw = parseHmsToSeconds(item.endTime) ?? 0;
+    const end = clampTimeSeconds(endRaw, item.durationSeconds);
+    const clipped = Math.max(0, end - clampTimeSeconds(start, item.durationSeconds));
+    return acc + clipped;
+  }, 0);
+  const segmentDurationSeconds = Number(workflowConfig.segmentationConfig.segmentDurationSeconds) || 0;
+  const estimatedSegments =
+    segmentationEnabled && segmentDurationSeconds > 0
+      ? Math.ceil(totalClipSeconds / segmentDurationSeconds)
+      : 0;
+  const updateTotalClipSeconds = updateSourceVideos.reduce((acc, item) => {
+    const start = parseHmsToSeconds(item.startTime) ?? 0;
+    const endRaw = parseHmsToSeconds(item.endTime) ?? 0;
+    const end = clampTimeSeconds(endRaw, item.durationSeconds);
+    const clipped = Math.max(0, end - clampTimeSeconds(start, item.durationSeconds));
+    return acc + clipped;
+  }, 0);
+  const updateSegmentDurationSeconds =
+    Number(updateWorkflowConfig.segmentationConfig.segmentDurationSeconds) || 0;
+  const updateEstimatedSegments =
+    updateSegmentationEnabled && updateSegmentDurationSeconds > 0
+      ? Math.ceil(updateTotalClipSeconds / updateSegmentDurationSeconds)
+      : 0;
+
+  const detailSegmentationEnabled =
+    typeof selectedTask?.workflowConfig?.segmentationConfig?.enabled === "boolean"
+      ? selectedTask.workflowConfig.segmentationConfig.enabled
+      : Boolean(selectedTask?.outputSegments?.length);
+  const partitionLabel =
+    partitions.find((item) => String(item.tid) === String(taskForm.partitionId))?.name ||
+    taskForm.partitionId ||
+    "-";
+  const collectionLabel =
+    collections.find((item) => String(item.seasonId) === String(taskForm.collectionId))
+      ?.name ||
+    (taskForm.collectionId ? taskForm.collectionId : "-");
+  const videoTypeLabel =
+    taskForm.videoType === "REPOST" ? "转载" : taskForm.videoType ? "原创" : "-";
+  const detailEstimatedSegments = segmentationEnabled
+    ? Math.max(selectedTask?.outputSegments?.length || 0, estimatedSegments)
+    : 0;
+
+  const totalPages = Math.max(1, Math.ceil(totalTasks / pageSize));
+  const quickFillTotalPages = Math.max(1, Math.ceil(quickFillTotal / quickFillPageSize));
+  const quickFillVisibleTasks = quickFillTasks.slice(0, quickFillPageSize);
+
+  return (
+    <div className="space-y-6">
+      {isCreateView ? (
+        <>
+          <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">
+                  视频投稿
+                </p>
+                <h2 className="text-2xl font-semibold text-[var(--ink)]">新增投稿任务</h2>
+              </div>
+              <button
+                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                onClick={backToList}
+              >
+                返回列表
+              </button>
+            </div>
+            <div className="mt-4 space-y-3">
+              <div className="space-y-1">
+                <div className="flex items-center justify-between text-xs text-[var(--muted)]">
+                  <div>
+                    投稿标题<span className="ml-1 text-rose-500">必填</span>
+                  </div>
+                  {!isReadOnly ? (
+                    <button
+                      className="rounded-full border border-black/10 bg-white px-2 py-1 text-[10px] font-semibold text-[var(--ink)]"
+                      onClick={openQuickFill}
+                    >
+                      一键填写
+                    </button>
+                  ) : null}
+                </div>
+                <input
+                  value={taskForm.title}
+                  onChange={(event) =>
+                    setTaskForm((prev) => ({ ...prev, title: event.target.value }))
+                  }
+                  placeholder="请输入投稿标题"
+                  readOnly={isReadOnly}
+                  className="w-full rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
+                />
+              </div>
+              <div className="space-y-1">
+                <div className="text-xs text-[var(--muted)]">视频描述（可选）</div>
+                <textarea
+                  value={taskForm.description}
+                  onChange={(event) =>
+                    setTaskForm((prev) => ({ ...prev, description: event.target.value }))
+                  }
+                  placeholder="视频描述"
+                  rows={2}
+                  readOnly={isReadOnly}
+                  className="w-full rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
+                />
+              </div>
+          <div className="grid gap-2 lg:grid-cols-3">
+            <div className="space-y-1">
+              <div className="text-xs text-[var(--muted)]">
+                B站分区<span className="ml-1 text-rose-500">必填</span>
+              </div>
+              <select
+                value={taskForm.partitionId}
+                onChange={(event) =>
+                  setTaskForm((prev) => ({ ...prev, partitionId: event.target.value }))
+                }
+                disabled={isReadOnly}
+                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+              >
+                <option value="">请选择分区</option>
+                {partitions.map((partition) => (
+                  <option key={partition.tid} value={partition.tid}>
+                    {partition.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="space-y-1">
+              <div className="text-xs text-[var(--muted)]">合集（可选）</div>
+              <select
+                value={taskForm.collectionId}
+                onChange={(event) =>
+                  setTaskForm((prev) => ({ ...prev, collectionId: event.target.value }))
+                }
+                disabled={isReadOnly}
+                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+              >
+                <option value="">请选择合集</option>
+                {collections.map((collection) => (
+                  <option key={collection.seasonId} value={collection.seasonId}>
+                    {collection.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="space-y-1">
+              <div className="text-xs text-[var(--muted)]">
+                视频类型<span className="ml-1 text-rose-500">必填</span>
+              </div>
+              <select
+                value={taskForm.videoType}
+                onChange={(event) =>
+                  setTaskForm((prev) => ({ ...prev, videoType: event.target.value }))
+                }
+                disabled={isReadOnly}
+                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+              >
+                <option value="ORIGINAL">原创</option>
+                <option value="REPOST">转载</option>
+              </select>
+            </div>
+          </div>
+          <div className="grid gap-2 lg:grid-cols-2">
+            <div className="space-y-1">
+              <div className="text-xs text-[var(--muted)]">
+                投稿标签<span className="ml-1 text-rose-500">必填</span>
+              </div>
+              <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus-within:border-[var(--accent)]">
+                <div className="flex flex-wrap gap-2">
+                  {tags.map((tag) => (
+                    <span
+                      key={tag}
+                      className="inline-flex items-center gap-1 rounded-full bg-[var(--accent)]/10 px-2 py-1 text-xs text-[var(--accent)]"
+                    >
+                      {tag}
+                      {!isReadOnly ? (
+                        <button
+                          className="text-[10px] font-semibold text-[var(--accent)] hover:opacity-70"
+                          onClick={() => removeTag(tag)}
+                          title="删除标签"
+                        >
+                          ×
+                        </button>
+                      ) : null}
+                    </span>
+                  ))}
+                  {isReadOnly ? null : (
+                    <input
+                      value={tagInput}
+                      onChange={(event) => setTagInput(event.target.value)}
+                      onKeyDown={handleTagKeyDown}
+                      placeholder="回车添加标签"
+                      className="min-w-[120px] flex-1 bg-transparent text-sm text-[var(--ink)] focus:outline-none"
+                    />
+                  )}
+                </div>
+              </div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-xs text-[var(--muted)]">分段前缀（可选）</div>
+              <input
+                value={taskForm.segmentPrefix}
+                onChange={(event) =>
+                  setTaskForm((prev) => ({ ...prev, segmentPrefix: event.target.value }))
+                }
+                placeholder="分段前缀"
+                readOnly={isReadOnly}
+                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+              />
+            </div>
+          </div>
+          <div className="text-xs text-[var(--muted)]">
+            分段前缀会作为分段文件名的前缀（可选）
+          </div>
+          <div className="rounded-xl border border-black/5 bg-white/80 p-3">
+            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              工作流配置
+            </div>
+            <div className="mt-2 space-y-3 text-sm text-[var(--ink)]">
+              <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                是否分段
+              </div>
+              <div className="flex flex-wrap gap-4 text-xs text-[var(--muted)]">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    checked={segmentationEnabled}
+                    onChange={() => setSegmentationEnabled(true)}
+                    disabled={isReadOnly}
+                  />
+                  需要分段
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    checked={!segmentationEnabled}
+                    onChange={() => setSegmentationEnabled(false)}
+                    disabled={isReadOnly}
+                  />
+                  不需要分段
+                </label>
+              </div>
+
+              {segmentationEnabled ? (
+                <div className="grid gap-2 lg:grid-cols-2">
+                  <input
+                    type="number"
+                    value={workflowConfig.segmentationConfig.segmentDurationSeconds}
+                    onChange={(event) =>
+                      setWorkflowConfig((prev) => ({
+                        ...prev,
+                        segmentationConfig: {
+                          ...prev.segmentationConfig,
+                          segmentDurationSeconds: Number(event.target.value),
+                        },
+                      }))
+                    }
+                    placeholder="分段时长（秒）"
+                    readOnly={isReadOnly}
+                    className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                  />
+                  <label className="flex items-center gap-2 text-xs text-[var(--muted)]">
+                    <input
+                      type="checkbox"
+                      checked={workflowConfig.segmentationConfig.preserveOriginal}
+                      onChange={(event) =>
+                        setWorkflowConfig((prev) => ({
+                          ...prev,
+                          segmentationConfig: {
+                            ...prev.segmentationConfig,
+                            preserveOriginal: event.target.checked,
+                          },
+                        }))
+                      }
+                      disabled={isReadOnly}
+                    />
+                    保留合并视频
+                  </label>
+                </div>
+              ) : null}
+              <div className="text-xs text-[var(--muted)]">
+                预计分段数：{segmentationEnabled ? estimatedSegments : "不分段"}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="rounded-2xl bg-white/80 p-6 shadow-sm ring-1 ring-black/5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">源视频配置</div>
+          {!isReadOnly ? (
+            <button
+              className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
+              onClick={addSource}
+            >
+              添加视频
+            </button>
+          ) : null}
+        </div>
+        <div className="mt-3 overflow-hidden rounded-xl border border-black/5">
+          <table className="w-full text-left text-sm whitespace-nowrap">
+            <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              <tr>
+                <th className="px-4 py-2">序号</th>
+                <th className="px-4 py-2">视频文件（必填）</th>
+                <th className="px-4 py-2">开始时间</th>
+                <th className="px-4 py-2">结束时间</th>
+                <th className="px-4 py-2">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sourceVideos.map((item, index) => (
+                <tr key={`source-${index}`} className="border-t border-black/5">
+                  <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                  <td className="px-4 py-2">
+                    <div className="flex flex-wrap gap-2">
+                      <input
+                        value={item.sourceFilePath}
+                        onChange={(event) =>
+                          updateSource(index, "sourceFilePath", event.target.value)
+                        }
+                        placeholder="请输入视频文件路径（必填）"
+                        readOnly={isReadOnly}
+                        className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                      />
+                      {!isReadOnly ? (
+                        <button
+                          className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)]"
+                          onClick={() => openFileDialog(index)}
+                        >
+                          选择
+                        </button>
+                      ) : null}
+                    </div>
+                  </td>
+                  <td className="px-4 py-2">
+                    <input
+                      value={item.startTime}
+                      onChange={(event) =>
+                        updateSourceTime(index, "startTime", event.target.value)
+                      }
+                      onBlur={() => normalizeSourceTime(index, "startTime")}
+                      placeholder="00:00:00"
+                      readOnly={isReadOnly}
+                      className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                    />
+                  </td>
+                  <td className="px-4 py-2">
+                    <input
+                      value={item.endTime}
+                      onChange={(event) => updateSourceTime(index, "endTime", event.target.value)}
+                      onBlur={() => normalizeSourceTime(index, "endTime")}
+                      placeholder="00:00:00"
+                      readOnly={isReadOnly}
+                      className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                    />
+                  </td>
+                  <td className="px-4 py-2">
+                    {!isReadOnly ? (
+                      <button
+                        className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                        onClick={() => removeSource(index)}
+                      >
+                        删除
+                      </button>
+                    ) : null}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {!isReadOnly ? (
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:brightness-110"
+              onClick={handleCreate}
+            >
+              创建任务
+            </button>
+          </div>
+        ) : null}
+        {message ? (
+          <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+            {message}
+          </div>
+        ) : null}
+      </div>
+        </>
+      ) : null}
+
+      {quickFillOpen && isCreateView ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
+          <div className="w-full max-w-2xl rounded-2xl bg-white p-5 shadow-lg">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-sm font-semibold text-[var(--ink)]">一键填写</div>
+              <button
+                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                onClick={closeQuickFill}
+              >
+                关闭
+              </button>
+            </div>
+            <div className="mt-3 h-[420px] overflow-y-auto rounded-xl border border-black/5">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                  <tr>
+                    <th className="px-4 py-2">投稿标题</th>
+                    <th className="px-4 py-2">创建时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {quickFillVisibleTasks.length === 0 ? (
+                    <tr>
+                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={2}>
+                        暂无任务
+                      </td>
+                    </tr>
+                  ) : (
+                    quickFillVisibleTasks.map((task) => (
+                      <tr
+                        key={task.taskId}
+                        className="cursor-pointer border-t border-black/5 hover:bg-black/5"
+                        onClick={() => handleQuickFillSelect(task)}
+                      >
+                        <td className="px-4 py-2 text-[var(--ink)]">{task.title}</td>
+                        <td className="px-4 py-2 text-[var(--muted)]">
+                          {formatDateTime(task.createdAt)}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-3 text-xs text-[var(--muted)]">
+              <div>
+                共 {quickFillTotal} 条，当前第 {quickFillPage}/{quickFillTotalPages} 页
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                  onClick={() => setQuickFillPage((prev) => Math.max(1, prev - 1))}
+                  disabled={quickFillPage <= 1}
+                >
+                  上一页
+                </button>
+                <button
+                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                  onClick={() =>
+                    setQuickFillPage((prev) => Math.min(quickFillTotalPages, prev + 1))
+                  }
+                  disabled={quickFillPage >= quickFillTotalPages}
+                >
+                  下一页
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {updateOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
+          <div className="w-full max-w-5xl rounded-2xl bg-white p-5 shadow-lg">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-sm font-semibold text-[var(--ink)]">视频更新</div>
+              <button
+                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                onClick={closeUpdateModal}
+              >
+                关闭
+              </button>
+            </div>
+            {message ? (
+              <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                {message}
+              </div>
+            ) : null}
+            <div className="mt-4 grid gap-4">
+              <div className="rounded-xl border border-black/5 bg-white/80 p-3">
+                <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                  更新配置
+                </div>
+                <div className="mt-3 space-y-3 text-sm text-[var(--ink)]">
+                  <div className="grid gap-2 lg:grid-cols-2">
+                    <div className="space-y-1">
+                      <div className="text-xs text-[var(--muted)]">分段前缀（可选）</div>
+                      <input
+                        value={updateSegmentPrefix}
+                        onChange={(event) => setUpdateSegmentPrefix(event.target.value)}
+                        placeholder="分段前缀"
+                        className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                  <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                    是否分段
+                  </div>
+                  <div className="flex flex-wrap gap-4 text-xs text-[var(--muted)]">
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        checked={updateSegmentationEnabled}
+                        onChange={() => setUpdateSegmentationEnabled(true)}
+                      />
+                      需要分段
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        checked={!updateSegmentationEnabled}
+                        onChange={() => setUpdateSegmentationEnabled(false)}
+                      />
+                      不需要分段
+                    </label>
+                  </div>
+                  {updateSegmentationEnabled ? (
+                    <div className="grid gap-2 lg:grid-cols-2">
+                      <input
+                        type="number"
+                        value={updateWorkflowConfig.segmentationConfig.segmentDurationSeconds}
+                        onChange={(event) =>
+                          setUpdateWorkflowConfig((prev) => ({
+                            ...prev,
+                            segmentationConfig: {
+                              ...prev.segmentationConfig,
+                              segmentDurationSeconds: Number(event.target.value),
+                            },
+                          }))
+                        }
+                        placeholder="分段时长（秒）"
+                        className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                      />
+                      <label className="flex items-center gap-2 text-xs text-[var(--muted)]">
+                        <input
+                          type="checkbox"
+                          checked={updateWorkflowConfig.segmentationConfig.preserveOriginal}
+                          onChange={(event) =>
+                            setUpdateWorkflowConfig((prev) => ({
+                              ...prev,
+                              segmentationConfig: {
+                                ...prev.segmentationConfig,
+                                preserveOriginal: event.target.checked,
+                              },
+                            }))
+                          }
+                        />
+                        保留合并视频
+                      </label>
+                    </div>
+                  ) : null}
+                  <div className="text-xs text-[var(--muted)]">
+                    预计分段数：
+                    {updateSegmentationEnabled ? updateEstimatedSegments : "不分段"}
+                  </div>
+                </div>
+              </div>
+              <div className="rounded-xl border border-black/5 bg-white/80 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                    源视频配置
+                  </div>
+                  <button
+                    className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
+                    onClick={addUpdateSource}
+                  >
+                    添加视频
+                  </button>
+                </div>
+                <div className="mt-3 overflow-hidden rounded-xl border border-black/5">
+                  <table className="w-full text-left text-sm">
+                    <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                      <tr>
+                        <th className="px-4 py-2">序号</th>
+                        <th className="px-4 py-2">视频文件（必填）</th>
+                        <th className="px-4 py-2">开始时间</th>
+                        <th className="px-4 py-2">结束时间</th>
+                        <th className="px-4 py-2">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {updateSourceVideos.map((item, index) => (
+                        <tr key={`update-source-${index}`} className="border-t border-black/5">
+                          <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                          <td className="px-4 py-2">
+                            <div className="flex flex-wrap gap-2">
+                              <input
+                                value={item.sourceFilePath}
+                                onChange={(event) =>
+                                  updateUpdateSource(index, "sourceFilePath", event.target.value)
+                                }
+                                placeholder="请输入视频文件路径（必填）"
+                                className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                              />
+                              <button
+                                className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)]"
+                                onClick={() => handleUpdateSelectSourceFile(index)}
+                              >
+                                选择
+                              </button>
+                            </div>
+                          </td>
+                          <td className="px-4 py-2">
+                            <input
+                              value={item.startTime}
+                              onChange={(event) =>
+                                updateUpdateSourceTime(index, "startTime", event.target.value)
+                              }
+                              onBlur={() => normalizeUpdateSourceTime(index, "startTime")}
+                              placeholder="00:00:00"
+                              className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                            />
+                          </td>
+                          <td className="px-4 py-2">
+                            <input
+                              value={item.endTime}
+                              onChange={(event) =>
+                                updateUpdateSourceTime(index, "endTime", event.target.value)
+                              }
+                              onBlur={() => normalizeUpdateSourceTime(index, "endTime")}
+                              placeholder="00:00:00"
+                              className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                            />
+                          </td>
+                          <td className="px-4 py-2">
+                            <button
+                              className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                              onClick={() => removeUpdateSource(index)}
+                            >
+                              删除
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+                onClick={handleUpdateSubmit}
+                disabled={updateSubmitting}
+              >
+                {updateSubmitting ? "提交中" : "提交更新"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {submissionView === "list" ? (
+        <>
+          <div className="rounded-2xl bg-white/80 shadow-sm ring-1 ring-black/5">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-black/5 px-6 py-4">
+          <div className="text-sm font-semibold uppercase tracking-[0.2em] text-[var(--muted)]">
+            投稿任务列表
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
+              onClick={openCreateView}
+            >
+              新增投稿任务
+            </button>
+            <button
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={handleWorkflowRefresh}
+              disabled={refreshingRemote}
+            >
+              {refreshingRemote ? "刷新中" : "刷新"}
+            </button>
+            <select
+              value={statusFilter}
+              onChange={(event) => {
+                setStatusFilter(event.target.value);
+                setCurrentPage(1);
+              }}
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+            >
+              {statusFilters.map((item) => (
+                <option key={item.value} value={item.value}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-max table-auto text-left text-sm whitespace-nowrap">
+            <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)] whitespace-nowrap">
+              <tr>
+                <th className="px-6 py-3">标题</th>
+                <th className="px-6 py-3">任务状态</th>
+                <th className="px-6 py-3">工作流状态</th>
+                <th className="px-6 py-3">BVID</th>
+                <th className="px-6 py-3">投稿状态</th>
+                <th className="px-6 py-3">拒绝原因</th>
+                <th className="px-6 py-3">创建时间</th>
+                <th className="px-6 py-3">更新时间</th>
+                <th className="sticky right-0 z-20 bg-[var(--surface)] px-6 py-3 shadow-[-6px_0_10px_-6px_rgba(0,0,0,0.2)]">
+                  操作
+                </th>
+              </tr>
+            </thead>
+            <tbody className="whitespace-nowrap">
+              {tasks.length === 0 ? (
+                <tr>
+                  <td className="px-6 py-4 text-[var(--muted)]" colSpan={9}>
+                    暂无任务。
+                  </td>
+                </tr>
+              ) : (
+                tasks.map((task) => (
+                  <tr key={task.taskId} className="border-t border-black/5">
+                    <td className="px-6 py-3 text-[var(--ink)] whitespace-nowrap">
+                      {task.title}
+                    </td>
+                    <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${taskStatusTone(
+                          task.status,
+                        )}`}
+                      >
+                        {formatTaskStatus(task.status)}
+                      </span>
+                    </td>
+                    <td className="px-6 py-3 whitespace-nowrap">
+                      {task.workflowStatus ? (
+                        <div className="space-y-1">
+                          <span
+                            className={`rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${workflowStatusTone(
+                              task.workflowStatus.status,
+                            )}`}
+                          >
+                            {formatWorkflowStatus(task.workflowStatus.status)}
+                          </span>
+                          {task.workflowStatus.status === "RUNNING" ? (
+                            <div className="h-1.5 w-24 rounded-full bg-black/5">
+                              <div
+                                className="h-1.5 rounded-full bg-[var(--accent)]"
+                                style={{
+                                  width: `${Math.min(
+                                    100,
+                                    task.workflowStatus.progress || 0,
+                                  )}%`,
+                                }}
+                              />
+                            </div>
+                          ) : null}
+                          {task.workflowStatus.currentStep ? (
+                            <div className="text-xs text-[var(--muted)]">
+                              当前步骤：{formatWorkflowStep(task.workflowStatus.currentStep)}
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <span className="text-xs text-[var(--muted)]">无工作流</span>
+                      )}
+                    </td>
+                    <td className="px-6 py-3 whitespace-nowrap">
+                      {task.bvid ? (
+                        <button
+                          className="text-xs font-semibold text-[var(--accent)] underline underline-offset-2"
+                          onClick={() => handleOpenBvid(task.bvid)}
+                        >
+                          {task.bvid}
+                        </button>
+                      ) : (
+                        <span className="text-[var(--muted)]">-</span>
+                      )}
+                    </td>
+                    <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${remoteStatusTone(
+                          resolveRemoteStatus(task),
+                        )}`}
+                      >
+                        {resolveRemoteStatus(task)}
+                      </span>
+                    </td>
+                    <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
+                      {resolveRejectReason(task)}
+                    </td>
+                    <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
+                      {formatDateTime(task.createdAt)}
+                    </td>
+                    <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
+                      {formatDateTime(task.updatedAt)}
+                    </td>
+                    <td className="sticky right-0 z-10 bg-[var(--surface)] px-6 py-3 whitespace-nowrap shadow-[-6px_0_10px_-6px_rgba(0,0,0,0.12)]">
+                      <div className="flex flex-nowrap gap-2">
+                        {task.workflowStatus ? (
+                          <>
+                            {task.workflowStatus.status === "RUNNING" ? (
+                              <button
+                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                                onClick={() => handleWorkflowPause(task.taskId)}
+                              >
+                                暂停
+                              </button>
+                            ) : null}
+                            {task.workflowStatus.status === "PAUSED" ? (
+                              <button
+                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                                onClick={() => handleWorkflowResume(task.taskId)}
+                              >
+                                恢复
+                              </button>
+                            ) : null}
+                            {["RUNNING", "PAUSED"].includes(task.workflowStatus.status) ? (
+                              <button
+                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                                onClick={() => handleWorkflowCancel(task.taskId)}
+                              >
+                                取消
+                              </button>
+                            ) : null}
+                          </>
+                        ) : null}
+                        {task.status === "COMPLETED" && task.bvid ? (
+                          <button
+                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                            onClick={() => handleEdit(task.taskId)}
+                          >
+                            编辑
+                          </button>
+                        ) : null}
+                        {task.status === "COMPLETED" && task.bvid ? (
+                          <button
+                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                            onClick={() => openUpdateModal(task)}
+                          >
+                            视频更新
+                          </button>
+                        ) : null}
+                        {isRemoteRejected(task) ? (
+                          <button
+                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                            onClick={() => openResegmentModal(task.taskId)}
+                          >
+                            重新分段
+                          </button>
+                        ) : null}
+                        {task.status === "FAILED" && task.hasIntegratedDownloads ? (
+                          <button
+                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                            onClick={() => handleIntegratedExecute(task.taskId)}
+                          >
+                            一键投稿
+                          </button>
+                        ) : null}
+                        <button
+                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                          onClick={() => handleDetail(task.taskId)}
+                        >
+                          查看详情
+                        </button>
+                        <button
+                          className="rounded-full border border-red-200 bg-white px-2 py-1 text-xs font-semibold text-red-600 hover:border-red-300"
+                          onClick={() => handleDeleteTask(task.taskId)}
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-black/5 px-6 py-4 text-sm text-[var(--muted)]">
+          <div>
+            共 {totalTasks} 条，当前第 {currentPage}/{totalPages} 页
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              value={pageSize}
+              onChange={(event) => {
+                setPageSize(Number(event.target.value));
+                setCurrentPage(1);
+              }}
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+            >
+              {[10, 20, 50].map((size) => (
+                <option key={size} value={size}>
+                  {size} 条/页
+                </option>
+              ))}
+            </select>
+            <button
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+              onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
+              disabled={currentPage <= 1}
+            >
+              上一页
+            </button>
+            <button
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+              onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
+              disabled={currentPage >= totalPages}
+            >
+              下一页
+            </button>
+          </div>
+        </div>
+      </div>
+          {message ? (
+            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+              {message}
+            </div>
+          ) : null}
+          {resegmentOpen ? (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
+              <div className="w-full max-w-md rounded-2xl bg-white p-5 shadow-lg">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-semibold text-[var(--ink)]">重新分段</div>
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={closeResegmentModal}
+                  >
+                    关闭
+                  </button>
+                </div>
+                {message ? (
+                  <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                    {message}
+                  </div>
+                ) : null}
+                <div className="mt-4 space-y-3 text-sm text-[var(--ink)]">
+                  <div className="space-y-1">
+                    <div className="text-xs text-[var(--muted)]">
+                      当前分段时长（秒）
+                    </div>
+                    <div className="rounded-lg border border-black/10 bg-black/5 px-3 py-2">
+                      {resegmentDefaultSeconds || "-"}
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-xs text-[var(--muted)]">
+                      新分段时长（秒）
+                    </div>
+                    <input
+                      type="number"
+                      min={1}
+                      value={resegmentSeconds}
+                      onChange={(event) => setResegmentSeconds(event.target.value)}
+                      placeholder="例如 120"
+                      className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-xs text-[var(--muted)]">预计分段数</div>
+                    <div className="rounded-lg border border-black/10 bg-black/5 px-3 py-2">
+                      {resolveResegmentCount(
+                        resegmentVideoSeconds,
+                        resegmentSeconds,
+                      ) ?? "-"}
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={closeResegmentModal}
+                  >
+                    取消
+                  </button>
+                  <button
+                    className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    onClick={handleResegmentSubmit}
+                    disabled={resegmentSubmitting}
+                  >
+                    {resegmentSubmitting ? "提交中" : "开始重新分段"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+          {deleteConfirmOpen ? (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
+              <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-lg">
+                <div className="text-sm font-semibold text-[var(--ink)]">确认删除投稿任务？</div>
+                <div className="mt-2 text-xs text-[var(--muted)]">删除后不可恢复。</div>
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={handleDeleteCancel}
+                  >
+                    取消
+                  </button>
+                  <button
+                    className="rounded-full border border-red-200 bg-red-500 px-3 py-1 text-xs font-semibold text-white"
+                    onClick={handleDeleteConfirm}
+                  >
+                    确认删除
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </>
+      ) : null}
+
+      {(isDetailView || isEditView) && selectedTask ? (
+        <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">
+                视频投稿
+              </p>
+              <h2 className="text-2xl font-semibold text-[var(--ink)]">
+                {isEditView ? "投稿任务编辑" : "投稿任务详情"}
+              </h2>
+            </div>
+            <button
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+              onClick={backToList}
+            >
+              返回列表
+            </button>
+          </div>
+          {message ? (
+            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+              {message}
+            </div>
+          ) : null}
+          <div className="sticky top-0 z-10 -mx-6 mt-4 flex flex-wrap gap-2 border-y border-black/5 bg-[var(--surface)]/95 px-6 py-3 backdrop-blur">
+            {[
+              { key: "basic", label: "基本信息" },
+              { key: "source", label: "源视频" },
+              { key: "merged", label: "合并视频" },
+              { key: "segments", label: "输出分段" },
+              { key: "upload", label: "上传进度" },
+            ].map((tab) => (
+              <button
+                key={tab.key}
+                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                  detailTab === tab.key
+                    ? "bg-[var(--accent)] text-white"
+                    : "border border-black/10 bg-white text-[var(--ink)]"
+                }`}
+                onClick={() => setDetailTab(tab.key)}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          {detailTab === "basic" ? (
+            <div className="mt-4 space-y-4 text-sm text-[var(--ink)]">
+              <div className="grid gap-2">
+                <div>任务ID：{selectedTask.task.taskId}</div>
+                <div>状态：{formatTaskStatus(selectedTask.task.status)}</div>
+                <div>BVID：{selectedTask.task.bvid || "-"}</div>
+                <div>创建时间：{formatDateTime(selectedTask.task.createdAt)}</div>
+                <div>更新时间：{formatDateTime(selectedTask.task.updatedAt)}</div>
+              </div>
+              {isEditView ? (
+                <div className="rounded-xl border border-black/5 bg-white/80 p-3">
+                  <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                    投稿信息
+                  </div>
+                  <div className="mt-3 space-y-3">
+                    <div className="space-y-1">
+                      <div className="text-xs text-[var(--muted)]">投稿标题</div>
+                      <input
+                        value={taskForm.title}
+                        onChange={(event) =>
+                          setTaskForm((prev) => ({ ...prev, title: event.target.value }))
+                        }
+                        placeholder="请输入投稿标题"
+                        className="w-full rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-xs text-[var(--muted)]">视频描述</div>
+                      <textarea
+                        value={taskForm.description}
+                        onChange={(event) =>
+                          setTaskForm((prev) => ({ ...prev, description: event.target.value }))
+                        }
+                        placeholder="视频描述"
+                        rows={2}
+                        className="w-full rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
+                      />
+                    </div>
+                    <div className="grid gap-3 lg:grid-cols-2">
+                      <div className="space-y-1">
+                        <div className="text-xs text-[var(--muted)]">B站分区</div>
+                        <select
+                          value={taskForm.partitionId}
+                          onChange={(event) =>
+                            setTaskForm((prev) => ({
+                              ...prev,
+                              partitionId: event.target.value,
+                            }))
+                          }
+                          disabled={isEditView}
+                          className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none disabled:cursor-not-allowed disabled:bg-black/5"
+                        >
+                          <option value="">请选择分区</option>
+                          {partitions.map((partition) => (
+                            <option key={partition.tid} value={partition.tid}>
+                              {partition.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-xs text-[var(--muted)]">合集</div>
+                        <select
+                          value={taskForm.collectionId}
+                          onChange={(event) =>
+                            setTaskForm((prev) => ({
+                              ...prev,
+                              collectionId: event.target.value,
+                            }))
+                          }
+                          className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                        >
+                          <option value="">请选择合集</option>
+                          {collections.map((collection) => (
+                            <option key={collection.seasonId} value={collection.seasonId}>
+                              {collection.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 lg:grid-cols-2">
+                      <div className="space-y-1">
+                        <div className="text-xs text-[var(--muted)]">视频类型</div>
+                        <select
+                          value={taskForm.videoType}
+                          onChange={(event) =>
+                            setTaskForm((prev) => ({
+                              ...prev,
+                              videoType: event.target.value,
+                            }))
+                          }
+                          className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                        >
+                          <option value="ORIGINAL">原创</option>
+                          <option value="REPOST">转载</option>
+                        </select>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-xs text-[var(--muted)]">分段前缀</div>
+                        <input
+                          value={taskForm.segmentPrefix}
+                          onChange={(event) =>
+                            setTaskForm((prev) => ({
+                              ...prev,
+                              segmentPrefix: event.target.value,
+                            }))
+                          }
+                          placeholder="分段前缀"
+                          className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                        />
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-xs text-[var(--muted)]">投稿标签</div>
+                      <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus-within:border-[var(--accent)]">
+                        <div className="flex flex-wrap gap-2">
+                          {tags.map((tag) => (
+                            <span
+                              key={tag}
+                              className="inline-flex items-center gap-1 rounded-full bg-[var(--accent)]/10 px-2 py-1 text-xs text-[var(--accent)]"
+                            >
+                              {tag}
+                              <button
+                                className="text-[10px] font-semibold text-[var(--accent)] hover:opacity-70"
+                                onClick={() => removeTag(tag)}
+                                title="删除标签"
+                              >
+                                ×
+                              </button>
+                            </span>
+                          ))}
+                          <input
+                            value={tagInput}
+                            onChange={(event) => setTagInput(event.target.value)}
+                            onKeyDown={handleTagKeyDown}
+                            placeholder="回车添加标签"
+                            className="min-w-[120px] flex-1 bg-transparent text-sm text-[var(--ink)] focus:outline-none"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-xl border border-black/5 bg-white/80 p-3">
+                  <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                    投稿信息
+                  </div>
+                  <div className="mt-3 space-y-3">
+                    <div className="space-y-1">
+                      <div className="text-xs text-[var(--muted)]">投稿标题</div>
+                      <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2">
+                        {taskForm.title || "-"}
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-xs text-[var(--muted)]">视频描述</div>
+                      <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2">
+                        {taskForm.description || "-"}
+                      </div>
+                    </div>
+                    <div className="grid gap-3 lg:grid-cols-2">
+                      <div className="space-y-1">
+                        <div className="text-xs text-[var(--muted)]">B站分区</div>
+                        <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2">
+                          {partitionLabel}
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-xs text-[var(--muted)]">合集</div>
+                        <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2">
+                          {collectionLabel}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 lg:grid-cols-2">
+                      <div className="space-y-1">
+                        <div className="text-xs text-[var(--muted)]">视频类型</div>
+                        <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2">
+                          {videoTypeLabel}
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-xs text-[var(--muted)]">分段前缀</div>
+                        <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2">
+                          {taskForm.segmentPrefix || "-"}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-xs text-[var(--muted)]">投稿标签</div>
+                      <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2">
+                        {tags.length ? (
+                          <div className="flex flex-wrap gap-2">
+                            {tags.map((tag) => (
+                              <span
+                                key={tag}
+                                className="rounded-full bg-[var(--accent)]/10 px-2 py-1 text-xs text-[var(--accent)]"
+                              >
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-[var(--muted)]">-</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+              <div className="rounded-xl border border-black/5 bg-white/80 p-3">
+                <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                  工作流配置
+                </div>
+                <div className="mt-2 grid gap-2">
+                  <div>是否分段：{segmentationEnabled ? "需要分段" : "不需要分段"}</div>
+                  {segmentationEnabled ? (
+                    <>
+                      <div>
+                        分段时长：
+                        {workflowConfig.segmentationConfig.segmentDurationSeconds || "-"} 秒
+                      </div>
+                      <div>
+                        保留合并视频：
+                        {workflowConfig.segmentationConfig.preserveOriginal ? "是" : "否"}
+                      </div>
+                      <div>
+                        预计分段数：
+                        {detailEstimatedSegments ? detailEstimatedSegments : "-"}
+                      </div>
+                    </>
+                  ) : (
+                    <div>预计分段数：不分段</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : null}
+          {detailTab === "source" ? (
+            <div className="mt-4 overflow-hidden rounded-xl border border-black/5">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                  <tr>
+                    <th className="px-4 py-2">序号</th>
+                    <th className="px-4 py-2">视频文件路径</th>
+                    <th className="px-4 py-2">开始时间</th>
+                    <th className="px-4 py-2">结束时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedTask.sourceVideos.length === 0 ? (
+                    <tr>
+                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={4}>
+                        暂无源视频
+                      </td>
+                    </tr>
+                  ) : (
+                    selectedTask.sourceVideos.map((item, index) => (
+                      <tr key={item.id} className="border-t border-black/5">
+                        <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                        <td className="px-4 py-2 text-[var(--ink)]">
+                          {item.sourceFilePath}
+                        </td>
+                        <td className="px-4 py-2 text-[var(--muted)]">
+                          {item.startTime || "-"}
+                        </td>
+                        <td className="px-4 py-2 text-[var(--muted)]">
+                          {item.endTime || "-"}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          {detailTab === "merged" ? (
+            <div className="mt-4 overflow-hidden rounded-xl border border-black/5">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                  <tr>
+                    <th className="px-4 py-2">序号</th>
+                    <th className="px-4 py-2">文件名</th>
+                    <th className="px-4 py-2">文件路径</th>
+                    <th className="px-4 py-2">状态</th>
+                    <th className="px-4 py-2">创建时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedTask.mergedVideos.length === 0 ? (
+                    <tr>
+                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={5}>
+                        暂无合并视频
+                      </td>
+                    </tr>
+                  ) : (
+                    selectedTask.mergedVideos.map((item, index) => (
+                      <tr key={item.id} className="border-t border-black/5">
+                        <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                        <td className="px-4 py-2 text-[var(--ink)]">{item.fileName}</td>
+                        <td className="px-4 py-2 text-[var(--muted)]">{item.videoPath}</td>
+                        <td className="px-4 py-2 text-[var(--muted)]">{item.status}</td>
+                        <td className="px-4 py-2 text-[var(--muted)]">
+                          {formatDateTime(item.createTime)}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          {detailTab === "segments" ? (
+            <div className="mt-4 overflow-hidden rounded-xl border border-black/5">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                  <tr>
+                    <th className="px-4 py-2">序号</th>
+                    <th className="px-4 py-2">P名称</th>
+                    <th className="px-4 py-2">文件路径</th>
+                    <th className="px-4 py-2">上传状态</th>
+                    <th className="px-4 py-2">CID</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedTask.outputSegments.length === 0 ? (
+                    <tr>
+                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={5}>
+                        暂无输出分段
+                      </td>
+                    </tr>
+                  ) : (
+                    selectedTask.outputSegments.map((item, index) => (
+                      <tr key={item.segmentId} className="border-t border-black/5">
+                        <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                        <td className="px-4 py-2 text-[var(--ink)]">{item.partName}</td>
+                        <td className="px-4 py-2 text-[var(--muted)]">
+                          {item.segmentFilePath}
+                        </td>
+                        <td className="px-4 py-2 text-[var(--muted)]">
+                          {formatSegmentUploadStatus(item.uploadStatus)}
+                        </td>
+                        <td className="px-4 py-2 text-[var(--muted)]">{item.cid || "-"}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          {detailTab === "upload" ? (
+            <div className="mt-4 overflow-hidden rounded-xl border border-black/5">
+              {isEditView ? (
+                <div className="w-full">
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-black/5 px-4 py-3">
+                    <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                      上传进度
+                    </div>
+                    <button
+                      className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
+                      onClick={handleEditSegmentAdd}
+                    >
+                      新增分P
+                    </button>
+                  </div>
+                  <table className="w-full text-left text-sm">
+                    <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                      <tr>
+                        <th className="px-4 py-2">序号</th>
+                        <th className="px-4 py-2">排序</th>
+                        <th className="px-4 py-2">P名称</th>
+                        <th className="px-4 py-2">文件路径</th>
+                        <th className="px-4 py-2">上传状态</th>
+                        <th className="px-4 py-2">上传进度</th>
+                        <th className="px-4 py-2">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {editSegments.length === 0 ? (
+                        <tr>
+                          <td className="px-4 py-3 text-[var(--muted)]" colSpan={7}>
+                            暂无分P
+                          </td>
+                        </tr>
+                      ) : (
+                        editSegments.map((item, index) => {
+                          const progress = formatUploadProgress(item.uploadProgress);
+                          const isEditing = editingSegmentId === item.segmentId;
+                          const isDragging = draggingSegmentId === item.segmentId;
+                          return (
+                            <tr
+                              key={item.segmentId}
+                              data-segment-id={item.segmentId}
+                              className={`border-t border-black/5 ${isDragging ? "bg-black/5" : ""}`}
+                            >
+                              <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                              <td
+                                className="px-4 py-2 text-[var(--muted)] cursor-grab select-none"
+                                onPointerDown={(event) =>
+                                  handleSegmentPointerDown(event, item.segmentId)
+                                }
+                                style={{ touchAction: "none" }}
+                              >
+                                ≡
+                              </td>
+                              <td className="px-4 py-2 text-[var(--ink)]">
+                                {isEditing ? (
+                                  <input
+                                    value={editingSegmentName}
+                                    onChange={(event) =>
+                                      setEditingSegmentName(event.target.value)
+                                    }
+                                    onBlur={commitSegmentNameEdit}
+                                    onKeyDown={(event) => {
+                                      if (event.key === "Enter") {
+                                        event.preventDefault();
+                                        commitSegmentNameEdit();
+                                      }
+                                      if (event.key === "Escape") {
+                                        event.preventDefault();
+                                        cancelSegmentNameEdit();
+                                      }
+                                    }}
+                                    autoFocus
+                                    className="w-full rounded border border-black/10 bg-white/90 px-2 py-1 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
+                                  />
+                                ) : (
+                                  <div
+                                    className="cursor-text"
+                                    onDoubleClick={() => handleSegmentNameStartEdit(item)}
+                                  >
+                                    {item.partName}
+                                  </div>
+                                )}
+                              </td>
+                              <td className="px-4 py-2 text-[var(--muted)]">
+                                {item.segmentFilePath}
+                              </td>
+                              <td className="px-4 py-2 text-[var(--muted)]">
+                                {formatSegmentUploadStatus(item.uploadStatus)}
+                              </td>
+                              <td className="px-4 py-2">
+                                <div className="flex items-center gap-2">
+                                  <div className="h-1.5 w-24 rounded-full bg-black/5">
+                                    <div
+                                      className="h-1.5 rounded-full bg-[var(--accent)]"
+                                      style={{ width: `${progress}%` }}
+                                    />
+                                  </div>
+                                  <span className="text-xs text-[var(--muted)]">
+                                    {progress}%
+                                  </span>
+                                </div>
+                              </td>
+                              <td className="px-4 py-2">
+                                <div className="flex flex-wrap gap-2">
+                                  <button
+                                    className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                                    onClick={() => handleEditSegmentReupload(item.segmentId)}
+                                    disabled={item.uploadStatus === "UPLOADING"}
+                                  >
+                                    重新上传
+                                  </button>
+                                  <button
+                                    className="rounded-full border border-red-200 bg-white px-2 py-1 text-xs font-semibold text-red-600 hover:border-red-300"
+                                    onClick={() => handleEditSegmentDelete(item.segmentId)}
+                                  >
+                                    删除
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              ) : detailSegmentationEnabled ? (
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                    <tr>
+                      <th className="px-4 py-2">序号</th>
+                      <th className="px-4 py-2">P名称</th>
+                      <th className="px-4 py-2">文件路径</th>
+                      <th className="px-4 py-2">上传状态</th>
+                      <th className="px-4 py-2">上传进度</th>
+                      <th className="px-4 py-2">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedTask.outputSegments.length === 0 ? (
+                      <tr>
+                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={6}>
+                          暂无输出分段
+                        </td>
+                      </tr>
+                    ) : (
+                      selectedTask.outputSegments.map((item, index) => {
+                        const progress = formatUploadProgress(item.uploadProgress);
+                        const isRetrying = retryingSegmentIds.has(item.segmentId);
+                        return (
+                          <tr key={item.segmentId} className="border-t border-black/5">
+                            <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                            <td className="px-4 py-2 text-[var(--ink)]">{item.partName}</td>
+                            <td className="px-4 py-2 text-[var(--muted)]">
+                              {item.segmentFilePath}
+                            </td>
+                            <td className="px-4 py-2 text-[var(--muted)]">
+                              {formatSegmentUploadStatus(item.uploadStatus)}
+                            </td>
+                            <td className="px-4 py-2">
+                              <div className="flex items-center gap-2">
+                                <div className="h-1.5 w-24 rounded-full bg-black/5">
+                                  <div
+                                    className="h-1.5 rounded-full bg-[var(--accent)]"
+                                    style={{ width: `${progress}%` }}
+                                  />
+                                </div>
+                                <span className="text-xs text-[var(--muted)]">
+                                  {progress}%
+                                </span>
+                              </div>
+                            </td>
+                            <td className="px-4 py-2">
+                              {item.uploadStatus === "FAILED" ? (
+                                <button
+                                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                                  onClick={() => handleRetrySegmentUpload(item.segmentId)}
+                                  disabled={isRetrying}
+                                >
+                                  {isRetrying ? "重试中" : "重试"}
+                                </button>
+                              ) : (
+                                <span className="text-xs text-[var(--muted)]">-</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              ) : (
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                    <tr>
+                      <th className="px-4 py-2">序号</th>
+                      <th className="px-4 py-2">文件名</th>
+                      <th className="px-4 py-2">文件路径</th>
+                      <th className="px-4 py-2">上传进度</th>
+                      <th className="px-4 py-2">创建时间</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedTask.mergedVideos.length === 0 ? (
+                      <tr>
+                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={5}>
+                          暂无合并视频
+                        </td>
+                      </tr>
+                    ) : (
+                      selectedTask.mergedVideos.map((item, index) => {
+                        const progress = formatUploadProgress(item.uploadProgress);
+                        return (
+                          <tr key={item.id} className="border-t border-black/5">
+                            <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                            <td className="px-4 py-2 text-[var(--ink)]">
+                              {item.fileName || "-"}
+                            </td>
+                            <td className="px-4 py-2 text-[var(--muted)]">
+                              {item.videoPath || "-"}
+                            </td>
+                            <td className="px-4 py-2">
+                              <div className="flex items-center gap-2">
+                                <div className="h-1.5 w-24 rounded-full bg-black/5">
+                                  <div
+                                    className="h-1.5 rounded-full bg-[var(--accent)]"
+                                    style={{ width: `${progress}%` }}
+                                  />
+                                </div>
+                                <span className="text-xs text-[var(--muted)]">
+                                  {progress}%
+                                </span>
+                              </div>
+                            </td>
+                            <td className="px-4 py-2 text-[var(--muted)]">
+                              {formatDateTime(item.createTime)}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          ) : null}
+          {isEditView ? (
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+                onClick={handleEditSubmit}
+                disabled={submittingEdit}
+              >
+                {submittingEdit ? "提交中" : "提交修改"}
+              </button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
