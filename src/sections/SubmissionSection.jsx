@@ -73,6 +73,11 @@ export default function SubmissionSection() {
   const [resegmentSeconds, setResegmentSeconds] = useState("");
   const [resegmentSubmitting, setResegmentSubmitting] = useState(false);
   const [resegmentVideoSeconds, setResegmentVideoSeconds] = useState(0);
+  const [repostOpen, setRepostOpen] = useState(false);
+  const [repostTaskId, setRepostTaskId] = useState("");
+  const [repostHasBvid, setRepostHasBvid] = useState(false);
+  const [repostUseCurrentBvid, setRepostUseCurrentBvid] = useState(false);
+  const [repostSubmitting, setRepostSubmitting] = useState(false);
   const [updateTaskId, setUpdateTaskId] = useState("");
   const [updateSourceVideos, setUpdateSourceVideos] = useState([emptySource(0)]);
   const [updateSegmentationEnabled, setUpdateSegmentationEnabled] = useState(true);
@@ -242,6 +247,29 @@ export default function SubmissionSection() {
     setResegmentSeconds("");
     setResegmentSubmitting(false);
     setResegmentVideoSeconds(0);
+    setMessage("");
+  };
+
+  const openRepostModal = (task) => {
+    const targetId = String(task?.taskId || "").trim();
+    if (!targetId) {
+      return;
+    }
+    const hasBvid = Boolean(String(task?.bvid || "").trim());
+    setMessage("");
+    setRepostOpen(true);
+    setRepostTaskId(targetId);
+    setRepostHasBvid(hasBvid);
+    setRepostUseCurrentBvid(hasBvid);
+    setRepostSubmitting(false);
+  };
+
+  const closeRepostModal = () => {
+    setRepostOpen(false);
+    setRepostTaskId("");
+    setRepostHasBvid(false);
+    setRepostUseCurrentBvid(false);
+    setRepostSubmitting(false);
     setMessage("");
   };
 
@@ -926,6 +954,20 @@ export default function SubmissionSection() {
     }
   };
 
+  const handleOpenTaskFolder = async (taskId) => {
+    if (!taskId) {
+      setMessage("任务ID为空，无法打开目录");
+      return;
+    }
+    try {
+      const folderPath = await invokeCommand("submission_task_dir", { taskId });
+      const { openPath } = await import("@tauri-apps/plugin-opener");
+      await openPath(folderPath);
+    } catch (error) {
+      setMessage(error?.message || "打开任务目录失败");
+    }
+  };
+
   const applyTaskSummaryToForm = (task) => {
     if (!task) {
       return;
@@ -1207,6 +1249,28 @@ export default function SubmissionSection() {
     } catch (error) {
       setMessage(error.message);
       setResegmentSubmitting(false);
+    }
+  };
+
+  const handleRepostSubmit = async () => {
+    if (!repostTaskId || repostSubmitting) {
+      return;
+    }
+    setMessage("");
+    setRepostSubmitting(true);
+    try {
+      const result = await invokeCommand("submission_repost", {
+        request: {
+          taskId: repostTaskId,
+          integrateCurrentBvid: repostUseCurrentBvid,
+        },
+      });
+      setMessage(result || "已提交重新投稿");
+      closeRepostModal();
+      await loadTasks(statusFilter, currentPage, pageSize);
+    } catch (error) {
+      setMessage(error.message);
+      setRepostSubmitting(false);
     }
   };
 
@@ -1706,6 +1770,8 @@ export default function SubmissionSection() {
         return "待处理";
       case "RUNNING":
         return "运行中";
+      case "VIDEO_DOWNLOADING":
+        return "视频下载中";
       case "PAUSED":
         return "已暂停";
       case "COMPLETED":
@@ -1742,7 +1808,8 @@ export default function SubmissionSection() {
     if (status === "COMPLETED") return "bg-emerald-500/10 text-emerald-600";
     if (status === "FAILED" || status === "CANCELLED")
       return "bg-rose-500/10 text-rose-600";
-    if (status === "RUNNING") return "bg-amber-500/10 text-amber-600";
+    if (status === "RUNNING" || status === "VIDEO_DOWNLOADING")
+      return "bg-amber-500/10 text-amber-600";
     if (status === "PAUSED") return "bg-slate-500/10 text-slate-600";
     return "bg-slate-500/10 text-slate-600";
   };
@@ -2535,8 +2602,14 @@ export default function SubmissionSection() {
               ) : (
                 tasks.map((task) => (
                   <tr key={task.taskId} className="border-t border-black/5">
-                    <td className="px-6 py-3 text-[var(--ink)] whitespace-nowrap">
-                      {task.title}
+                    <td className="px-6 py-3 text-[var(--ink)] whitespace-normal">
+                      <button
+                        className="text-left font-semibold text-[var(--ink)] transition hover:text-[var(--accent)] hover:underline hover:underline-offset-4 break-words"
+                        title="打开任务目录"
+                        onClick={() => handleOpenTaskFolder(task.taskId)}
+                      >
+                        {task.title || "-"}
+                      </button>
                     </td>
                     <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
                       <span
@@ -2672,6 +2745,14 @@ export default function SubmissionSection() {
                             一键投稿
                           </button>
                         ) : null}
+                        {["COMPLETED", "FAILED"].includes(task.status) ? (
+                          <button
+                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                            onClick={() => openRepostModal(task)}
+                          >
+                            重新投稿
+                          </button>
+                        ) : null}
                         <button
                           className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
                           onClick={() => handleDetail(task.taskId)}
@@ -2795,6 +2876,66 @@ export default function SubmissionSection() {
                     disabled={resegmentSubmitting}
                   >
                     {resegmentSubmitting ? "提交中" : "开始重新分段"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+          {repostOpen ? (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
+              <div className="w-full max-w-md rounded-2xl bg-white p-5 shadow-lg">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-semibold text-[var(--ink)]">重新投稿</div>
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={closeRepostModal}
+                  >
+                    关闭
+                  </button>
+                </div>
+                {message ? (
+                  <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                    {message}
+                  </div>
+                ) : null}
+                <div className="mt-4 space-y-3 text-sm text-[var(--ink)]">
+                  <div className="text-xs text-[var(--muted)]">是否集成当前BV视频</div>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="radio"
+                      checked={repostUseCurrentBvid}
+                      onChange={() => setRepostUseCurrentBvid(true)}
+                      disabled={!repostHasBvid}
+                    />
+                    <span>集成当前BV视频（编辑投稿，沿用BV号）</span>
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="radio"
+                      checked={!repostUseCurrentBvid}
+                      onChange={() => setRepostUseCurrentBvid(false)}
+                    />
+                    <span>重新生成投稿（创建新的BV号）</span>
+                  </label>
+                  {!repostHasBvid ? (
+                    <div className="text-xs text-amber-700">
+                      当前任务没有BV号，将创建新投稿。
+                    </div>
+                  ) : null}
+                </div>
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                    onClick={closeRepostModal}
+                  >
+                    取消
+                  </button>
+                  <button
+                    className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    onClick={handleRepostSubmit}
+                    disabled={repostSubmitting}
+                  >
+                    {repostSubmitting ? "提交中" : "开始重新投稿"}
                   </button>
                 </div>
               </div>

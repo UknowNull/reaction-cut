@@ -26,14 +26,16 @@ use crate::commands::settings::{
 };
 use crate::config::default_download_dir;
 use crate::db::Db;
+use crate::login_refresh;
 use crate::login_store::{AuthInfo, LoginStore};
-use crate::processing::{clip_sources, merge_files, segment_file, ClipSource};
+use crate::processing::{can_concat_copy_sources, clip_sources, merge_files, segment_file, ClipSource};
 use crate::utils::{append_log, now_rfc3339, sanitize_filename};
 use crate::AppState;
 
 #[derive(Clone)]
 struct SubmissionContext {
   db: Arc<Db>,
+  app_log_path: Arc<PathBuf>,
   edit_upload_state: Arc<Mutex<EditUploadState>>,
 }
 
@@ -41,6 +43,7 @@ impl SubmissionContext {
   fn new(state: &State<'_, AppState>) -> Self {
     Self {
       db: state.db.clone(),
+      app_log_path: state.app_log_path.clone(),
       edit_upload_state: state.edit_upload_state.clone(),
     }
   }
@@ -156,6 +159,13 @@ pub struct SubmissionUpdateRequest {
 pub struct SubmissionResegmentRequest {
   pub task_id: String,
   pub segment_duration_seconds: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionRepostRequest {
+  pub task_id: String,
+  pub integrate_current_bvid: bool,
 }
 
 #[derive(Deserialize)]
@@ -521,12 +531,13 @@ pub async fn submission_update(
     Some(config) => config,
     None => return Ok(ApiResponse::error("工作流配置不能为空")),
   };
+  let workflow_config = attach_update_sources(workflow_config, &request.source_videos);
   append_log(
     &state.app_log_path,
     &format!("submission_update_start task_id={}", task_id),
   );
-  if let Err(err) = replace_source_videos(&context, &task_id, &request.source_videos) {
-    return Ok(ApiResponse::error(format!("更新源视频失败: {}", err)));
+  if let Err(err) = append_source_videos(&context, &task_id, &request.source_videos) {
+    return Ok(ApiResponse::error(format!("追加源视频失败: {}", err)));
   }
   if let Err(err) = reset_workflow_instances(&context, &task_id) {
     return Ok(ApiResponse::error(format!("重置工作流失败: {}", err)));
@@ -542,60 +553,170 @@ pub async fn submission_update(
   ) {
     return Ok(ApiResponse::error(err));
   }
-  start_submission_workflow(context.db.clone(), context.edit_upload_state.clone(), task_id);
+  start_submission_workflow(
+    context.db.clone(),
+    context.app_log_path.clone(),
+    context.edit_upload_state.clone(),
+    task_id,
+  );
   Ok(ApiResponse::success("更新任务已启动".to_string()))
 }
 
 #[tauri::command]
-pub fn submission_repost(
+pub async fn submission_repost(
   state: State<'_, AppState>,
-  task_id: String,
-) -> ApiResponse<String> {
+  request: SubmissionRepostRequest,
+) -> Result<ApiResponse<String>, String> {
   let context = SubmissionContext::new(&state);
-  let task_id = task_id.trim().to_string();
+  let task_id = request.task_id.trim().to_string();
   if task_id.is_empty() {
-    return ApiResponse::error("任务ID不能为空");
+    return Ok(ApiResponse::error("任务ID不能为空"));
   }
   let detail = match load_task_detail(&context, &task_id) {
     Ok(detail) => detail,
-    Err(err) => return ApiResponse::error(err),
+    Err(err) => return Ok(ApiResponse::error(err)),
   };
   if detail.task.status == "UPLOADING" {
-    return ApiResponse::error("任务正在投稿中，请稍后再试");
+    return Ok(ApiResponse::error("任务正在投稿中，请稍后再试"));
+  }
+  if detail.source_videos.is_empty() {
+    return Ok(ApiResponse::error("请至少添加一个源视频"));
   }
   let workflow_config = match detail.workflow_config {
     Some(config) => config,
-    None => return ApiResponse::error("未找到工作流配置"),
+    None => return Ok(ApiResponse::error("未找到工作流配置")),
   };
-  append_log(
-    &state.app_log_path,
-    &format!("submission_repost_start task_id={}", task_id),
-  );
-  if let Err(err) = clear_edit_upload_segments_by_task(&context, &task_id) {
+  let integrate_current_bvid = request.integrate_current_bvid;
+  if integrate_current_bvid {
+    let has_bvid = detail
+      .task
+      .bvid
+      .as_deref()
+      .map(|value| !value.trim().is_empty())
+      .unwrap_or(false);
+    if !has_bvid {
+      return Ok(ApiResponse::error("当前任务没有BV号，无法集成投稿"));
+    }
+  }
+
+  let missing_sources = collect_missing_source_files(&detail.source_videos);
+  if !missing_sources.is_empty() {
     append_log(
       &state.app_log_path,
+      &format!(
+        "submission_repost_missing_sources task_id={} count={}",
+        task_id,
+        missing_sources.len()
+      ),
+    );
+    for path in &missing_sources {
+      append_log(
+        &state.app_log_path,
+        &format!("submission_repost_missing_source task_id={} path={}", task_id, path),
+      );
+    }
+    let download_ids = load_integrated_download_ids(&context, &task_id)?;
+    if download_ids.is_empty() {
+      return Ok(ApiResponse::error("源视频不存在且未关联下载记录，请先补充下载"));
+    }
+    reset_submission_for_repost(
+      &context,
+      &state.app_log_path,
+      &task_id,
+      &workflow_config,
+      if integrate_current_bvid { "VIDEO_UPDATE" } else { "VIDEO_SUBMISSION" },
+      !integrate_current_bvid,
+    )?;
+    crate::commands::download::requeue_integrated_downloads(&state, &download_ids).await?;
+    return Ok(ApiResponse::success(
+      "源视频缺失，已加入下载队列，下载完成后自动重新投稿".to_string(),
+    ));
+  }
+
+  reset_submission_for_repost(
+    &context,
+    &state.app_log_path,
+    &task_id,
+    &workflow_config,
+    if integrate_current_bvid { "VIDEO_UPDATE" } else { "VIDEO_SUBMISSION" },
+    !integrate_current_bvid,
+  )?;
+  start_submission_workflow(
+    context.db.clone(),
+    context.app_log_path.clone(),
+    context.edit_upload_state.clone(),
+    task_id,
+  );
+  Ok(ApiResponse::success("重新投稿已启动".to_string()))
+}
+
+fn collect_missing_source_files(sources: &[TaskSourceVideoRecord]) -> Vec<String> {
+  let mut missing = Vec::new();
+  for source in sources {
+    if source.source_file_path.trim().is_empty() {
+      continue;
+    }
+    let path = Path::new(&source.source_file_path);
+    if !path.exists() {
+      missing.push(source.source_file_path.clone());
+    }
+  }
+  missing
+}
+
+fn load_integrated_download_ids(
+  context: &SubmissionContext,
+  task_id: &str,
+) -> Result<Vec<i64>, String> {
+  context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT download_task_id FROM task_relations WHERE submission_task_id = ?1 AND relation_type = 'INTEGRATED' ORDER BY id ASC",
+      )?;
+      let rows = stmt.query_map([task_id], |row| row.get(0))?;
+      let list = rows.collect::<Result<Vec<i64>, _>>()?;
+      Ok(list)
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn reset_submission_for_repost(
+  context: &SubmissionContext,
+  app_log_path: &PathBuf,
+  task_id: &str,
+  workflow_config: &Value,
+  workflow_type: &str,
+  clear_bvid: bool,
+) -> Result<(), String> {
+  append_log(
+    app_log_path,
+    &format!("submission_repost_start task_id={} type={}", task_id, workflow_type),
+  );
+  if let Err(err) = clear_edit_upload_segments_by_task(context, task_id) {
+    append_log(
+      app_log_path,
       &format!(
         "submission_repost_clear_cache_fail task_id={} err={}",
         task_id, err
       ),
     );
   }
-  if let Err(err) = reset_workflow_instances(&context, &task_id) {
-    return ApiResponse::error(format!("重置工作流失败: {}", err));
-  }
+  reset_workflow_instances(context, task_id)
+    .map_err(|err| format!("重置工作流失败: {}", err))?;
   let cleanup_result = context.db.with_conn(|conn| {
-    conn.execute("DELETE FROM task_output_segment WHERE task_id = ?1", [&task_id])?;
-    conn.execute("DELETE FROM merged_video WHERE task_id = ?1", [&task_id])?;
-    conn.execute("DELETE FROM video_clip WHERE task_id = ?1", [&task_id])?;
+    conn.execute("DELETE FROM task_output_segment WHERE task_id = ?1", [task_id])?;
+    conn.execute("DELETE FROM merged_video WHERE task_id = ?1", [task_id])?;
+    conn.execute("DELETE FROM video_clip WHERE task_id = ?1", [task_id])?;
     Ok(())
   });
   if let Err(err) = cleanup_result {
-    return ApiResponse::error(format!("清理任务数据失败: {}", err));
+    return Err(format!("清理任务数据失败: {}", err));
   }
-  let base_dir = resolve_submission_base_dir(&context, &task_id);
-  if let Err(err) = cleanup_submission_derived_files(&state.app_log_path, &base_dir) {
+  let base_dir = resolve_submission_base_dir(context, task_id);
+  if let Err(err) = cleanup_submission_derived_files(app_log_path, &base_dir) {
     append_log(
-      &state.app_log_path,
+      app_log_path,
       &format!(
         "submission_repost_cleanup_fail task_id={} err={}",
         task_id, err
@@ -604,20 +725,33 @@ pub fn submission_repost(
   }
   let now = now_rfc3339();
   let update_result = context.db.with_conn(|conn| {
-    conn.execute(
-      "UPDATE submission_task SET status = 'PENDING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
-      (&now, &task_id),
-    )?;
+    if clear_bvid {
+      conn.execute(
+        "UPDATE submission_task SET status = 'PENDING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+        (&now, task_id),
+      )?;
+    } else {
+      conn.execute(
+        "UPDATE submission_task SET status = 'PENDING', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+        (&now, task_id),
+      )?;
+    }
     Ok(())
   });
   if let Err(err) = update_result {
-    return ApiResponse::error(format!("重置任务状态失败: {}", err));
+    return Err(format!("重置任务状态失败: {}", err));
   }
-  if let Err(err) = create_workflow_instance_for_task(context.db.as_ref(), &task_id, &workflow_config) {
-    return ApiResponse::error(format!("创建工作流失败: {}", err));
-  }
-  start_submission_workflow(context.db.clone(), context.edit_upload_state.clone(), task_id);
-  ApiResponse::success("重新投稿已启动".to_string())
+  let (instance_id, _) =
+    create_workflow_instance_for_task_with_type(context.db.as_ref(), task_id, workflow_config, workflow_type)
+      .map_err(|err| format!("创建工作流失败: {}", err))?;
+  let _ = context.db.with_conn(|conn| {
+    conn.execute(
+      "UPDATE task_relations SET workflow_instance_id = ?1, updated_at = ?2 WHERE submission_task_id = ?3 AND relation_type = 'INTEGRATED'",
+      (&instance_id, &now, task_id),
+    )?;
+    Ok(())
+  });
+  Ok(())
 }
 
 #[tauri::command]
@@ -851,6 +985,26 @@ pub async fn submission_list_by_status(
 }
 
 #[tauri::command]
+pub fn submission_task_dir(state: State<'_, AppState>, task_id: String) -> ApiResponse<String> {
+  let trimmed = task_id.trim();
+  if trimmed.is_empty() {
+    return ApiResponse::error("任务ID不能为空");
+  }
+  let context = SubmissionContext::new(&state);
+  let dir = resolve_submission_base_dir(&context, trimmed);
+  match fs::metadata(&dir) {
+    Ok(meta) => {
+      if meta.is_dir() {
+        ApiResponse::success(dir.to_string_lossy().to_string())
+      } else {
+        ApiResponse::error("任务目录不是有效文件夹".to_string())
+      }
+    }
+    Err(err) => ApiResponse::error(format!("任务目录不存在: {}", err)),
+  }
+}
+
+#[tauri::command]
 pub fn submission_detail(
   state: State<'_, AppState>,
   task_id: String,
@@ -1050,7 +1204,7 @@ pub async fn submission_edit_add_segment(
     ),
   );
   let upload_context = UploadContext::new(&state);
-  let auth = match load_auth_or_error(&upload_context) {
+  let auth = match load_auth_or_refresh(&upload_context, "submission_edit_add_segment").await {
     Ok(auth) => auth,
     Err(err) => return Ok(ApiResponse::error(err)),
   };
@@ -1075,6 +1229,7 @@ pub async fn submission_edit_add_segment(
     let client = Client::new();
     let result = upload_edit_segment_with_retry(
       &context_clone,
+      &upload_context_clone,
       &client,
       &auth,
       &segment_id_clone,
@@ -1196,7 +1351,7 @@ pub async fn submission_edit_reupload_segment(
     Err(err) => return Ok(ApiResponse::error(err)),
   };
   let upload_context = UploadContext::new(&state);
-  let auth = match load_auth_or_error(&upload_context) {
+  let auth = match load_auth_or_refresh(&upload_context, "submission_edit_reupload").await {
     Ok(auth) => auth,
     Err(err) => return Ok(ApiResponse::error(err)),
   };
@@ -1207,6 +1362,7 @@ pub async fn submission_edit_reupload_segment(
     let client = Client::new();
     let result = upload_edit_segment_with_retry(
       &context_clone,
+      &upload_context_clone,
       &client,
       &auth,
       &segment_id_clone,
@@ -1357,18 +1513,27 @@ pub async fn submission_edit_submit(
     });
   }
   let upload_context = UploadContext::new(&state);
-  let auth = match load_auth_or_error(&upload_context) {
+  let mut auth = match load_auth_or_refresh(&upload_context, "submission_edit_prepare").await {
     Ok(auth) => auth,
     Err(err) => return Ok(ApiResponse::error(err)),
   };
   let csrf = match auth.csrf.clone() {
     Some(value) => value,
-    None => return Ok(ApiResponse::error("登录信息缺少CSRF")),
+    None => {
+      auth = match refresh_auth(&upload_context, "submission_edit_prepare_csrf").await {
+        Ok(auth) => auth,
+        Err(err) => return Ok(ApiResponse::error(err)),
+      };
+      match auth.csrf.clone() {
+        Some(value) => value,
+        None => return Ok(ApiResponse::error("登录信息缺少CSRF")),
+      }
+    }
   };
   let mut aid = detail.task.aid.unwrap_or(0);
   if aid <= 0 {
     let bvid = detail.task.bvid.clone().unwrap_or_default();
-    aid = fetch_aid_by_bvid(&upload_context, Some(&auth), &bvid)
+    aid = fetch_aid_with_refresh(&upload_context, &auth, &bvid)
       .await
       .unwrap_or(0);
     if aid <= 0 {
@@ -1387,7 +1552,8 @@ pub async fn submission_edit_submit(
   task.video_type = request.task.video_type.clone();
   task.segment_prefix = request.task.segment_prefix.clone();
   task.aid = Some(aid);
-  if let Err(err) = submit_video_edit(&upload_context, &auth, &task, &parts, aid, &csrf).await
+  if let Err(err) =
+    submit_video_edit_with_refresh(&upload_context, &auth, &task, &parts, aid, &csrf).await
   {
     return Ok(ApiResponse::error(err));
   }
@@ -1401,7 +1567,7 @@ pub async fn submission_edit_submit(
       ),
     );
     if next_collection_id > 0 {
-      if let Err(err) = switch_video_collection(
+      if let Err(err) = switch_video_collection_with_refresh(
         &upload_context,
         &auth,
         &task.title,
@@ -1587,7 +1753,12 @@ pub async fn submission_execute(
     &format!("submission_execute_request task_id={}", task_id),
   );
   let context = SubmissionContext::new(&state);
-  start_submission_workflow(context.db.clone(), context.edit_upload_state.clone(), task_id);
+  start_submission_workflow(
+    context.db.clone(),
+    context.app_log_path.clone(),
+    context.edit_upload_state.clone(),
+    task_id,
+  );
 
   Ok(ApiResponse::success("Workflow started".to_string()))
 }
@@ -1611,37 +1782,23 @@ pub async fn submission_integrated_execute(
     return Ok(ApiResponse::error("当前任务状态不支持一键投稿"));
   }
 
-  let (total, completed, failed) = match context.db.with_conn(|conn| {
-    let mut stmt = conn.prepare(
-      "SELECT \
-        COUNT(*) AS total, \
-        SUM(CASE WHEN vd.status = 2 THEN 1 ELSE 0 END) AS completed, \
-        SUM(CASE WHEN vd.status = 3 THEN 1 ELSE 0 END) AS failed \
-       FROM task_relations tr \
-       JOIN video_download vd ON tr.download_task_id = vd.id \
-       WHERE tr.submission_task_id = ?1 AND tr.relation_type = 'INTEGRATED'",
-    )?;
-    let row = stmt.query_row([&task_id], |row| {
-      let total: i64 = row.get(0)?;
-      let completed: Option<i64> = row.get(1)?;
-      let failed: Option<i64> = row.get(2)?;
-      Ok((total, completed.unwrap_or(0), failed.unwrap_or(0)))
-    })?;
-    Ok(row)
-  }) {
+  let stats = match load_integrated_download_stats(&context, &task_id) {
     Ok(value) => value,
     Err(err) => return Ok(ApiResponse::error(format!("读取下载状态失败: {}", err))),
   };
 
-  if total == 0 {
-    return Ok(ApiResponse::error("该任务未关联下载记录"));
-  }
-  if failed > 0 {
+  let stats = match stats {
+    Some(value) => value,
+    None => return Ok(ApiResponse::error("该任务未关联下载记录")),
+  };
+
+  if stats.failed > 0 {
     return Ok(ApiResponse::error("存在下载失败的分P，请先重试下载"));
   }
-  if completed != total {
+  if stats.completed != stats.total {
     return Ok(ApiResponse::error("仍有分P下载未完成"));
   }
+
 
   if let Ok(Some(workflow_status)) = load_workflow_status(&context, &task_id) {
     if workflow_status.status == "RUNNING" {
@@ -1651,6 +1808,7 @@ pub async fn submission_integrated_execute(
 
   start_submission_workflow(
     context.db.clone(),
+    context.app_log_path.clone(),
     context.edit_upload_state.clone(),
     task_id,
   );
@@ -1727,20 +1885,16 @@ pub async fn submission_retry_segment_upload(
   }
 
   let upload_context = UploadContext::new(&state);
-  let auth = match upload_context
-    .login_store
-    .load_auth_info(&upload_context.db)
-    .ok()
-    .flatten()
-  {
-    Some(auth) => auth,
-    None => return Ok(ApiResponse::error("请先登录")),
+  let auth = match load_auth_or_refresh(&upload_context, "submission_retry_segment").await {
+    Ok(auth) => auth,
+    Err(err) => return Ok(ApiResponse::error(err)),
   };
 
   update_segment_upload_status(&context, &segment_id, "UPLOADING")?;
   let client = Client::new();
   let result = upload_segment_with_retry(
     &context,
+    &upload_context,
     &client,
     &auth,
     &segment_id,
@@ -2102,32 +2256,140 @@ async fn run_submission_workflow(
   let _ = update_workflow_status(&context, &task_id, "RUNNING", Some("CLIPPING"), 0.0);
   update_submission_status(&context, &task_id, "CLIPPING")?;
 
-  let sources = load_source_videos(&context, &task_id)?;
+  let sources = if is_update_workflow {
+    match load_update_sources(&context, &task_id)? {
+      Some(update_sources) => update_sources,
+      None => load_source_videos(&context, &task_id)?,
+    }
+  } else {
+    load_source_videos(&context, &task_id)?
+  };
   if sources.is_empty() {
     update_submission_status(&context, &task_id, "FAILED")?;
     return Err("No source videos".to_string());
   }
 
   let base_dir = resolve_submission_base_dir(&context, &task_id);
-  let clip_dir = base_dir.join("cut");
+  let workflow_dir = if is_update_workflow {
+    let update_stamp = sanitize_filename(&format!("update_{}", now_rfc3339()));
+    base_dir.join("updates").join(update_stamp)
+  } else {
+    base_dir.clone()
+  };
+  let clip_dir = workflow_dir.join("cut");
+  let use_copy = match can_concat_copy_sources(&sources) {
+    Ok(value) => value,
+    Err(err) => {
+      append_log(
+        &context.app_log_path,
+        &format!("submission_clip_copy_check_err task_id={} err={}", task_id, err),
+      );
+      false
+    }
+  };
+  append_log(
+    &context.app_log_path,
+    &format!(
+      "submission_clip_start task_id={} sources={} use_copy={} output_dir={}",
+      task_id,
+      sources.len(),
+      use_copy,
+      clip_dir.to_string_lossy()
+    ),
+  );
+  for source in &sources {
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "submission_clip_source task_id={} order={} input={} start={} end={}",
+        task_id,
+        source.order,
+        source.input_path,
+        source.start_time.as_deref().unwrap_or(""),
+        source.end_time.as_deref().unwrap_or("")
+      ),
+    );
+  }
   let sources_clone = sources.clone();
-  let clip_outputs =
-    tauri::async_runtime::spawn_blocking(move || clip_sources(&sources_clone, &clip_dir))
-    .await
-    .map_err(|_| "Failed to clip videos".to_string())??;
+  let clip_dir_clone = clip_dir.clone();
+  let clip_outputs = match tauri::async_runtime::spawn_blocking(move || {
+    clip_sources(&sources_clone, &clip_dir_clone)
+  })
+  .await
+  {
+    Ok(Ok(outputs)) => outputs,
+    Ok(Err(err)) => {
+      append_log(
+        &context.app_log_path,
+        &format!("submission_clip_fail task_id={} err={}", task_id, err),
+      );
+      return Err(err);
+    }
+    Err(_) => {
+      append_log(
+        &context.app_log_path,
+        &format!("submission_clip_fail task_id={} err=spawn_blocking_failed", task_id),
+      );
+      return Err("Failed to clip videos".to_string());
+    }
+  };
+  append_log(
+    &context.app_log_path,
+    &format!(
+      "submission_clip_done task_id={} outputs={} output_dir={}",
+      task_id,
+      clip_outputs.len(),
+      clip_dir.to_string_lossy()
+    ),
+  );
 
   let _ = wait_for_workflow_ready(&context, &task_id).await?;
-  save_video_clips(&context, &task_id, &sources, &clip_outputs)?;
+  save_video_clips(
+    &context,
+    &task_id,
+    &sources,
+    &clip_outputs,
+    !is_update_workflow,
+  )?;
 
   update_submission_status(&context, &task_id, "MERGING")?;
   let _ = update_workflow_status(&context, &task_id, "RUNNING", Some("MERGING"), 40.0);
-  let merge_output = base_dir
+  let merge_output = workflow_dir
     .join("merge")
     .join(format!("{}_merged.mp4", sanitize_filename(&task_id)));
+  let merge_list_path = merge_output.with_extension("txt");
+  append_log(
+    &context.app_log_path,
+    &format!(
+      "submission_merge_start task_id={} inputs={} output={} list={} mode=concat_copy",
+      task_id,
+      clip_outputs.len(),
+      merge_output.to_string_lossy(),
+      merge_list_path.to_string_lossy()
+    ),
+  );
+  for path in &clip_outputs {
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "submission_merge_input task_id={} path={}",
+        task_id,
+        path.to_string_lossy()
+      ),
+    );
+  }
   let merge_output_clone = merge_output.clone();
   tauri::async_runtime::spawn_blocking(move || merge_files(&clip_outputs, &merge_output_clone))
     .await
     .map_err(|_| "Failed to merge videos".to_string())??;
+  append_log(
+    &context.app_log_path,
+    &format!(
+      "submission_merge_done task_id={} output={}",
+      task_id,
+      merge_output.to_string_lossy()
+    ),
+  );
 
   let _ = wait_for_workflow_ready(&context, &task_id).await?;
   save_merged_video(&context, &task_id, &merge_output)?;
@@ -2137,13 +2399,37 @@ async fn run_submission_workflow(
     let _ = wait_for_workflow_ready(&context, &task_id).await?;
     update_submission_status(&context, &task_id, "SEGMENTING")?;
     let _ = update_workflow_status(&context, &task_id, "RUNNING", Some("SEGMENTING"), 70.0);
-    let segment_dir = base_dir.join("output");
+    let segment_dir = workflow_dir.join("output");
     let merge_output_segment = merge_output.clone();
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "submission_segment_start task_id={} input={} output_dir={} segment_seconds={} mode=segment_copy",
+        task_id,
+        merge_output_segment.to_string_lossy(),
+        segment_dir.to_string_lossy(),
+        workflow_settings.segment_duration_seconds
+      ),
+    );
+    let segment_dir_clone = segment_dir.clone();
     let segment_outputs = tauri::async_runtime::spawn_blocking(move || {
-      segment_file(&merge_output_segment, &segment_dir, workflow_settings.segment_duration_seconds)
+      segment_file(
+        &merge_output_segment,
+        &segment_dir_clone,
+        workflow_settings.segment_duration_seconds,
+      )
     })
     .await
     .map_err(|_| "Failed to segment video".to_string())??;
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "submission_segment_done task_id={} outputs={} output_dir={}",
+        task_id,
+        segment_outputs.len(),
+        segment_dir.to_string_lossy()
+      ),
+    );
 
     if is_update_workflow {
       let (existing_count, max_order) = load_output_segment_stats(&context, &task_id)?;
@@ -2184,17 +2470,23 @@ async fn run_submission_workflow(
   }
 
   update_submission_status(&context, &task_id, "WAITING_UPLOAD")?;
-  let _ = update_workflow_status(&context, &task_id, "COMPLETED", None, 100.0);
+  let workflow_status = match load_integrated_download_stats(&context, &task_id)? {
+    Some(stats) if stats.completed < stats.total => "VIDEO_DOWNLOADING",
+    _ => "COMPLETED",
+  };
+  let _ = update_workflow_status(&context, &task_id, workflow_status, None, 100.0);
   Ok(())
 }
 
 pub fn start_submission_workflow(
   db: Arc<Db>,
+  app_log_path: Arc<PathBuf>,
   edit_upload_state: Arc<Mutex<EditUploadState>>,
   task_id: String,
 ) {
   let context = SubmissionContext {
     db,
+    app_log_path,
     edit_upload_state,
   };
   tauri::async_runtime::spawn(async move {
@@ -2340,6 +2632,7 @@ async fn run_submission_upload(
 ) -> Result<(), String> {
   let submission_context = SubmissionContext {
     db: context.db.clone(),
+    app_log_path: context.app_log_path.clone(),
     edit_upload_state: context.edit_upload_state.clone(),
   };
   append_log(
@@ -2347,23 +2640,27 @@ async fn run_submission_upload(
     &format!("submission_upload_start task_id={}", task_id),
   );
 
-  let auth = match context
-    .login_store
-    .load_auth_info(&context.db)
-    .ok()
-    .flatten()
-  {
-    Some(auth) => auth,
-    None => {
+  let mut auth = match load_auth_or_refresh(&context, "submission_upload").await {
+    Ok(auth) => auth,
+    Err(err) => {
       update_submission_status(&submission_context, &task_id, "FAILED")?;
-      return Err("请先登录".to_string());
+      return Err(err);
     }
   };
-  let csrf = match auth.csrf.clone() {
+  let mut csrf = match auth.csrf.clone() {
     Some(value) => value,
     None => {
-      update_submission_status(&submission_context, &task_id, "FAILED")?;
-      return Err("登录信息缺少CSRF".to_string());
+      auth = match refresh_auth(&context, "submission_upload_csrf").await {
+        Ok(auth) => auth,
+        Err(err) => {
+          update_submission_status(&submission_context, &task_id, "FAILED")?;
+          return Err(err);
+        }
+      };
+      auth
+        .csrf
+        .clone()
+        .ok_or_else(|| "登录信息缺少CSRF".to_string())?
     }
   };
 
@@ -2420,6 +2717,7 @@ async fn run_submission_upload(
       }
       let segment_id = segment.segment_id.clone();
       let context_clone = submission_context.clone();
+      let upload_context_clone = context.clone();
       let client_clone = client.clone();
       let auth_clone = auth.clone();
       let log_path = context.app_log_path.clone();
@@ -2438,6 +2736,7 @@ async fn run_submission_upload(
         };
         let result = upload_segment_with_retry(
           &context_clone,
+          &upload_context_clone,
           &client_clone,
           &auth_clone,
           &segment_id,
@@ -2515,6 +2814,7 @@ async fn run_submission_upload(
       }
       let segment_id = segment.segment_id.clone();
       let context_clone = submission_context.clone();
+      let upload_context_clone = context.clone();
       let client_clone = client.clone();
       let auth_clone = auth.clone();
       let log_path = context.app_log_path.clone();
@@ -2533,6 +2833,7 @@ async fn run_submission_upload(
         };
         let result = upload_segment_with_retry(
           &context_clone,
+          &upload_context_clone,
           &client_clone,
           &auth_clone,
           &segment_id,
@@ -2598,23 +2899,34 @@ async fn run_submission_upload(
     }
     let target = UploadTarget::Merged(merged.id);
     let resume_session = build_upload_session_from_merged(&merged);
-    let result = match upload_single_file(
-      &submission_context,
-      &target,
-      &client,
-      &auth,
-      Path::new(&merged_path),
-      &context.app_log_path,
-      resume_session,
-    )
-    .await
-    {
-      Ok(result) => result,
-      Err(err) => {
-        update_submission_status(&submission_context, &task_id, "FAILED")?;
-        return Err(err);
+    let mut current_auth = auth.clone();
+    let result = loop {
+      match upload_single_file(
+        &submission_context,
+        &target,
+        &client,
+        &current_auth,
+        Path::new(&merged_path),
+        &context.app_log_path,
+        resume_session.clone(),
+      )
+      .await
+      {
+        Ok(result) => break Ok(result),
+        Err(err) => {
+          if is_auth_error(&err) {
+            match refresh_auth(&context, "upload_merged").await {
+              Ok(auth) => {
+                current_auth = auth;
+                continue;
+              }
+              Err(refresh_err) => break Err(refresh_err),
+            }
+          }
+          break Err(err);
+        }
       }
-    };
+    }?;
     update_merged_upload_result(
       &submission_context,
       merged.id,
@@ -2637,7 +2949,7 @@ async fn run_submission_upload(
     let mut aid = detail.task.aid.unwrap_or(0);
     if aid <= 0 {
       let bvid = detail.task.bvid.clone().unwrap_or_default();
-      aid = fetch_aid_by_bvid(&context, Some(&auth), &bvid)
+      aid = fetch_aid_with_refresh(&context, &auth, &bvid)
         .await
         .unwrap_or(0);
       if aid > 0 {
@@ -2681,7 +2993,7 @@ async fn run_submission_upload(
         if let Some(collection_id) = detail.task.collection_id {
           if collection_id > 0 {
             let cid = parts.first().map(|item| item.cid).unwrap_or(0);
-            let add_result = add_video_to_collection(
+            let add_result = add_video_to_collection_with_refresh(
               &context,
               &auth,
               &detail.task.title,
@@ -2729,6 +3041,7 @@ async fn run_submission_upload(
 async fn submission_queue_loop(context: SubmissionQueueContext) {
   let submission_context = SubmissionContext {
     db: context.db.clone(),
+    app_log_path: context.app_log_path.clone(),
     edit_upload_state: context.edit_upload_state.clone(),
   };
   loop {
@@ -3015,6 +3328,7 @@ async fn fetch_remote_audit_map(
 async fn recover_submission_tasks(context: SubmissionQueueContext) {
   let submission_context = SubmissionContext {
     db: context.db.clone(),
+    app_log_path: context.app_log_path.clone(),
     edit_upload_state: context.edit_upload_state.clone(),
   };
   let mut processing_ids = Vec::new();
@@ -3351,6 +3665,7 @@ async fn upload_single_file(
 
 async fn upload_segment_with_retry(
   context: &SubmissionContext,
+  upload_context: &UploadContext,
   client: &Client,
   auth: &AuthInfo,
   segment_id: &str,
@@ -3358,6 +3673,7 @@ async fn upload_segment_with_retry(
   max_retries: u32,
 ) -> Result<UploadFileResult, String> {
   let mut attempt: u32 = 0;
+  let mut current_auth = auth.clone();
   loop {
     attempt = attempt.saturating_add(1);
     let segment = load_output_segment_by_id(context, segment_id)?
@@ -3373,7 +3689,7 @@ async fn upload_segment_with_retry(
       context,
       &target,
       client,
-      auth,
+      &current_auth,
       path,
       log_path,
       resume_session,
@@ -3382,6 +3698,15 @@ async fn upload_segment_with_retry(
     {
       Ok(result) => return Ok(result),
       Err(err) => {
+        if is_auth_error(&err) {
+          match refresh_auth(upload_context, "upload_segment").await {
+            Ok(auth) => {
+              current_auth = auth;
+              continue;
+            }
+            Err(refresh_err) => return Err(refresh_err),
+          }
+        }
         append_log(
           log_path,
           &format!(
@@ -3401,6 +3726,7 @@ async fn upload_segment_with_retry(
 
 async fn upload_edit_segment_with_retry(
   context: &SubmissionContext,
+  upload_context: &UploadContext,
   client: &Client,
   auth: &AuthInfo,
   segment_id: &str,
@@ -3408,6 +3734,7 @@ async fn upload_edit_segment_with_retry(
   max_retries: u32,
 ) -> Result<UploadFileResult, String> {
   let mut attempt: u32 = 0;
+  let mut current_auth = auth.clone();
   loop {
     attempt = attempt.saturating_add(1);
     let segment = load_edit_upload_segment(context, segment_id)?
@@ -3423,7 +3750,7 @@ async fn upload_edit_segment_with_retry(
       context,
       &target,
       client,
-      auth,
+      &current_auth,
       path,
       log_path,
       resume_session,
@@ -3432,6 +3759,15 @@ async fn upload_edit_segment_with_retry(
     {
       Ok(result) => return Ok(result),
       Err(err) => {
+        if is_auth_error(&err) {
+          match refresh_auth(upload_context, "upload_edit_segment").await {
+            Ok(auth) => {
+              current_auth = auth;
+              continue;
+            }
+            Err(refresh_err) => return Err(refresh_err),
+          }
+        }
         append_log(
           log_path,
           &format!(
@@ -3486,6 +3822,15 @@ async fn preupload_video(
       .json()
       .await
       .map_err(|err| format!("预上传解析失败: {}", err))?;
+    if let Some(code) = value.get("code").and_then(|val| val.as_i64()) {
+      if code != 0 {
+        let message = value
+          .get("message")
+          .and_then(|val| val.as_str())
+          .unwrap_or("预上传失败");
+        return Err(format!("{} (code: {})", message, code));
+      }
+    }
     if let Some(ok) = value.get("OK").and_then(|val| val.as_i64()) {
       if ok != 1 {
         return Err("预上传失败".to_string());
@@ -3561,6 +3906,15 @@ async fn post_video_meta(
       .json()
       .await
       .map_err(|err| format!("上传元数据解析失败: {}", err))?;
+    if let Some(code) = value.get("code").and_then(|val| val.as_i64()) {
+      if code != 0 {
+        let message = value
+          .get("message")
+          .and_then(|val| val.as_str())
+          .unwrap_or("上传元数据失败");
+        return Err(format!("{} (code: {})", message, code));
+      }
+    }
     if let Some(ok) = value.get("OK").and_then(|val| val.as_i64()) {
       if ok != 1 {
         return Err("上传元数据失败".to_string());
@@ -3800,6 +4154,53 @@ fn build_upload_url(endpoint: &str, upos_uri: &str) -> String {
   format!("https:{}{}", endpoint, path)
 }
 
+async fn submit_video_add_with_refresh(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  task: &SubmissionTaskRecord,
+  parts: &[UploadedVideoPart],
+  csrf: &str,
+) -> Result<SubmissionSubmitResult, String> {
+  match submit_video_add(context, auth, task, parts, csrf).await {
+    Ok(result) => Ok(result),
+    Err(err) => {
+      if !is_auth_error(&err) {
+        return Err(err);
+      }
+      let auth = refresh_auth(context, "submit_video_add").await?;
+      let csrf = auth
+        .csrf
+        .clone()
+        .ok_or_else(|| "登录信息缺少CSRF".to_string())?;
+      submit_video_add(context, &auth, task, parts, &csrf).await
+    }
+  }
+}
+
+async fn submit_video_edit_with_refresh(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  task: &SubmissionTaskRecord,
+  parts: &[UploadedVideoPart],
+  aid: i64,
+  csrf: &str,
+) -> Result<(), String> {
+  match submit_video_edit(context, auth, task, parts, aid, csrf).await {
+    Ok(()) => Ok(()),
+    Err(err) => {
+      if !is_auth_error(&err) {
+        return Err(err);
+      }
+      let auth = refresh_auth(context, "submit_video_edit").await?;
+      let csrf = auth
+        .csrf
+        .clone()
+        .ok_or_else(|| "登录信息缺少CSRF".to_string())?;
+      submit_video_edit(context, &auth, task, parts, aid, &csrf).await
+    }
+  }
+}
+
 async fn submit_video_in_batches(
   context: &UploadContext,
   auth: &AuthInfo,
@@ -3808,7 +4209,7 @@ async fn submit_video_in_batches(
   csrf: &str,
 ) -> Result<SubmissionSubmitResult, String> {
   if parts.len() <= MAX_PARTS_PER_SUBMISSION {
-    return submit_video_add(context, auth, task, parts, csrf).await;
+    return submit_video_add_with_refresh(context, auth, task, parts, csrf).await;
   }
 
   let total_batches = (parts.len() + MAX_PARTS_PER_SUBMISSION - 1) / MAX_PARTS_PER_SUBMISSION;
@@ -3823,7 +4224,7 @@ async fn submit_video_in_batches(
   );
 
   let first_parts = &parts[..MAX_PARTS_PER_SUBMISSION];
-  let result = submit_video_add(context, auth, task, first_parts, csrf).await?;
+  let result = submit_video_add_with_refresh(context, auth, task, first_parts, csrf).await?;
   let mut end_index = MAX_PARTS_PER_SUBMISSION;
   let mut batch_index = 2;
 
@@ -3836,7 +4237,8 @@ async fn submit_video_in_batches(
         result.aid, batch_index, total_batches, next_end
       ),
     );
-    submit_video_edit(context, auth, task, &parts[..next_end], result.aid, csrf).await?;
+    submit_video_edit_with_refresh(context, auth, task, &parts[..next_end], result.aid, csrf)
+      .await?;
     append_log(
       &context.app_log_path,
       &format!(
@@ -3860,7 +4262,7 @@ async fn submit_video_update_in_batches(
   csrf: &str,
 ) -> Result<(), String> {
   if parts.len() <= MAX_PARTS_PER_SUBMISSION {
-    submit_video_edit(context, auth, task, parts, aid, csrf).await?;
+    submit_video_edit_with_refresh(context, auth, task, parts, aid, csrf).await?;
     return Ok(());
   }
 
@@ -3886,7 +4288,7 @@ async fn submit_video_update_in_batches(
         aid, batch_index, total_batches, next_end
       ),
     );
-    submit_video_edit(context, auth, task, &parts[..next_end], aid, csrf).await?;
+    submit_video_edit_with_refresh(context, auth, task, &parts[..next_end], aid, csrf).await?;
     append_log(
       &context.app_log_path,
       &format!(
@@ -4072,6 +4474,55 @@ fn build_edit_payload(task: &SubmissionTaskRecord, parts: &[UploadedVideoPart], 
   payload
 }
 
+async fn add_video_to_collection_with_refresh(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  title: &str,
+  season_id: i64,
+  aid: i64,
+  cid: i64,
+  csrf: &str,
+) -> Result<(), String> {
+  match add_video_to_collection(context, auth, title, season_id, aid, cid, csrf).await {
+    Ok(()) => Ok(()),
+    Err(err) => {
+      if !is_auth_error(&err) {
+        return Err(err);
+      }
+      let auth = refresh_auth(context, "add_video_collection").await?;
+      let csrf = auth
+        .csrf
+        .clone()
+        .ok_or_else(|| "登录信息缺少CSRF".to_string())?;
+      add_video_to_collection(context, &auth, title, season_id, aid, cid, &csrf).await
+    }
+  }
+}
+
+async fn switch_video_collection_with_refresh(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  title: &str,
+  season_id: i64,
+  aid: i64,
+  csrf: &str,
+) -> Result<(), String> {
+  match switch_video_collection(context, auth, title, season_id, aid, csrf).await {
+    Ok(()) => Ok(()),
+    Err(err) => {
+      if !is_auth_error(&err) {
+        return Err(err);
+      }
+      let auth = refresh_auth(context, "switch_video_collection").await?;
+      let csrf = auth
+        .csrf
+        .clone()
+        .ok_or_else(|| "登录信息缺少CSRF".to_string())?;
+      switch_video_collection(context, &auth, title, season_id, aid, &csrf).await
+    }
+  }
+}
+
 async fn add_video_to_collection(
   context: &UploadContext,
   auth: &AuthInfo,
@@ -4248,6 +4699,79 @@ fn load_source_videos(
     .map_err(|err| err.to_string())
 }
 
+fn load_latest_workflow_config(
+  context: &SubmissionContext,
+  task_id: &str,
+) -> Result<Option<Value>, String> {
+  context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT wc.configuration_data FROM workflow_instances wi \
+         JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
+         WHERE wi.task_id = ?1 ORDER BY wi.created_at DESC LIMIT 1",
+      )?;
+      let result: Option<String> = stmt.query_row([task_id], |row| row.get(0)).ok();
+      Ok(result)
+    })
+    .map_err(|err| err.to_string())
+    .map(|value| value.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()))
+}
+
+fn load_update_sources(
+  context: &SubmissionContext,
+  task_id: &str,
+) -> Result<Option<Vec<ClipSource>>, String> {
+  let config = load_latest_workflow_config(context, task_id)?;
+  let Some(config) = config else {
+    return Ok(None);
+  };
+  let Some(list) = config.get("updateSources").and_then(|value| value.as_array()) else {
+    return Ok(None);
+  };
+  let mut sources = Vec::new();
+  for (index, item) in list.iter().enumerate() {
+    let input_path = item
+      .get("sourceFilePath")
+      .or_else(|| item.get("source_file_path"))
+      .and_then(|value| value.as_str())
+      .unwrap_or("")
+      .trim()
+      .to_string();
+    if input_path.is_empty() {
+      continue;
+    }
+    let start_time = item
+      .get("startTime")
+      .or_else(|| item.get("start_time"))
+      .and_then(|value| value.as_str())
+      .map(|value| value.trim().to_string())
+      .filter(|value| !value.is_empty());
+    let end_time = item
+      .get("endTime")
+      .or_else(|| item.get("end_time"))
+      .and_then(|value| value.as_str())
+      .map(|value| value.trim().to_string())
+      .filter(|value| !value.is_empty());
+    let order = item
+      .get("sortOrder")
+      .or_else(|| item.get("sort_order"))
+      .and_then(|value| value.as_i64())
+      .unwrap_or((index + 1) as i64);
+    sources.push(ClipSource {
+      input_path,
+      start_time,
+      end_time,
+      order,
+    });
+  }
+  if sources.is_empty() {
+    return Ok(None);
+  }
+  sources.sort_by_key(|item| item.order);
+  Ok(Some(sources))
+}
+
 fn replace_source_videos(
   context: &SubmissionContext,
   task_id: &str,
@@ -4277,17 +4801,100 @@ fn replace_source_videos(
     .map_err(|err| err.to_string())
 }
 
+fn append_source_videos(
+  context: &SubmissionContext,
+  task_id: &str,
+  sources: &[SourceVideoInput],
+) -> Result<(), String> {
+  context
+    .db
+    .with_conn(|conn| {
+      let base_order: i64 = conn
+        .query_row(
+          "SELECT COALESCE(MAX(sort_order), 0) FROM task_source_video WHERE task_id = ?1",
+          [task_id],
+          |row| row.get(0),
+        )
+        .unwrap_or(0);
+      for (index, source) in sources.iter().enumerate() {
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let sort_order = base_order + index as i64 + 1;
+        conn.execute(
+          "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+          (
+            source_id,
+            task_id,
+            &source.source_file_path,
+            sort_order,
+            source.start_time.as_deref(),
+            source.end_time.as_deref(),
+          ),
+        )?;
+      }
+      Ok(())
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn attach_update_sources(mut config: Value, sources: &[SourceVideoInput]) -> Value {
+  let list = sources
+    .iter()
+    .enumerate()
+    .map(|(index, source)| {
+      let mut map = Map::new();
+      map.insert(
+        "sourceFilePath".to_string(),
+        Value::String(source.source_file_path.clone()),
+      );
+      if let Some(start) = source.start_time.as_deref() {
+        let trimmed = start.trim();
+        if !trimmed.is_empty() {
+          map.insert("startTime".to_string(), Value::String(trimmed.to_string()));
+        }
+      }
+      if let Some(end) = source.end_time.as_deref() {
+        let trimmed = end.trim();
+        if !trimmed.is_empty() {
+          map.insert("endTime".to_string(), Value::String(trimmed.to_string()));
+        }
+      }
+      map.insert(
+        "sortOrder".to_string(),
+        Value::Number(Number::from(
+          source.sort_order.max(1).max(index as i64 + 1),
+        )),
+      );
+      Value::Object(map)
+    })
+    .collect::<Vec<_>>();
+  match config {
+    Value::Object(mut map) => {
+      map.insert("updateSources".to_string(), Value::Array(list));
+      Value::Object(map)
+    }
+    _ => {
+      let mut map = Map::new();
+      map.insert("updateSources".to_string(), Value::Array(list));
+      Value::Object(map)
+    }
+  }
+}
+
 fn save_video_clips(
   context: &SubmissionContext,
   task_id: &str,
   sources: &[ClipSource],
   outputs: &[PathBuf],
+  replace_existing: bool,
 ) -> Result<(), String> {
   let now = now_rfc3339();
   context
     .db
     .with_conn(|conn| {
-      conn.execute("DELETE FROM video_clip WHERE task_id = ?1", [task_id])?;
+      if replace_existing {
+        conn.execute("DELETE FROM video_clip WHERE task_id = ?1", [task_id])?;
+      }
       for (index, output) in outputs.iter().enumerate() {
         let source = sources.get(index).cloned();
         conn.execute(
@@ -4943,6 +5550,18 @@ async fn fetch_aid_by_bvid(
   data.get("aid").and_then(|value| value.as_i64())
 }
 
+async fn fetch_aid_with_refresh(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  bvid: &str,
+) -> Option<i64> {
+  if let Some(aid) = fetch_aid_by_bvid(context, Some(auth), bvid).await {
+    return Some(aid);
+  }
+  let refreshed = refresh_auth(context, "fetch_aid").await.ok()?;
+  fetch_aid_by_bvid(context, Some(&refreshed), bvid).await
+}
+
 fn update_submission_bvid_and_aid(
   context: &SubmissionContext,
   task_id: &str,
@@ -4991,6 +5610,46 @@ fn load_task_status(context: &SubmissionContext, task_id: &str) -> Result<String
     .map_err(|err| err.to_string())
 }
 
+struct IntegratedDownloadStats {
+  total: i64,
+  completed: i64,
+  failed: i64,
+}
+
+fn load_integrated_download_stats(
+  context: &SubmissionContext,
+  task_id: &str,
+) -> Result<Option<IntegratedDownloadStats>, String> {
+  context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT \
+          COUNT(*) AS total, \
+          SUM(CASE WHEN vd.status = 2 THEN 1 ELSE 0 END) AS completed, \
+          SUM(CASE WHEN vd.status = 3 THEN 1 ELSE 0 END) AS failed \
+         FROM task_relations tr \
+         JOIN video_download vd ON tr.download_task_id = vd.id \
+         WHERE tr.submission_task_id = ?1 AND tr.relation_type = 'INTEGRATED'",
+      )?;
+      let row = stmt.query_row([task_id], |row| {
+        let total: i64 = row.get(0)?;
+        let completed: Option<i64> = row.get(1)?;
+        let failed: Option<i64> = row.get(2)?;
+        Ok(IntegratedDownloadStats {
+          total,
+          completed: completed.unwrap_or(0),
+          failed: failed.unwrap_or(0),
+        })
+      })?;
+      if row.total == 0 {
+        return Ok(None);
+      }
+      Ok(Some(row))
+    })
+    .map_err(|err| err.to_string())
+}
+
 fn ensure_editable_status(context: &SubmissionContext, task_id: &str) -> Result<(), String> {
   let status = load_task_status(context, task_id)?;
   if status == "UPLOADING" {
@@ -5015,13 +5674,60 @@ fn ensure_editable_detail(detail: &SubmissionTaskDetail) -> Result<(), String> {
   Ok(())
 }
 
-fn load_auth_or_error(context: &UploadContext) -> Result<AuthInfo, String> {
-  context
+async fn load_auth_or_refresh(
+  context: &UploadContext,
+  reason: &str,
+) -> Result<AuthInfo, String> {
+  if let Some(auth) = context
     .login_store
     .load_auth_info(&context.db)
     .ok()
     .flatten()
-    .ok_or_else(|| "请先登录".to_string())
+  {
+    return Ok(auth);
+  }
+  refresh_auth(context, reason).await
+}
+
+async fn refresh_auth(
+  context: &UploadContext,
+  reason: &str,
+) -> Result<AuthInfo, String> {
+  append_log(
+    &context.app_log_path,
+    &format!("submission_cookie_refresh_start reason={}", reason),
+  );
+  match login_refresh::refresh_cookie(
+    &context.bilibili,
+    &context.login_store,
+    &context.db,
+    &context.app_log_path,
+  )
+  .await
+  {
+    Ok(auth) => {
+      append_log(
+        &context.app_log_path,
+        &format!("submission_cookie_refresh_ok reason={}", reason),
+      );
+      Ok(auth)
+    }
+    Err(err) => {
+      append_log(
+        &context.app_log_path,
+        &format!("submission_cookie_refresh_fail reason={} err={}", reason, err),
+      );
+      Err(err)
+    }
+  }
+}
+
+fn is_auth_error(err: &str) -> bool {
+  err.contains("code: -101")
+    || err.contains("code: -111")
+    || err.contains("code: 86095")
+    || err.contains("账号未登录")
+    || err.contains("请先登录")
 }
 
 fn load_auth_from_queue_context(
@@ -5228,20 +5934,9 @@ struct WorkflowSettings {
 }
 
 fn load_workflow_settings(context: &SubmissionContext, task_id: &str) -> WorkflowSettings {
-  let config_value = context
-    .db
-    .with_conn(|conn| {
-      let mut stmt = conn.prepare(
-        "SELECT wc.configuration_data FROM workflow_instances wi \
-         JOIN workflow_configurations wc ON wi.configuration_id = wc.config_id \
-         WHERE wi.task_id = ?1 ORDER BY wi.created_at DESC LIMIT 1",
-      )?;
-      let result: Option<String> = stmt.query_row([task_id], |row| row.get(0)).ok();
-      Ok(result)
-    })
+  let config_value = load_latest_workflow_config(context, task_id)
     .ok()
-    .flatten()
-    .and_then(|value| serde_json::from_str::<Value>(&value).ok());
+    .flatten();
 
   parse_workflow_settings(config_value)
 }

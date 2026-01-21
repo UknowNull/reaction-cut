@@ -9,7 +9,8 @@ export default function SettingsSection() {
   const [uploadConcurrency, setUploadConcurrency] = useState(3);
   const [submissionRemoteRefreshMinutes, setSubmissionRemoteRefreshMinutes] = useState(10);
   const [blockPcdn, setBlockPcdn] = useState(true);
-  const [enableAria2c, setEnableAria2c] = useState(true);
+  const [aria2cConnections, setAria2cConnections] = useState(4);
+  const [aria2cSplit, setAria2cSplit] = useState(4);
   const [message, setMessage] = useState("");
   const [liveMessage, setLiveMessage] = useState("");
   const [liveSettings, setLiveSettings] = useState({
@@ -64,7 +65,10 @@ export default function SettingsSection() {
         );
         setSubmissionRemoteRefreshMinutes(refreshMinutes);
         setBlockPcdn(Boolean(data.blockPcdn));
-        setEnableAria2c(Boolean(data.enableAria2c));
+        const connections = Math.min(32, Math.max(1, Number(data.aria2cConnections || 4)));
+        const split = Math.min(32, Math.max(1, Number(data.aria2cSplit || 4)));
+        setAria2cConnections(connections);
+        setAria2cSplit(split);
         await logClient(`settings_load:ok:${data.downloadPath || ""}`);
       }
     } catch (error) {
@@ -141,8 +145,13 @@ export default function SettingsSection() {
         1,
         Number(submissionRemoteRefreshMinutes) || 1,
       );
+      const normalizedAria2cConnections = Math.min(
+        32,
+        Math.max(1, Number(aria2cConnections) || 1),
+      );
+      const normalizedAria2cSplit = Math.min(32, Math.max(1, Number(aria2cSplit) || 1));
       await logClient(
-        `settings_save:start path=${downloadPath} threads=${String(threads)} queue=${String(queueSize)} uploadConcurrency=${String(normalizedUploadConcurrency)} remoteRefreshMinutes=${String(normalizedRefreshMinutes)} blockPcdn=${String(blockPcdn)} enableAria2c=${String(enableAria2c)}`,
+        `settings_save:start path=${downloadPath} threads=${String(threads)} queue=${String(queueSize)} uploadConcurrency=${String(normalizedUploadConcurrency)} remoteRefreshMinutes=${String(normalizedRefreshMinutes)} blockPcdn=${String(blockPcdn)} aria2cConnections=${String(normalizedAria2cConnections)} aria2cSplit=${String(normalizedAria2cSplit)}`,
       );
       await logClient("settings_save:invoke_start");
       const data = await invokeCommand("update_download_settings", {
@@ -152,7 +161,9 @@ export default function SettingsSection() {
         uploadConcurrency: normalizedUploadConcurrency,
         submissionRemoteRefreshMinutes: normalizedRefreshMinutes,
         blockPcdn: Boolean(blockPcdn),
-        enableAria2c: Boolean(enableAria2c),
+        aria2cConnections: normalizedAria2cConnections,
+        aria2cSplit: normalizedAria2cSplit,
+        enableAria2c: true,
       });
       await logClient("settings_save:invoke_end");
       if (data) {
@@ -164,7 +175,10 @@ export default function SettingsSection() {
           Math.max(1, Number(data.submissionRemoteRefreshMinutes || 10)),
         );
         setBlockPcdn(Boolean(data.blockPcdn));
-        setEnableAria2c(Boolean(data.enableAria2c));
+        setAria2cConnections(
+          Math.min(32, Math.max(1, Number(data.aria2cConnections || 4))),
+        );
+        setAria2cSplit(Math.min(32, Math.max(1, Number(data.aria2cSplit || 4))));
         await logClient(`settings_save:ok:${data.downloadPath || ""}`);
       }
       setMessage("设置已保存");
@@ -247,6 +261,32 @@ export default function SettingsSection() {
           </div>
           <div>
             <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              aria2c 连接数
+            </div>
+            <input
+              type="number"
+              value={aria2cConnections}
+              onChange={(event) => setAria2cConnections(event.target.value)}
+              min={1}
+              max={32}
+              className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+            />
+          </div>
+          <div>
+            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              aria2c 分片数
+            </div>
+            <input
+              type="number"
+              value={aria2cSplit}
+              onChange={(event) => setAria2cSplit(event.target.value)}
+              min={1}
+              max={32}
+              className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+            />
+          </div>
+          <div>
+            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
               投稿并发上传数
             </div>
             <input
@@ -309,14 +349,6 @@ export default function SettingsSection() {
               onChange={(event) => setBlockPcdn(event.target.checked)}
             />
             过滤 PCDN（优先镜像与 upos）
-          </label>
-          <label className="flex items-center gap-2 text-sm text-[var(--muted)] lg:col-span-2">
-            <input
-              type="checkbox"
-              checked={enableAria2c}
-              onChange={(event) => setEnableAria2c(event.target.checked)}
-            />
-            启用 aria2c 下载（失败自动回退）
           </label>
         </div>
         <div className="mt-4 flex flex-wrap gap-2">

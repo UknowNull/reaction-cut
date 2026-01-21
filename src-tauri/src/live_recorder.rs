@@ -18,9 +18,12 @@ use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
 
 use crate::bilibili::client::BilibiliClient;
-use crate::commands::settings::{load_download_settings_from_db, load_live_settings_from_db, LiveSettings};
+use crate::commands::settings::{
+  load_download_settings_from_db, load_live_settings_from_db, LiveSettings,
+};
 use crate::config::default_download_dir;
 use crate::db::Db;
+use crate::ffmpeg::run_ffmpeg;
 use crate::login_store::{AuthInfo, LoginStore};
 use crate::utils::{append_log, now_rfc3339, sanitize_filename};
 
@@ -370,7 +373,11 @@ fn run_record_loop(
     loop {
       if stop_flag.load(Ordering::SeqCst) {
         if let Some(mut seg) = segment.take() {
+          let record_id = seg.record_id;
+          let file_path = seg.file_path.clone();
           seg.finish("STOPPED", None)?;
+          drop(seg);
+          spawn_segment_remux(context.clone(), record_id, file_path);
         }
         return Ok(());
       }
@@ -379,7 +386,11 @@ fn run_record_loop(
         Ok(0) => {
           if settings.flv_fix_split_on_missing && !settings.flv_fix_disable_on_annexb {
             if let Some(mut seg) = segment.take() {
+              let record_id = seg.record_id;
+              let file_path = seg.file_path.clone();
               seg.finish("COMPLETED", Some("网络中断自动分段"))?;
+              drop(seg);
+              spawn_segment_remux(context.clone(), record_id, file_path);
             }
             segment_index += 1;
             current_title = load_current_title(&context, &room_id, &current_title);
@@ -451,7 +462,11 @@ fn run_record_loop(
                   if cache.has_header() {
                     split_flag.store(false, Ordering::SeqCst);
                     if let Some(mut seg) = segment.take() {
+                      let record_id = seg.record_id;
+                      let file_path = seg.file_path.clone();
                       seg.finish("COMPLETED", Some("分段切换"))?;
+                      drop(seg);
+                      spawn_segment_remux(context.clone(), record_id, file_path);
                     }
                     segment_index += 1;
                     current_title = load_current_title(&context, &room_id, &current_title);
@@ -507,7 +522,11 @@ fn run_record_loop(
           append_log(&context.app_log_path, &format!("stream_read_error room={} err={}", room_id, err));
           if settings.flv_fix_split_on_missing && !settings.flv_fix_disable_on_annexb {
             if let Some(mut seg) = segment.take() {
+              let record_id = seg.record_id;
+              let file_path = seg.file_path.clone();
               seg.finish("COMPLETED", Some("读取异常自动分段"))?;
+              drop(seg);
+              spawn_segment_remux(context.clone(), record_id, file_path);
             }
             segment_index += 1;
             current_title = load_current_title(&context, &room_id, &current_title);
@@ -810,6 +829,72 @@ fn open_segment(
   })
 }
 
+fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) {
+  let source_path = PathBuf::from(file_path);
+  let ext = source_path
+    .extension()
+    .and_then(|value| value.to_str())
+    .unwrap_or("")
+    .to_string();
+  if !ext.eq_ignore_ascii_case("flv") {
+    return;
+  }
+  let target_path = source_path.with_extension("mp4");
+  let source = source_path.to_string_lossy().to_string();
+  let target = target_path.to_string_lossy().to_string();
+  let log_path = context.app_log_path.clone();
+  let db = context.db.clone();
+  tauri::async_runtime::spawn(async move {
+    append_log(
+      log_path.as_ref(),
+      &format!("live_remux_start record_id={} source={} target={}", record_id, source, target),
+    );
+    let args = vec![
+      "-hide_banner".to_string(),
+      "-loglevel".to_string(),
+      "error".to_string(),
+      "-y".to_string(),
+      "-i".to_string(),
+      source.clone(),
+      "-c".to_string(),
+      "copy".to_string(),
+      target.clone(),
+    ];
+    let result = tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&args))
+      .await
+      .map_err(|_| "转封装执行失败".to_string());
+    match result {
+      Ok(Ok(())) => {
+        let file_size = std::fs::metadata(&target)
+          .map(|meta| meta.len())
+          .unwrap_or(0);
+        if let Err(err) = update_record_task_file_path(&db, record_id, &target, file_size) {
+          append_log(
+            log_path.as_ref(),
+            &format!("live_remux_update_fail record_id={} err={}", record_id, err),
+          );
+        }
+        append_log(
+          log_path.as_ref(),
+          &format!("live_remux_done record_id={} status=ok", record_id),
+        );
+      }
+      Ok(Err(err)) => {
+        append_log(
+          log_path.as_ref(),
+          &format!("live_remux_done record_id={} status=err err={}", record_id, err),
+        );
+      }
+      Err(err) => {
+        append_log(
+          log_path.as_ref(),
+          &format!("live_remux_done record_id={} status=err err={}", record_id, err),
+        );
+      }
+    }
+  });
+}
+
 fn insert_record_task(
   db: &Db,
   room_id: &str,
@@ -848,6 +933,23 @@ fn update_record_task(
     Ok(())
   })
   .map_err(|err| format!("更新录制任务失败: {}", err))
+}
+
+fn update_record_task_file_path(
+  db: &Db,
+  record_id: i64,
+  file_path: &str,
+  file_size: u64,
+) -> Result<(), String> {
+  let now = now_rfc3339();
+  db.with_conn(|conn| {
+    conn.execute(
+      "UPDATE live_record_task SET file_path = ?1, file_size = ?2, update_time = ?3 WHERE id = ?4",
+      (file_path, file_size as i64, &now, record_id),
+    )?;
+    Ok(())
+  })
+  .map_err(|err| format!("更新录播路径失败: {}", err))
 }
 
 fn load_anchor_room_ids(db: &Db) -> Result<Vec<String>, String> {

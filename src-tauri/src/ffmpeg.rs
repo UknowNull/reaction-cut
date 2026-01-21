@@ -3,10 +3,11 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-use crate::config::{DEFAULT_FFMPEG_PATH, DEFAULT_FFPROBE_PATH};
+use crate::config::{resolve_ffmpeg_path, resolve_ffprobe_path};
 
 pub fn run_ffmpeg(args: &[String]) -> Result<(), String> {
-  let output = Command::new(DEFAULT_FFMPEG_PATH)
+  let ffmpeg_path = resolve_ffmpeg_path();
+  let output = Command::new(ffmpeg_path)
     .args(args)
     .output()
     .map_err(|err| format!("Failed to start FFmpeg: {}", err))?;
@@ -27,7 +28,8 @@ pub fn run_ffmpeg_with_progress<F>(
 where
   F: FnMut(i64),
 {
-  let mut child = Command::new(DEFAULT_FFMPEG_PATH)
+  let ffmpeg_path = resolve_ffmpeg_path();
+  let mut child = Command::new(ffmpeg_path)
     .args(args)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -96,7 +98,8 @@ where
 }
 
 pub fn run_ffprobe_json(args: &[String]) -> Result<Value, String> {
-  let output = Command::new(DEFAULT_FFPROBE_PATH)
+  let ffprobe_path = resolve_ffprobe_path();
+  let output = Command::new(ffprobe_path)
     .args(args)
     .output()
     .map_err(|err| format!("Failed to start FFprobe: {}", err))?;

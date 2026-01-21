@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::time::{sleep, Duration};
 
+use tauri::path::BaseDirectory;
 use tauri::Manager;
 
 mod api;
@@ -12,6 +14,7 @@ mod config;
 mod db;
 mod ffmpeg;
 mod live_recorder;
+mod login_refresh;
 mod login_store;
 mod processing;
 mod utils;
@@ -29,12 +32,14 @@ struct AppState {
 
 struct DownloadRuntime {
     active_count: Mutex<i64>,
+    progress_state: Mutex<HashMap<i64, HashMap<String, (u64, u64)>>>,
 }
 
 impl DownloadRuntime {
     fn new() -> Self {
         Self {
             active_count: Mutex::new(0),
+            progress_state: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -70,6 +75,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            config::init_resource_bins(&app.handle());
             let app_dir = app.path().app_data_dir()?;
             let db_path = app_dir.join("reaction-cut-rust.sqlite3");
             let db = Arc::new(db::Db::new(db_path)?);
@@ -78,6 +84,32 @@ pub fn run() {
             let app_log_path = app_dir.join("app_debug.log");
             let panic_log_path = app_dir.join("panic_debug.log");
             utils::append_log(&app_log_path, "app_start");
+            match app.path().resolve("bin", BaseDirectory::Resource) {
+                Ok(resource_dir) => {
+                    utils::append_log(
+                        &app_log_path,
+                        &format!("resource_bin_dir={}", resource_dir.to_string_lossy()),
+                    );
+                }
+                Err(err) => {
+                    utils::append_log(
+                        &app_log_path,
+                        &format!("resource_bin_dir_error={}", err),
+                    );
+                }
+            }
+            let ffmpeg_path = config::resolve_ffmpeg_path();
+            let ffprobe_path = config::resolve_ffprobe_path();
+            let aria2c_candidates = config::resolve_aria2c_candidates();
+            utils::append_log(
+                &app_log_path,
+                &format!(
+                    "bin_paths ffmpeg={} ffprobe={} aria2c={}",
+                    ffmpeg_path.to_string_lossy(),
+                    ffprobe_path.to_string_lossy(),
+                    aria2c_candidates.join(",")
+                ),
+            );
             init_panic_log(Arc::new(panic_log_path));
             let heartbeat_path = app_log_path.clone();
             tauri::async_runtime::spawn(async move {
@@ -98,6 +130,8 @@ pub fn run() {
                     commands::submission::EditUploadState::default(),
                 )),
             };
+            commands::download::recover_stale_downloads(&state);
+            commands::download::start_download_queue_loop(&state);
             let live_context = live_recorder::LiveContext {
                 db: Arc::clone(&state.db),
                 bilibili: Arc::clone(&state.bilibili),
@@ -106,6 +140,12 @@ pub fn run() {
                 live_runtime: Arc::clone(&state.live_runtime),
             };
             live_recorder::start_auto_record_loop(live_context);
+            login_refresh::start_cookie_refresh_loop(
+                Arc::clone(&state.db),
+                Arc::clone(&state.bilibili),
+                Arc::clone(&state.login_store),
+                Arc::clone(&state.app_log_path),
+            );
             commands::submission::start_submission_background_tasks(
                 Arc::clone(&state.db),
                 Arc::clone(&state.bilibili),
@@ -150,6 +190,7 @@ pub fn run() {
             commands::download::download_list_by_status,
             commands::download::download_delete,
             commands::download::download_retry,
+            commands::download::download_resume,
             commands::process::process_create,
             commands::process::process_status,
             commands::toolbox::toolbox_remux,
@@ -159,6 +200,7 @@ pub fn run() {
             commands::submission::submission_resegment,
             commands::submission::submission_list,
             commands::submission::submission_list_by_status,
+            commands::submission::submission_task_dir,
             commands::submission::submission_detail,
             commands::submission::submission_edit_prepare,
             commands::submission::submission_edit_add_segment,

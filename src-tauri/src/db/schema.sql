@@ -133,6 +133,8 @@ CREATE TABLE IF NOT EXISTS video_download (
   local_path TEXT,
   status INTEGER DEFAULT 0,
   progress INTEGER DEFAULT 0,
+  progress_total INTEGER DEFAULT 0,
+  progress_done INTEGER DEFAULT 0,
   create_time TEXT NOT NULL,
   update_time TEXT NOT NULL,
   resolution TEXT,

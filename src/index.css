@@ -158,6 +158,34 @@ img {
   .sidebar .menu-label {
     @apply leading-none font-medium;
   }
+  .sidebar .menu-group {
+    @apply flex flex-col gap-1;
+  }
+  .sidebar .menu-group.expanded > button {
+    @apply text-[var(--primary-color)];
+    background-color: var(--solid-button-color);
+  }
+  .sidebar .menu-caret {
+    @apply ml-auto;
+    @apply transition-transform;
+    width: 10px;
+    height: 10px;
+    border-right: 2px solid var(--desc-color);
+    border-bottom: 2px solid var(--desc-color);
+    transform: rotate(-45deg);
+    margin-right: 2px;
+  }
+  .sidebar .menu-group.expanded .menu-caret {
+    border-right-color: var(--primary-color);
+    border-bottom-color: var(--primary-color);
+    transform: rotate(45deg);
+  }
+  .sidebar .submenu {
+    @apply ml-2 flex flex-col gap-1;
+  }
+  .sidebar button.submenu-item {
+    @apply h-9 text-sm pl-6;
+  }
   .main-shell {
     @apply flex flex-col relative w-full h-full overflow-hidden;
   }

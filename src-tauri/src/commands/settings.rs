@@ -15,6 +15,8 @@ pub const MAX_UPLOAD_CONCURRENCY: i64 = 5;
 pub const DEFAULT_SUBMISSION_REMOTE_REFRESH_MINUTES: i64 = 10;
 pub const DEFAULT_BLOCK_PCDN: bool = true;
 pub const DEFAULT_ENABLE_ARIA2C: bool = true;
+pub const DEFAULT_ARIA2C_CONNECTIONS: i64 = 4;
+pub const DEFAULT_ARIA2C_SPLIT: i64 = 4;
 pub const LEGACY_LIVE_FILE_TEMPLATE: &str =
   "live/{{ roomId }}/录制-{{ roomId }}-{{ now }}-{{ title }}.flv";
 pub const LEGACY_LIVE_FILE_TEMPLATE_DATE: &str =
@@ -32,6 +34,8 @@ pub struct DownloadSettings {
   pub submission_remote_refresh_minutes: i64,
   pub block_pcdn: bool,
   pub enable_aria2c: bool,
+  pub aria2c_connections: i64,
+  pub aria2c_split: i64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -85,9 +89,16 @@ pub fn update_download_settings(
   upload_concurrency: i64,
   submission_remote_refresh_minutes: i64,
   block_pcdn: bool,
-  enable_aria2c: bool,
+  aria2c_connections: i64,
+  aria2c_split: i64,
+  _enable_aria2c: bool,
 ) -> ApiResponse<DownloadSettings> {
-  if threads <= 0 || queue_size <= 0 || submission_remote_refresh_minutes <= 0 {
+  if threads <= 0
+    || queue_size <= 0
+    || submission_remote_refresh_minutes <= 0
+    || aria2c_connections <= 0
+    || aria2c_split <= 0
+  {
     return ApiResponse::error("Values must be greater than 0");
   }
   if upload_concurrency <= 0 || upload_concurrency > MAX_UPLOAD_CONCURRENCY {
@@ -99,8 +110,11 @@ pub fn update_download_settings(
   } else {
     download_path.trim().to_string()
   };
+  let normalized_aria2c_connections = aria2c_connections.clamp(1, 32);
+  let normalized_aria2c_split = aria2c_split.clamp(1, 32);
 
   let now = Utc::now().to_rfc3339();
+  let enable_aria2c = true;
   let result = state.db.with_conn(|conn| {
     conn.execute(
       "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
@@ -143,11 +157,21 @@ pub fn update_download_settings(
     conn.execute(
       "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+      ("download_enable_aria2c", "1", &now),
+    )?;
+    conn.execute(
+      "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
       (
-        "download_enable_aria2c",
-        if enable_aria2c { "1" } else { "0" },
+        "download_aria2c_connections",
+        normalized_aria2c_connections.to_string(),
         &now,
       ),
+    )?;
+    conn.execute(
+      "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+      ("download_aria2c_split", normalized_aria2c_split.to_string(), &now),
     )?;
     Ok(())
   });
@@ -164,6 +188,8 @@ pub fn update_download_settings(
     submission_remote_refresh_minutes,
     block_pcdn,
     enable_aria2c,
+    aria2c_connections: normalized_aria2c_connections,
+    aria2c_split: normalized_aria2c_split,
   })
 }
 
@@ -280,13 +306,28 @@ pub fn load_download_settings_from_db(db: &Db) -> Result<DownloadSettings, crate
         |row| row.get(0),
       )
       .ok();
-    let enable_aria2c: Option<String> = conn
+    let _enable_aria2c: Option<String> = conn
       .query_row(
         "SELECT value FROM app_settings WHERE key = 'download_enable_aria2c'",
         [],
         |row| row.get(0),
       )
       .ok();
+    let aria2c_connections: Option<String> = conn
+      .query_row(
+        "SELECT value FROM app_settings WHERE key = 'download_aria2c_connections'",
+        [],
+        |row| row.get(0),
+      )
+      .ok();
+    let aria2c_split: Option<String> = conn
+      .query_row(
+        "SELECT value FROM app_settings WHERE key = 'download_aria2c_split'",
+        [],
+        |row| row.get(0),
+      )
+      .ok();
+    let enable_aria2c = true;
 
     Ok(DownloadSettings {
       threads: threads
@@ -308,9 +349,15 @@ pub fn load_download_settings_from_db(db: &Db) -> Result<DownloadSettings, crate
       block_pcdn: block_pcdn
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(DEFAULT_BLOCK_PCDN),
-      enable_aria2c: enable_aria2c
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(DEFAULT_ENABLE_ARIA2C),
+      enable_aria2c,
+      aria2c_connections: aria2c_connections
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_ARIA2C_CONNECTIONS)
+        .clamp(1, 32),
+      aria2c_split: aria2c_split
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_ARIA2C_SPLIT)
+        .clamp(1, 32),
     })
   })
 }

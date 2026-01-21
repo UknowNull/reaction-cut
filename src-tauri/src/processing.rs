@@ -102,7 +102,9 @@ fn probe_media_info(path: &Path) -> Result<MediaProbeInfo, String> {
     "json".to_string(),
     path.to_string_lossy().to_string(),
   ];
-  let data = run_ffprobe_json(&args)?;
+  let args_line = args.join(" ");
+  let data = run_ffprobe_json(&args)
+    .map_err(|err| format!("ffprobe_fail path={} args={} err={}", path.to_string_lossy(), args_line, err))?;
   let streams = data
     .get("streams")
     .and_then(|value| value.as_array())
@@ -227,7 +229,7 @@ fn can_concat_copy(files: &[PathBuf]) -> Result<bool, String> {
   Ok(true)
 }
 
-fn can_concat_copy_sources(sources: &[ClipSource]) -> Result<bool, String> {
+pub fn can_concat_copy_sources(sources: &[ClipSource]) -> Result<bool, String> {
   let files: Vec<PathBuf> = sources
     .iter()
     .map(|source| PathBuf::from(&source.input_path))
@@ -377,5 +379,14 @@ fn clip_single(source: &ClipSource, output_path: &Path, use_copy: bool) -> Resul
   }
   args.push(output_path.to_string_lossy().to_string());
 
-  run_ffmpeg(&args)
+  let args_line = args.join(" ");
+  run_ffmpeg(&args).map_err(|err| {
+    format!(
+      "clip_ffmpeg_fail input={} output={} args={} err={}",
+      source.input_path,
+      output_path.to_string_lossy(),
+      args_line,
+      err
+    )
+  })
 }

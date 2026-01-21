@@ -32,6 +32,14 @@ impl Db {
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN reject_reason TEXT", []);
     let _ = conn.execute("ALTER TABLE video_download ADD COLUMN cid INTEGER", []);
     let _ = conn.execute("ALTER TABLE video_download ADD COLUMN content TEXT", []);
+    let _ = conn.execute(
+      "ALTER TABLE video_download ADD COLUMN progress_total INTEGER DEFAULT 0",
+      [],
+    );
+    let _ = conn.execute(
+      "ALTER TABLE video_download ADD COLUMN progress_done INTEGER DEFAULT 0",
+      [],
+    );
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN upload_progress REAL DEFAULT 0.0", []);
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN upload_uploaded_bytes INTEGER DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN upload_total_bytes INTEGER DEFAULT 0", []);

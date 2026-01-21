@@ -1,10 +1,14 @@
-use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Read};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufReader, Read};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use reqwest::blocking::Client;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::State;
@@ -12,7 +16,7 @@ use tokio::time::sleep;
 use url::Url;
 
 use crate::api::ApiResponse;
-use crate::config::{default_download_dir, DEFAULT_ARIA2C_PATH};
+use crate::config::{default_download_dir, resolve_aria2c_candidates};
 use crate::commands::settings::load_download_settings_from_db;
 use crate::ffmpeg::{run_ffmpeg, run_ffmpeg_with_progress, run_ffprobe_json};
 use crate::login_store::AuthInfo;
@@ -34,6 +38,17 @@ struct DownloadContext {
 
 impl DownloadContext {
   fn new(state: &State<'_, AppState>) -> Self {
+    Self {
+      db: state.db.clone(),
+      bilibili: state.bilibili.clone(),
+      login_store: state.login_store.clone(),
+      download_runtime: state.download_runtime.clone(),
+      app_log_path: state.app_log_path.clone(),
+      edit_upload_state: state.edit_upload_state.clone(),
+    }
+  }
+
+  fn from_state(state: &AppState) -> Self {
     Self {
       db: state.db.clone(),
       bilibili: state.bilibili.clone(),
@@ -134,8 +149,24 @@ pub struct VideoDownloadRecord {
   pub format: Option<String>,
   pub status: i64,
   pub progress: i64,
+  pub progress_total: i64,
+  pub progress_done: i64,
   pub create_time: String,
   pub update_time: String,
+}
+
+struct PendingDownloadRecord {
+  id: i64,
+  bvid: Option<String>,
+  aid: Option<String>,
+  part_title: Option<String>,
+  local_path: Option<String>,
+  resolution: Option<String>,
+  codec: Option<String>,
+  format: Option<String>,
+  cid: Option<i64>,
+  content: Option<String>,
+  progress: i64,
 }
 
 #[tauri::command]
@@ -179,7 +210,7 @@ pub async fn download_video(
 pub fn download_get(state: State<'_, AppState>, task_id: i64) -> ApiResponse<VideoDownloadRecord> {
   match state.db.with_conn(|conn| {
     conn.query_row(
-      "SELECT id, bvid, aid, title, part_title, part_count, current_part, download_url, local_path, resolution, codec, format, status, progress, create_time, update_time \
+      "SELECT id, bvid, aid, title, part_title, part_count, current_part, download_url, local_path, resolution, codec, format, status, progress, progress_total, progress_done, create_time, update_time \
        FROM video_download WHERE id = ?1",
       [task_id],
       |row| {
@@ -198,8 +229,10 @@ pub fn download_get(state: State<'_, AppState>, task_id: i64) -> ApiResponse<Vid
           format: row.get(11)?,
           status: row.get(12)?,
           progress: row.get(13)?,
-          create_time: row.get(14)?,
-          update_time: row.get(15)?,
+          progress_total: row.get(14)?,
+          progress_done: row.get(15)?,
+          create_time: row.get(16)?,
+          update_time: row.get(17)?,
         })
       },
     )
@@ -216,7 +249,7 @@ pub fn download_list_by_status(
 ) -> ApiResponse<Vec<VideoDownloadRecord>> {
   match state.db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT id, bvid, aid, title, part_title, part_count, current_part, download_url, local_path, resolution, codec, format, status, progress, create_time, update_time \
+      "SELECT id, bvid, aid, title, part_title, part_count, current_part, download_url, local_path, resolution, codec, format, status, progress, progress_total, progress_done, create_time, update_time \
        FROM video_download WHERE status = ?1 ORDER BY id DESC",
     )?;
     let list = stmt
@@ -236,8 +269,10 @@ pub fn download_list_by_status(
           format: row.get(11)?,
           status: row.get(12)?,
           progress: row.get(13)?,
-          create_time: row.get(14)?,
-          update_time: row.get(15)?,
+          progress_total: row.get(14)?,
+          progress_done: row.get(15)?,
+          create_time: row.get(16)?,
+          update_time: row.get(17)?,
         })
       })?
       .collect::<Result<Vec<_>, _>>()?;
@@ -249,7 +284,40 @@ pub fn download_list_by_status(
 }
 
 #[tauri::command]
-pub fn download_delete(state: State<'_, AppState>, task_id: i64) -> ApiResponse<String> {
+pub fn download_delete(
+  state: State<'_, AppState>,
+  task_id: i64,
+  delete_file: Option<bool>,
+) -> ApiResponse<String> {
+  let delete_file = delete_file.unwrap_or(false);
+  let local_path = match state.db.with_conn(|conn| {
+    conn.query_row(
+      "SELECT local_path FROM video_download WHERE id = ?1",
+      [task_id],
+      |row| row.get::<_, Option<String>>(0),
+    )
+  }) {
+    Ok(value) => value,
+    Err(err) => return ApiResponse::error(format!("Failed to load download record: {}", err)),
+  };
+
+  if delete_file {
+    let local_path = match local_path {
+      Some(value) if !value.trim().is_empty() => value,
+      _ => return ApiResponse::error("缺少本地路径，无法删除文件".to_string()),
+    };
+    let path = PathBuf::from(local_path);
+    cleanup_download_outputs(&path);
+
+    if let Some(parent) = path.parent() {
+      if is_dir_empty(parent) {
+        if let Err(err) = std::fs::remove_dir(parent) {
+          return ApiResponse::error(format!("删除目录失败: {}", err));
+        }
+      }
+    }
+  }
+
   match state.db.with_conn(|conn| {
     conn.execute("DELETE FROM video_download WHERE id = ?1", [task_id])?;
     Ok(())
@@ -299,6 +367,9 @@ pub async fn download_retry(
   if status == 0 {
     return Ok(ApiResponse::error("任务已在队列中"));
   }
+  if status == 4 {
+    return Ok(ApiResponse::error("任务已暂停，请使用继续下载"));
+  }
   let cid = match cid {
     Some(value) => value,
     None => return Ok(ApiResponse::error("该任务缺少CID，无法重试")),
@@ -307,13 +378,6 @@ pub async fn download_retry(
     Some(value) => value,
     None => return Ok(ApiResponse::error("缺少本地路径，无法重试")),
   };
-
-  let settings = load_download_settings_from_db(&context.db)
-    .map_err(|err| format!("Failed to load download settings: {}", err))?;
-  let active_count = count_active_downloads(&context)?;
-  if active_count >= settings.queue_size.max(1) {
-    return Ok(ApiResponse::error("下载队列已满"));
-  }
 
   let part = DownloadPart {
     cid,
@@ -328,23 +392,324 @@ pub async fn download_retry(
     format,
     content,
   };
+
+  let duration = if bvid.is_some() || aid.is_some() {
+    match fetch_play_info(&context, bvid.clone(), aid.clone(), cid, &config).await {
+      Ok(play_info) => {
+        let duration = extract_play_duration_seconds(&play_info);
+        if let Some(value) = duration {
+          append_log(
+            &context.app_log_path,
+            &format!("download_retry_duration task_id={} duration={}", task_id, value),
+          );
+        } else {
+          append_log(
+            &context.app_log_path,
+            &format!("download_retry_duration task_id={} duration=missing", task_id),
+          );
+        }
+        duration
+      }
+      Err(err) => {
+        append_log(
+          &context.app_log_path,
+          &format!("download_retry_duration task_id={} err={}", task_id, err),
+        );
+        None
+      }
+    }
+  } else {
+    None
+  };
+
+  let part = DownloadPart {
+    duration,
+    ..part
+  };
   let output_path = PathBuf::from(local_path);
+  cleanup_download_outputs(&output_path);
   let _ = update_download_status(&context, task_id, 0, 0);
-  let context_clone = context.clone();
-  tauri::async_runtime::spawn(async move {
-    run_download_job(
-      context_clone,
-      task_id,
-      bvid,
-      aid,
-      part,
-      config,
-      output_path,
-    )
-    .await;
-  });
+  let started = try_start_download_job(
+    context.clone(),
+    task_id,
+    0,
+    bvid,
+    aid,
+    part,
+    config,
+    output_path,
+    None,
+  )?;
+  if !started {
+    let _ = update_download_status_only(&context, task_id, 0);
+  }
+  schedule_pending_downloads(context.clone()).await;
 
   Ok(ApiResponse::success("Retry started".to_string()))
+}
+
+#[tauri::command]
+pub async fn download_resume(
+  state: State<'_, AppState>,
+  task_id: i64,
+) -> Result<ApiResponse<String>, String> {
+  let context = DownloadContext::new(&state);
+  let record = context
+    .db
+    .with_conn(|conn| {
+      conn.query_row(
+        "SELECT bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status, progress \
+         FROM video_download WHERE id = ?1",
+        [task_id],
+        |row| {
+          Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, i64>(10)?,
+          ))
+        },
+      )
+    })
+    .map_err(|err| format!("读取下载任务失败: {}", err))?;
+
+  let (bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status, progress) =
+    record;
+
+  if status == 1 {
+    return Ok(ApiResponse::error("任务正在下载"));
+  }
+  if status == 0 {
+    return Ok(ApiResponse::error("任务已在队列中"));
+  }
+  if status != 4 {
+    return Ok(ApiResponse::error("任务未处于暂停状态"));
+  }
+  let cid = match cid {
+    Some(value) => value,
+    None => return Ok(ApiResponse::error("该任务缺少CID，无法继续下载")),
+  };
+  let local_path = match local_path {
+    Some(value) => value,
+    None => return Ok(ApiResponse::error("缺少本地路径，无法继续下载")),
+  };
+
+  let part = DownloadPart {
+    cid,
+    title: part_title.unwrap_or_else(|| "未命名分P".to_string()),
+    duration: None,
+  };
+  let config = DownloadConfig {
+    download_name: None,
+    download_path: None,
+    resolution,
+    codec,
+    format,
+    content,
+  };
+
+  let duration = if bvid.is_some() || aid.is_some() {
+    match fetch_play_info(&context, bvid.clone(), aid.clone(), cid, &config).await {
+      Ok(play_info) => extract_play_duration_seconds(&play_info),
+      Err(_) => None,
+    }
+  } else {
+    None
+  };
+
+  let part = DownloadPart {
+    duration,
+    ..part
+  };
+  let output_path = PathBuf::from(local_path);
+  let resume_progress = progress.max(0).min(99);
+  let started = try_start_download_job(
+    context.clone(),
+    task_id,
+    4,
+    bvid,
+    aid,
+    part,
+    config,
+    output_path,
+    Some(resume_progress),
+  )?;
+  let message = if started {
+    "Resume started"
+  } else {
+    let _ = update_download_status_only(&context, task_id, 0);
+    "Resume queued"
+  };
+  schedule_pending_downloads(context.clone()).await;
+
+  Ok(ApiResponse::success(message.to_string()))
+}
+
+pub async fn requeue_integrated_downloads(
+  state: &State<'_, AppState>,
+  download_ids: &[i64],
+) -> Result<(), String> {
+  if download_ids.is_empty() {
+    return Ok(());
+  }
+  let context = DownloadContext::new(state);
+  for record_id in download_ids {
+    requeue_download_record(&context, *record_id).await?;
+  }
+  schedule_pending_downloads(context.clone()).await;
+  Ok(())
+}
+
+async fn requeue_download_record(
+  context: &DownloadContext,
+  record_id: i64,
+) -> Result<(), String> {
+  let record = context
+    .db
+    .with_conn(|conn| {
+      conn.query_row(
+        "SELECT bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status \
+         FROM video_download WHERE id = ?1",
+        [record_id],
+        |row| {
+          Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, i64>(9)?,
+          ))
+        },
+      )
+    })
+    .map_err(|err| format!("读取下载任务失败: {}", err))?;
+
+  let (bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status) =
+    record;
+
+  if status == 1 || status == 0 {
+    return Ok(());
+  }
+
+  let cid = match cid {
+    Some(value) => value,
+    None => return Err("该任务缺少CID，无法重新下载".to_string()),
+  };
+  let local_path = match local_path {
+    Some(value) => value,
+    None => return Err("缺少本地路径，无法重新下载".to_string()),
+  };
+
+  let part = DownloadPart {
+    cid,
+    title: part_title.unwrap_or_else(|| "未命名分P".to_string()),
+    duration: None,
+  };
+  let config = DownloadConfig {
+    download_name: None,
+    download_path: None,
+    resolution,
+    codec,
+    format,
+    content,
+  };
+
+  let duration = if bvid.is_some() || aid.is_some() {
+    match fetch_play_info(context, bvid.clone(), aid.clone(), cid, &config).await {
+      Ok(play_info) => extract_play_duration_seconds(&play_info),
+      Err(_) => None,
+    }
+  } else {
+    None
+  };
+  let part = DownloadPart { duration, ..part };
+  let output_path = PathBuf::from(local_path);
+  cleanup_download_outputs(&output_path);
+  reset_download_record_progress(context, record_id)?;
+  clear_download_progress(context, record_id);
+
+  let started = try_start_download_job(
+    context.clone(),
+    record_id,
+    0,
+    bvid,
+    aid,
+    part,
+    config,
+    output_path,
+    None,
+  )?;
+  if !started {
+    let _ = update_download_status_only(context, record_id, 0);
+  }
+
+  Ok(())
+}
+
+pub fn recover_stale_downloads(state: &AppState) {
+  let context = DownloadContext::from_state(state);
+  let stale_ids = context
+    .db
+    .with_conn(|conn| {
+      let mut stmt =
+        conn.prepare("SELECT id FROM video_download WHERE status = 1")?;
+      let rows = stmt.query_map([], |row| row.get(0))?;
+      Ok(rows.collect::<Result<Vec<i64>, _>>()?)
+    })
+    .unwrap_or_default();
+
+  if stale_ids.is_empty() {
+    append_log(&context.app_log_path, "download_recover_stale none");
+    return;
+  }
+
+  let now = now_rfc3339();
+  if context
+    .db
+    .with_conn(|conn| {
+      conn.execute(
+        "UPDATE video_download SET status = 4, update_time = ?1 WHERE status = 1",
+        [&now],
+      )?;
+      Ok(())
+    })
+    .is_ok()
+  {
+    append_log(
+      &context.app_log_path,
+      &format!("download_recover_stale status=paused count={}", stale_ids.len()),
+    );
+  }
+
+  let context_clone = context.clone();
+  tauri::async_runtime::spawn(async move {
+    for record_id in stale_ids {
+      let _ = refresh_integration_status(&context_clone, record_id).await;
+    }
+  });
+}
+
+pub fn start_download_queue_loop(state: &AppState) {
+  let context = DownloadContext::from_state(state);
+  tauri::async_runtime::spawn(async move {
+    schedule_pending_downloads(context.clone()).await;
+    loop {
+      sleep(Duration::from_secs(5)).await;
+      schedule_pending_downloads(context.clone()).await;
+    }
+  });
 }
 
 async fn handle_integration_download(
@@ -503,12 +868,6 @@ async fn create_download_tasks(
   } else {
     base_dir
   };
-  let queue_size = settings.queue_size.max(1);
-  let active_count = count_active_downloads(&context)?;
-  if active_count + part_count > queue_size {
-    return Err("下载队列已满".to_string());
-  }
-
   for (index, part) in parts.iter().enumerate() {
     let file_name = format!("{}.mp4", sanitize_filename(&part.title));
     let output_path = build_output_path(&base_dir, &sanitized_folder, &file_name);
@@ -517,8 +876,8 @@ async fn create_download_tasks(
       .db
       .with_conn(|conn| {
         conn.execute(
-          "INSERT INTO video_download (bvid, aid, title, part_title, part_count, current_part, download_url, local_path, status, progress, create_time, update_time, resolution, codec, format, cid, content) \
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+          "INSERT INTO video_download (bvid, aid, title, part_title, part_count, current_part, download_url, local_path, status, progress, progress_total, progress_done, create_time, update_time, resolution, codec, format, cid, content) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
           (
             bvid.as_deref(),
             aid.as_deref(),
@@ -543,31 +902,246 @@ async fn create_download_tasks(
 
     record_ids.push(record_id);
 
-    let context_clone = context.clone();
-    let part_clone = part.clone();
-    let config_clone = request.config.clone();
-    let bvid_clone = bvid.clone();
-    let aid_clone = aid.clone();
-    let output_path_clone = output_path.clone();
-
-    tauri::async_runtime::spawn(async move {
-      run_download_job(
-        context_clone,
-        record_id,
-        bvid_clone,
-        aid_clone,
-        part_clone,
-        config_clone,
-        output_path_clone,
-      )
-      .await;
-    });
   }
 
   if record_ids.is_empty() {
     return Err("No download task created".to_string());
   }
+  schedule_pending_downloads(context.clone()).await;
   Ok(record_ids)
+}
+
+async fn schedule_pending_downloads(context: DownloadContext) {
+  let available = match available_download_slots(&context) {
+    Ok(value) => value,
+    Err(err) => {
+      append_log(
+        &context.app_log_path,
+        &format!("download_schedule_skip err={}", err),
+      );
+      return;
+    }
+  };
+  if available <= 0 {
+    return;
+  }
+
+  let pending = match load_pending_downloads(&context, available) {
+    Ok(records) => records,
+    Err(err) => {
+      append_log(
+        &context.app_log_path,
+        &format!("download_schedule_skip err={}", err),
+      );
+      return;
+    }
+  };
+  if pending.is_empty() {
+    return;
+  }
+
+  for record in pending {
+    match start_pending_download(context.clone(), record) {
+      Ok(started) => {
+        if !started {
+          break;
+        }
+      }
+      Err(err) => {
+        append_log(
+          &context.app_log_path,
+          &format!("download_schedule_error err={}", err),
+        );
+      }
+    }
+  }
+}
+
+fn load_pending_downloads(
+  context: &DownloadContext,
+  limit: i64,
+) -> Result<Vec<PendingDownloadRecord>, String> {
+  if limit <= 0 {
+    return Ok(Vec::new());
+  }
+  context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT id, bvid, aid, part_title, local_path, resolution, codec, format, cid, content, progress \
+         FROM video_download WHERE status = 0 ORDER BY id ASC LIMIT ?1",
+      )?;
+      let rows = stmt.query_map([limit], |row| {
+        Ok(PendingDownloadRecord {
+          id: row.get(0)?,
+          bvid: row.get(1)?,
+          aid: row.get(2)?,
+          part_title: row.get(3)?,
+          local_path: row.get(4)?,
+          resolution: row.get(5)?,
+          codec: row.get(6)?,
+          format: row.get(7)?,
+          cid: row.get(8)?,
+          content: row.get(9)?,
+          progress: row.get(10)?,
+        })
+      })?;
+      Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .map_err(|err| format!("Failed to load pending downloads: {}", err))
+}
+
+fn start_pending_download(
+  context: DownloadContext,
+  record: PendingDownloadRecord,
+) -> Result<bool, String> {
+  let resume_progress = record.progress.max(0);
+  let local_path = match record.local_path {
+    Some(value) => value,
+    None => {
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "download_schedule_invalid record_id={} reason=missing_local_path",
+          record.id
+        ),
+      );
+      let _ = update_download_status(&context, record.id, 3, 0);
+      let context_clone = context.clone();
+      tauri::async_runtime::spawn(async move {
+        let _ = refresh_integration_status(&context_clone, record.id).await;
+      });
+      return Ok(false);
+    }
+  };
+  let cid = match record.cid {
+    Some(value) => value,
+    None => {
+      append_log(
+        &context.app_log_path,
+        &format!("download_schedule_invalid record_id={} reason=missing_cid", record.id),
+      );
+      let _ = update_download_status(&context, record.id, 3, 0);
+      let context_clone = context.clone();
+      tauri::async_runtime::spawn(async move {
+        let _ = refresh_integration_status(&context_clone, record.id).await;
+      });
+      return Ok(false);
+    }
+  };
+  let part = DownloadPart {
+    cid,
+    title: record.part_title.unwrap_or_else(|| "未命名分P".to_string()),
+    duration: None,
+  };
+  let config = DownloadConfig {
+    download_name: None,
+    download_path: None,
+    resolution: record.resolution,
+    codec: record.codec,
+    format: record.format,
+    content: record.content,
+  };
+
+  try_start_download_job(
+    context,
+    record.id,
+    0,
+    record.bvid,
+    record.aid,
+    part,
+    config,
+    PathBuf::from(local_path),
+    if resume_progress > 0 {
+      Some(resume_progress.min(99))
+    } else {
+      None
+    },
+  )
+}
+
+fn try_start_download_job(
+  context: DownloadContext,
+  record_id: i64,
+  expected_status: i64,
+  bvid: Option<String>,
+  aid: Option<String>,
+  part: DownloadPart,
+  config: DownloadConfig,
+  output_path: PathBuf,
+  resume_progress: Option<i64>,
+) -> Result<bool, String> {
+  if !try_acquire_download_slot(&context)? {
+    return Ok(false);
+  }
+  if !mark_download_running(&context, record_id, expected_status)? {
+    release_download_slot(&context);
+    return Ok(false);
+  }
+
+  let context_clone = context.clone();
+  tauri::async_runtime::spawn(async move {
+    run_download_job(
+      context_clone,
+      record_id,
+      bvid,
+      aid,
+      part,
+      config,
+      output_path,
+      resume_progress,
+    )
+    .await;
+  });
+
+  Ok(true)
+}
+
+fn mark_download_running(
+  context: &DownloadContext,
+  record_id: i64,
+  expected_status: i64,
+) -> Result<bool, String> {
+  let now = now_rfc3339();
+  context
+    .db
+    .with_conn(|conn| {
+      let updated = conn.execute(
+        "UPDATE video_download SET status = 1, update_time = ?1 WHERE id = ?2 AND status = ?3",
+        (&now, record_id, expected_status),
+      )?;
+      Ok(updated > 0)
+    })
+    .map_err(|err| format!("Failed to update download status: {}", err))
+}
+
+fn available_download_slots(context: &DownloadContext) -> Result<i64, String> {
+  let settings = load_download_settings_from_db(&context.db)
+    .map_err(|err| format!("Failed to load download settings: {}", err))?;
+  let threads = settings.threads.max(1);
+  let active = context
+    .download_runtime
+    .active_count
+    .lock()
+    .map_err(|_| "Download state lock failed".to_string())?;
+  Ok((threads - *active).max(0))
+}
+
+fn try_acquire_download_slot(context: &DownloadContext) -> Result<bool, String> {
+  let settings = load_download_settings_from_db(&context.db)
+    .map_err(|err| format!("Failed to load download settings: {}", err))?;
+  let threads = settings.threads.max(1);
+  let mut active = context
+    .download_runtime
+    .active_count
+    .lock()
+    .map_err(|_| "Download state lock failed".to_string())?;
+  if *active < threads {
+    *active += 1;
+    Ok(true)
+  } else {
+    Ok(false)
+  }
 }
 
 async fn run_download_job(
@@ -578,23 +1152,26 @@ async fn run_download_job(
   part: DownloadPart,
   config: DownloadConfig,
   output_path: PathBuf,
+  resume_progress: Option<i64>,
 ) {
-  if wait_for_download_slot(&context).await.is_err() {
-    let _ = update_download_status(&context, record_id, 3, 0);
-    return;
-  }
-
-  let _ = update_download_status(&context, record_id, 1, 0);
+  clear_download_progress(&context, record_id);
   append_log(
     &context.app_log_path,
     &format!("download_job_start record_id={} cid={}", record_id, part.cid),
   );
 
-  let result = download_part(&context, record_id, bvid, aid, part, config, output_path).await;
+  let result =
+    download_part(&context, record_id, bvid, aid, part, config, output_path, resume_progress)
+      .await;
   release_download_slot(&context);
+  let context_clone = context.clone();
+  tauri::async_runtime::spawn(async move {
+    schedule_pending_downloads(context_clone).await;
+  });
   match result {
     Ok(()) => {
       let _ = update_download_status(&context, record_id, 2, 100);
+      clear_download_progress(&context, record_id);
       append_log(
         &context.app_log_path,
         &format!("download_job_complete record_id={} status=completed", record_id),
@@ -602,38 +1179,26 @@ async fn run_download_job(
       let _ = refresh_integration_status(&context, record_id).await;
     }
     Err(err) => {
-      let _ = update_download_status(&context, record_id, 3, 0);
-      append_log(
-        &context.app_log_path,
-        &format!("download_job_complete record_id={} status=failed err={}", record_id, err),
-      );
+      if is_resume_error(&err) {
+        let _ = update_download_status_only(&context, record_id, 4);
+        clear_download_progress(&context, record_id);
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "download_job_complete record_id={} status=paused err={}",
+            record_id, err
+          ),
+        );
+      } else {
+        let _ = update_download_status(&context, record_id, 3, 0);
+        clear_download_progress(&context, record_id);
+        append_log(
+          &context.app_log_path,
+          &format!("download_job_complete record_id={} status=failed err={}", record_id, err),
+        );
+      }
       let _ = refresh_integration_status(&context, record_id).await;
     }
-  }
-}
-
-async fn wait_for_download_slot(context: &DownloadContext) -> Result<(), String> {
-  loop {
-    let settings = load_download_settings_from_db(&context.db)
-      .map_err(|err| format!("Failed to load download settings: {}", err))?;
-    let threads = settings.threads.max(1);
-    let acquired = {
-      let mut active = context
-        .download_runtime
-        .active_count
-        .lock()
-        .map_err(|_| "Download state lock failed".to_string())?;
-      if *active < threads {
-        *active += 1;
-        true
-      } else {
-        false
-      }
-    };
-    if acquired {
-      return Ok(());
-    }
-    sleep(Duration::from_secs(1)).await;
   }
 }
 
@@ -653,11 +1218,15 @@ async fn download_part(
   part: DownloadPart,
   config: DownloadConfig,
   output_path: PathBuf,
+  resume_progress: Option<i64>,
 ) -> Result<(), String> {
   let settings = load_download_settings_from_db(&context.db)
     .map_err(|err| format!("Failed to load download settings: {}", err))?;
   let block_pcdn = settings.block_pcdn;
   let enable_aria2c = settings.enable_aria2c;
+  let aria2c_connections = settings.aria2c_connections.max(1).min(32);
+  let aria2c_split = settings.aria2c_split.max(1).min(32);
+  let min_progress = resume_progress.filter(|value| *value > 0).map(|value| value.min(99));
   let play_info = fetch_play_info(context, bvid.clone(), aid.clone(), part.cid, &config).await?;
   let mut format = config.format.clone().unwrap_or_else(|| "dash".to_string());
   let has_dash = play_info.get("dash").is_some();
@@ -679,16 +1248,21 @@ async fn download_part(
     );
     format = "dash".to_string();
   }
-  let duration_ms = part.duration.and_then(|value| value.max(0).checked_mul(1000));
-  let expected_duration_seconds = part.duration.unwrap_or(0).max(0) as f64;
-  let track_progress = duration_ms.unwrap_or(0) > 0;
+  let duration = part
+    .duration
+    .or_else(|| extract_play_duration_seconds(&play_info))
+    .unwrap_or(0)
+    .max(0);
+  let duration_ms = duration.checked_mul(1000);
+  let expected_duration_seconds = duration as f64;
+  let track_progress = duration_ms.unwrap_or(0) > 0 || enable_aria2c;
 
   let header = build_ffmpeg_headers(context).unwrap_or_default();
   let output_path_string = output_path.to_string_lossy().to_string();
 
   if format == "mp4" || format == "flv" {
     let urls = collect_durl_urls(&play_info, block_pcdn)?;
-    if enable_aria2c {
+      if enable_aria2c {
       if let Err(err) = download_with_aria2c(
         context,
         record_id,
@@ -696,10 +1270,24 @@ async fn download_part(
         &output_path,
         &urls,
         &header,
-        None,
+        aria2c_connections,
+        aria2c_split,
+        "main",
       )
       .await
       {
+        if has_partial_file(&output_path) {
+          append_log(
+            &context.app_log_path,
+            &format!(
+              "aria2c_resume_pending record_id={} output={}",
+              record_id,
+              output_path.to_string_lossy()
+            ),
+          );
+          return Err("aria2c下载中断，可重试续传".to_string());
+        }
+        cleanup_aria2c_files(&output_path);
         append_log(
           &context.app_log_path,
           &format!("aria2c_fallback record_id={} err={}", record_id, err),
@@ -713,6 +1301,7 @@ async fn download_part(
       record_id,
       track_progress,
       duration_ms,
+      min_progress,
       &format,
       &output_path,
       &urls,
@@ -752,17 +1341,31 @@ async fn download_part(
         .map(|candidate| candidate.urls.clone())
         .ok_or_else(|| "Missing video URL".to_string())?;
       if enable_aria2c {
-        if let Err(err) = download_with_aria2c(
-          context,
-          record_id,
-          track_progress,
-          &output_path,
-          &video_urls,
-          &header,
-          None,
-        )
-        .await
-        {
+      if let Err(err) = download_with_aria2c(
+        context,
+        record_id,
+        track_progress,
+        &output_path,
+        &video_urls,
+        &header,
+        aria2c_connections,
+        aria2c_split,
+        "main",
+      )
+      .await
+      {
+          if has_partial_file(&output_path) {
+            append_log(
+              &context.app_log_path,
+              &format!(
+                "aria2c_resume_pending record_id={} output={}",
+                record_id,
+                output_path.to_string_lossy()
+              ),
+            );
+            return Err("aria2c下载中断，可重试续传".to_string());
+          }
+          cleanup_aria2c_files(&output_path);
           append_log(
             &context.app_log_path,
             &format!("aria2c_fallback record_id={} err={}", record_id, err),
@@ -776,6 +1379,7 @@ async fn download_part(
         record_id,
         track_progress,
         duration_ms,
+        min_progress,
         &format,
         &output_path,
         &video_urls,
@@ -807,17 +1411,31 @@ async fn download_part(
         .map(|candidate| candidate.urls.clone())
         .ok_or_else(|| "Missing audio URL".to_string())?;
       if enable_aria2c {
-        if let Err(err) = download_with_aria2c(
-          context,
-          record_id,
-          track_progress,
-          &output_path,
-          &audio_urls,
-          &header,
-          None,
-        )
-        .await
-        {
+      if let Err(err) = download_with_aria2c(
+        context,
+        record_id,
+        track_progress,
+        &output_path,
+        &audio_urls,
+        &header,
+        aria2c_connections,
+        aria2c_split,
+        "main",
+      )
+      .await
+      {
+          if has_partial_file(&output_path) {
+            append_log(
+              &context.app_log_path,
+              &format!(
+                "aria2c_resume_pending record_id={} output={}",
+                record_id,
+                output_path.to_string_lossy()
+              ),
+            );
+            return Err("aria2c下载中断，可重试续传".to_string());
+          }
+          cleanup_aria2c_files(&output_path);
           append_log(
             &context.app_log_path,
             &format!("aria2c_fallback record_id={} err={}", record_id, err),
@@ -831,6 +1449,7 @@ async fn download_part(
         record_id,
         track_progress,
         duration_ms,
+        min_progress,
         &format,
         &output_path,
         &audio_urls,
@@ -867,68 +1486,145 @@ async fn download_part(
           let temp_video_path = output_path.with_extension("video");
           let temp_audio_path = output_path.with_extension("audio");
           if aria2c_enabled {
-            if let Err(err) = download_with_aria2c(
-              context,
-              record_id,
-              track_progress,
-              &temp_video_path,
-              &video_candidate.urls,
-              &header,
-              Some((0, 45)),
-            )
-            .await
-            {
+            let (video_result, audio_result) = tokio::join!(
+              download_with_aria2c(
+                context,
+                record_id,
+                track_progress,
+                &temp_video_path,
+                &video_candidate.urls,
+                &header,
+                aria2c_connections,
+                aria2c_split,
+                "video",
+              ),
+              download_with_aria2c(
+                context,
+                record_id,
+                track_progress,
+                &temp_audio_path,
+                &audio_candidate.urls,
+                &header,
+                aria2c_connections,
+                aria2c_split,
+                "audio",
+              ),
+            );
+            if let Err(err) = &video_result {
               append_log(
                 &context.app_log_path,
                 &format!("aria2c_fallback record_id={} err={}", record_id, err),
               );
-              if is_aria2c_missing_error(&err) {
+              if is_aria2c_missing_error(err) {
                 aria2c_enabled = false;
               }
-              let _ = std::fs::remove_file(&temp_video_path);
-              aria2c_failed = true;
-            } else if let Err(err) = download_with_aria2c(
-              context,
-              record_id,
-              track_progress,
-              &temp_audio_path,
-              &audio_candidate.urls,
-              &header,
-              Some((45, 90)),
-            )
-            .await
-            {
+            }
+            if let Err(err) = &audio_result {
               append_log(
                 &context.app_log_path,
                 &format!("aria2c_fallback record_id={} err={}", record_id, err),
               );
-              if is_aria2c_missing_error(&err) {
+              if is_aria2c_missing_error(err) {
                 aria2c_enabled = false;
               }
-              let _ = std::fs::remove_file(&temp_video_path);
-              let _ = std::fs::remove_file(&temp_audio_path);
+            }
+            if video_result.is_err() || audio_result.is_err() {
+              if has_partial_file(&temp_video_path) || has_partial_file(&temp_audio_path) {
+                let resume_path = if has_partial_file(&temp_audio_path) {
+                  &temp_audio_path
+                } else {
+                  &temp_video_path
+                };
+                append_log(
+                  &context.app_log_path,
+                  &format!(
+                    "aria2c_resume_pending record_id={} output={}",
+                    record_id,
+                    resume_path.to_string_lossy()
+                  ),
+                );
+                return Err("aria2c下载中断，可重试续传".to_string());
+              }
+              cleanup_aria2c_files(&temp_video_path);
+              cleanup_aria2c_files(&temp_audio_path);
               aria2c_failed = true;
             } else {
-              let _ = update_download_status(context, record_id, 1, 95);
+              let _ = update_download_progress(context, record_id, 95);
+              let video_timing = log_ffprobe_source_duration(
+                &context.app_log_path,
+                record_id,
+                "dash_aria2c_video",
+                &temp_video_path,
+              );
+              let audio_timing = log_ffprobe_source_duration(
+                &context.app_log_path,
+                record_id,
+                "dash_aria2c_audio",
+                &temp_audio_path,
+              );
+              let mut video_delay = 0.0;
+              let mut audio_trim = 0.0;
+              if let (Some(video_timing), Some(audio_timing)) = (video_timing, audio_timing) {
+                let offset = video_timing.video_start - audio_timing.audio_start;
+                if offset > 0.1 {
+                  audio_trim = offset;
+                } else if offset < -0.1 {
+                  video_delay = -offset;
+                }
+                append_log(
+                  &context.app_log_path,
+                  &format!(
+                    "ffmpeg_merge_offset record_id={} v_start={:.3} a_start={:.3} v_delay={:.3} a_trim={:.3}",
+                    record_id,
+                    video_timing.video_start,
+                    audio_timing.audio_start,
+                    video_delay,
+                    audio_trim
+                  ),
+                );
+              }
               let mut args = Vec::new();
+              if video_delay > 0.0 {
+                args.push("-itsoffset".to_string());
+                args.push(format!("{:.3}", video_delay));
+              }
               args.push("-i".to_string());
               args.push(temp_video_path.to_string_lossy().to_string());
               args.push("-i".to_string());
               args.push(temp_audio_path.to_string_lossy().to_string());
+              if audio_trim > 0.0 {
+                args.push("-af".to_string());
+                args.push(format!(
+                  "atrim=start={:.3},asetpts=PTS-STARTPTS",
+                  audio_trim
+                ));
+              }
               args.extend([
                 "-map".to_string(),
                 "0:v:0".to_string(),
                 "-map".to_string(),
                 "1:a:0".to_string(),
-                "-c".to_string(),
+                "-c:v".to_string(),
                 "copy".to_string(),
+                "-c:a".to_string(),
+                if audio_trim > 0.0 {
+                  "aac".to_string()
+                } else {
+                  "copy".to_string()
+                },
+                "-shortest".to_string(),
               ]);
+              if output_path.extension().and_then(|value| value.to_str()) == Some("mp4") {
+                args.push("-movflags".to_string());
+                args.push("+faststart".to_string());
+              }
               args.push(output_path_string.clone());
               match run_ffmpeg_job(
                 context,
                 record_id,
                 false,
                 duration_ms,
+                min_progress,
                 &format,
                 &output_path,
                 args,
@@ -936,9 +1632,24 @@ async fn download_part(
               .await
               {
                 Ok(_) => {
-                  let _ = update_download_status(context, record_id, 1, 99);
+                  let _ = update_download_progress(context, record_id, 99);
                   match probe_stream_durations(&output_path) {
                   Ok((video_duration, audio_duration)) => {
+                    log_ffprobe_av_duration(
+                      &context.app_log_path,
+                      record_id,
+                      "dash_aria2c_merge",
+                      &output_path,
+                      expected_duration_seconds,
+                      video_duration,
+                      audio_duration,
+                    );
+                    log_ffprobe_av_timing(
+                      &context.app_log_path,
+                      record_id,
+                      "dash_aria2c_merge",
+                      &output_path,
+                    );
                     if !is_video_complete(
                       video_duration,
                       audio_duration,
@@ -1034,6 +1745,7 @@ async fn download_part(
                 "1:a:0".to_string(),
                 "-c".to_string(),
                 "copy".to_string(),
+                "-shortest".to_string(),
               ]);
               if track_progress {
                 args.push("-progress".to_string());
@@ -1046,6 +1758,7 @@ async fn download_part(
                 record_id,
                 track_progress,
                 duration_ms,
+                min_progress,
                 &format,
                 &output_path,
                 args,
@@ -1054,6 +1767,21 @@ async fn download_part(
               {
                 Ok(_) => match probe_stream_durations(&output_path) {
                   Ok((video_duration, audio_duration)) => {
+                    log_ffprobe_av_duration(
+                      &context.app_log_path,
+                      record_id,
+                      "dash_ffmpeg",
+                      &output_path,
+                      expected_duration_seconds,
+                      video_duration,
+                      audio_duration,
+                    );
+                    log_ffprobe_av_timing(
+                      &context.app_log_path,
+                      record_id,
+                      "dash_ffmpeg",
+                      &output_path,
+                    );
                     if !is_video_complete(
                       video_duration,
                       audio_duration,
@@ -1114,6 +1842,7 @@ async fn run_ffmpeg_job(
   record_id: i64,
   track_progress: bool,
   duration_ms: Option<i64>,
+  min_progress: Option<i64>,
   format: &str,
   output_path: &Path,
   args: Vec<String>,
@@ -1121,6 +1850,7 @@ async fn run_ffmpeg_job(
   if let Some(parent) = output_path.parent() {
     std::fs::create_dir_all(parent).map_err(|err| format!("Failed to create directory: {}", err))?;
   }
+  let _ = reset_download_progress_bytes(context, record_id);
 
   append_log(
     &context.app_log_path,
@@ -1134,14 +1864,19 @@ async fn run_ffmpeg_job(
   );
 
   let exec_result = if track_progress {
-    let mut last_progress = 0;
+    let min_progress = min_progress.unwrap_or(0).clamp(0, 99);
+    let mut last_progress = min_progress;
     let context_clone = context.clone();
     let record_id_clone = record_id;
     tauri::async_runtime::spawn_blocking(move || {
       run_ffmpeg_with_progress(&args, duration_ms, |progress| {
+        if progress <= last_progress {
+          return;
+        }
+        let progress = progress.max(min_progress);
         if progress > last_progress {
           last_progress = progress;
-          let _ = update_download_status(&context_clone, record_id_clone, 1, progress);
+          let _ = update_download_progress(&context_clone, record_id_clone, progress);
         }
       })
     })
@@ -1176,6 +1911,7 @@ async fn run_ffmpeg_job_with_url_fallback<F>(
   record_id: i64,
   track_progress: bool,
   duration_ms: Option<i64>,
+  min_progress: Option<i64>,
   format: &str,
   output_path: &Path,
   urls: &[String],
@@ -1201,6 +1937,7 @@ where
       record_id,
       track_progress,
       duration_ms,
+      min_progress,
       format,
       output_path,
       args,
@@ -1222,6 +1959,8 @@ fn build_aria2c_args(
   output_path: &Path,
   urls: &[String],
   header: &str,
+  connections: i64,
+  split: i64,
 ) -> Result<Vec<String>, String> {
   let parent = output_path
     .parent()
@@ -1232,12 +1971,15 @@ fn build_aria2c_args(
   let mut args = vec![
     "--allow-overwrite=true".to_string(),
     "--auto-file-renaming=false".to_string(),
+    "--continue=true".to_string(),
+    "--disable-ipv6=true".to_string(),
     "--file-allocation=none".to_string(),
     "--summary-interval=1".to_string(),
     "--console-log-level=warn".to_string(),
-    "--max-connection-per-server=4".to_string(),
-    "--split=4".to_string(),
+    format!("--max-connection-per-server={}", connections),
+    format!("--split={}", split),
     "--min-split-size=1M".to_string(),
+    "--referer=https://www.bilibili.com/".to_string(),
     format!("--dir={}", parent.to_string_lossy()),
     format!("--out={}", file_name.to_string_lossy()),
   ];
@@ -1250,30 +1992,174 @@ fn build_aria2c_args(
   Ok(args)
 }
 
-fn parse_aria2c_progress(line: &str) -> Option<i64> {
-  let mut digits = String::new();
-  let mut last_percent = None;
-  for ch in line.chars() {
-    if ch.is_ascii_digit() {
-      digits.push(ch);
-      continue;
-    }
-    if ch == '%' && !digits.is_empty() {
-      last_percent = digits.parse::<i64>().ok();
-    }
-    digits.clear();
+#[derive(Clone)]
+struct Aria2cRpcConfig {
+  endpoint: String,
+  secret: String,
+  port: u16,
+}
+
+#[derive(Deserialize)]
+struct Aria2cRpcError {
+  code: i64,
+  message: String,
+}
+
+#[derive(Deserialize)]
+struct Aria2cRpcResponse<T> {
+  result: Option<T>,
+  error: Option<Aria2cRpcError>,
+}
+
+#[derive(Deserialize)]
+struct Aria2cTaskStatus {
+  status: String,
+  #[serde(rename = "totalLength")]
+  total_length: String,
+  #[serde(rename = "completedLength")]
+  completed_length: String,
+  #[serde(rename = "errorCode")]
+  error_code: Option<String>,
+  #[serde(rename = "errorMessage")]
+  error_message: Option<String>,
+}
+
+fn build_aria2c_rpc_config() -> Result<Aria2cRpcConfig, String> {
+  let listener = TcpListener::bind("127.0.0.1:0")
+    .map_err(|err| format!("Failed to bind aria2c rpc port: {}", err))?;
+  let port = listener
+    .local_addr()
+    .map_err(|err| format!("Failed to read aria2c rpc port: {}", err))?
+    .port();
+  drop(listener);
+  let nanos = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_nanos();
+  let secret = format!("{}-{}", std::process::id(), nanos);
+  Ok(Aria2cRpcConfig {
+    endpoint: format!("http://127.0.0.1:{}/jsonrpc", port),
+    secret,
+    port,
+  })
+}
+
+fn append_aria2c_rpc_args(args: &mut Vec<String>, rpc: &Aria2cRpcConfig) {
+  args.push("--enable-rpc".to_string());
+  args.push("--rpc-listen-all=false".to_string());
+  args.push(format!("--rpc-listen-port={}", rpc.port));
+  args.push(format!("--rpc-secret={}", rpc.secret));
+}
+
+fn aria2c_rpc_request<T: DeserializeOwned>(
+  client: &Client,
+  rpc: &Aria2cRpcConfig,
+  method: &str,
+  mut params: Vec<Value>,
+) -> Result<T, String> {
+  params.insert(0, Value::String(format!("token:{}", rpc.secret)));
+  let payload = json!({
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": format!("aria2.{}", method),
+    "params": params,
+  });
+  let response = client
+    .post(&rpc.endpoint)
+    .json(&payload)
+    .send()
+    .map_err(|err| format!("aria2c rpc {} request failed: {}", method, err))?;
+  let body: Aria2cRpcResponse<T> = response
+    .json()
+    .map_err(|err| format!("aria2c rpc {} decode failed: {}", method, err))?;
+  if let Some(err) = body.error {
+    return Err(format!(
+      "aria2c rpc {} error: {} ({})",
+      method, err.message, err.code
+    ));
   }
-  last_percent
+  body
+    .result
+    .ok_or_else(|| format!("aria2c rpc {} empty result", method))
+}
+
+fn aria2c_rpc_fetch_status(
+  client: &Client,
+  rpc: &Aria2cRpcConfig,
+) -> Result<Option<Aria2cTaskStatus>, String> {
+  let active: Vec<Aria2cTaskStatus> = aria2c_rpc_request(client, rpc, "tellActive", vec![])?;
+  if let Some(status) = active.into_iter().next() {
+    return Ok(Some(status));
+  }
+  let waiting: Vec<Aria2cTaskStatus> =
+    aria2c_rpc_request(client, rpc, "tellWaiting", vec![json!(0), json!(1)])?;
+  if let Some(status) = waiting.into_iter().next() {
+    return Ok(Some(status));
+  }
+  let stopped: Vec<Aria2cTaskStatus> =
+    aria2c_rpc_request(client, rpc, "tellStopped", vec![json!(0), json!(1)])?;
+  Ok(stopped.into_iter().next())
+}
+
+fn aria2c_status_bytes(status: &Aria2cTaskStatus) -> Option<(u64, u64)> {
+  let total: u64 = status.total_length.parse().ok()?;
+  let completed: u64 = status.completed_length.parse().ok()?;
+  Some((total, completed))
+}
+
+fn aria2c_status_error(status: &Aria2cTaskStatus) -> Option<String> {
+  if status.status == "error" {
+    return Some(
+      status
+        .error_message
+        .clone()
+        .unwrap_or_else(|| "aria2c failed".to_string()),
+    );
+  }
+  if let Some(code) = &status.error_code {
+    if code != "0" && code != "31" {
+      let message = status
+        .error_message
+        .clone()
+        .unwrap_or_else(|| "aria2c failed".to_string());
+      return Some(format!("aria2c failed: {}", message));
+    }
+  }
+  None
+}
+
+fn has_partial_file(path: &Path) -> bool {
+  std::fs::metadata(path)
+    .map(|meta| meta.len() > 0)
+    .unwrap_or(false)
+}
+
+fn cleanup_aria2c_files(path: &Path) {
+  let _ = std::fs::remove_file(path);
+  let control_path = PathBuf::from(format!("{}.aria2", path.to_string_lossy()));
+  let _ = std::fs::remove_file(control_path);
+}
+
+fn cleanup_download_outputs(path: &Path) {
+  cleanup_aria2c_files(path);
+  let temp_video = path.with_extension("video");
+  let temp_audio = path.with_extension("audio");
+  cleanup_aria2c_files(&temp_video);
+  cleanup_aria2c_files(&temp_audio);
 }
 
 fn run_aria2c_with_path<F>(
+  app_log_path: &Path,
+  record_id: i64,
+  progress_key: &str,
   path: &str,
   args: &[String],
   track_progress: bool,
   on_progress: &mut F,
+  rpc: &Aria2cRpcConfig,
 ) -> Result<(), String>
 where
-  F: FnMut(i64),
+  F: FnMut(u64, u64),
 {
   let mut child = Command::new(path)
     .args(args)
@@ -1292,48 +2178,187 @@ where
     .ok_or_else(|| "Failed to capture aria2c stderr".to_string())?;
 
   let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
-  std::thread::spawn(move || {
+  thread::spawn(move || {
     let mut buffer = String::new();
     let _ = stderr.read_to_string(&mut buffer);
     let _ = stderr_tx.send(buffer);
   });
+  thread::spawn(move || {
+    let mut buffer = Vec::new();
+    let mut reader = BufReader::new(stdout);
+    let _ = reader.read_to_end(&mut buffer);
+  });
 
-  let mut last_progress = -1;
-  let reader = BufReader::new(stdout);
-  for line in reader.lines().flatten() {
-    if track_progress {
-      if let Some(progress) = parse_aria2c_progress(&line) {
-        let progress = progress.min(99);
-        if progress > last_progress {
-          last_progress = progress;
-          on_progress(progress);
-        }
-      }
+  let client = Client::builder()
+    .timeout(Duration::from_secs(3))
+    .build()
+    .map_err(|err| format!("Failed to create aria2c rpc client: {}", err))?;
+
+  let mut rpc_ready = false;
+  for _ in 0..20 {
+    if aria2c_rpc_request::<Value>(&client, rpc, "getVersion", vec![]).is_ok() {
+      rpc_ready = true;
+      break;
     }
+    thread::sleep(Duration::from_millis(100));
+  }
+  let mut logged_rpc_not_ready = false;
+  if !rpc_ready {
+    logged_rpc_not_ready = true;
+    append_log(
+      app_log_path,
+      &format!(
+        "aria2c_rpc_not_ready record_id={} key={} path={}",
+        record_id, progress_key, path
+      ),
+    );
   }
 
-  let status = child
-    .wait()
-    .map_err(|err| format!("Failed to wait for aria2c: {}", err))?;
+  let mut last_error: Option<String> = None;
+  let mut exit_status: Option<std::process::ExitStatus> = None;
+  let mut completed = false;
+  let mut logged_no_status = false;
+  let mut logged_zero_total = false;
+  let mut logged_parse_error = false;
+  loop {
+    if rpc_ready {
+      match aria2c_rpc_fetch_status(&client, rpc) {
+        Ok(Some(status)) => {
+          if let Some(err) = aria2c_status_error(&status) {
+            last_error = Some(err);
+            break;
+          }
+          if track_progress {
+            if let Some((content, chunk)) = aria2c_status_bytes(&status) {
+              if content == 0 && !logged_zero_total {
+                logged_zero_total = true;
+                append_log(
+                  app_log_path,
+                  &format!(
+                    "aria2c_rpc_zero_total record_id={} key={} status={} total={} completed={}",
+                    record_id,
+                    progress_key,
+                    status.status,
+                    status.total_length,
+                    status.completed_length
+                  ),
+                );
+              }
+              on_progress(content, chunk);
+            } else if !logged_parse_error {
+              logged_parse_error = true;
+              append_log(
+                app_log_path,
+                &format!(
+                  "aria2c_rpc_bytes_parse_fail record_id={} key={} status={} total={} completed={}",
+                  record_id,
+                  progress_key,
+                  status.status,
+                  status.total_length,
+                  status.completed_length
+                ),
+              );
+            }
+          }
+          if status.status == "complete" {
+            if let Some((content, _chunk)) = aria2c_status_bytes(&status) {
+              on_progress(content, content);
+            }
+            completed = true;
+            break;
+          }
+        }
+        Ok(None) => {
+          if !logged_no_status {
+            logged_no_status = true;
+            append_log(
+              app_log_path,
+              &format!("aria2c_rpc_no_status record_id={} key={}", record_id, progress_key),
+            );
+          }
+        }
+        Err(_) => {}
+      }
+    } else if aria2c_rpc_request::<Value>(&client, rpc, "getVersion", vec![]).is_ok() {
+      rpc_ready = true;
+      append_log(
+        app_log_path,
+        &format!(
+          "aria2c_rpc_ready record_id={} key={} path={}",
+          record_id, progress_key, path
+        ),
+      );
+    }
+
+    match child
+      .try_wait()
+      .map_err(|err| format!("Failed to wait for aria2c: {}", err))?
+    {
+      Some(status) => {
+        exit_status = Some(status);
+        break;
+      }
+      None => {}
+    }
+    thread::sleep(Duration::from_secs(1));
+  }
+
+  if completed && rpc_ready {
+    let _ = aria2c_rpc_request::<Value>(&client, rpc, "shutdown", vec![]);
+  }
+
+  if exit_status.is_none() {
+    let _ = child.kill();
+    exit_status = Some(
+      child
+        .wait()
+        .map_err(|err| format!("Failed to wait for aria2c: {}", err))?,
+    );
+  }
   let stderr_output = stderr_rx.recv().unwrap_or_default();
-  if status.success() {
+  if let Some(err) = last_error {
+    let stderr_trimmed = stderr_output.trim();
+    if stderr_trimmed.is_empty() {
+      return Err(err);
+    }
+    return Err(format!("{}; {}", err, stderr_trimmed));
+  }
+  if completed {
     return Ok(());
+  }
+  if let Some(status) = exit_status {
+    if status.success() {
+      return Ok(());
+    }
   }
 
   Err(format!("aria2c failed: {}", stderr_output.trim()))
 }
 
 fn run_aria2c_command<F>(
+  app_log_path: &Path,
+  record_id: i64,
+  progress_key: &str,
   args: &[String],
   track_progress: bool,
   on_progress: &mut F,
+  rpc: &Aria2cRpcConfig,
 ) -> Result<(), String>
 where
-  F: FnMut(i64),
+  F: FnMut(u64, u64),
 {
   let mut last_error = None;
-  for path in [DEFAULT_ARIA2C_PATH, "aria2c"] {
-    match run_aria2c_with_path(path, args, track_progress, on_progress) {
+  for path in resolve_aria2c_candidates() {
+    match run_aria2c_with_path(
+      app_log_path,
+      record_id,
+      progress_key,
+      &path,
+      args,
+      track_progress,
+      on_progress,
+      rpc,
+    ) {
       Ok(_) => return Ok(()),
       Err(err) => {
         last_error = Some(err);
@@ -1348,6 +2373,10 @@ fn is_aria2c_missing_error(message: &str) -> bool {
   lower.contains("aria2c") && (lower.contains("no such file") || lower.contains("not found"))
 }
 
+fn is_resume_error(message: &str) -> bool {
+  message.contains("可重试续传") || message.contains("aria2c下载中断")
+}
+
 async fn download_with_aria2c(
   context: &DownloadContext,
   record_id: i64,
@@ -1355,7 +2384,9 @@ async fn download_with_aria2c(
   output_path: &Path,
   urls: &[String],
   header: &str,
-  progress_range: Option<(i64, i64)>,
+  aria2c_connections: i64,
+  aria2c_split: i64,
+  progress_key: &str,
 ) -> Result<(), String> {
   if urls.is_empty() {
     return Err("Missing stream url".to_string());
@@ -1364,7 +2395,9 @@ async fn download_with_aria2c(
     std::fs::create_dir_all(parent).map_err(|err| format!("Failed to create directory: {}", err))?;
   }
 
-  let args = build_aria2c_args(output_path, urls, header)?;
+  let mut args = build_aria2c_args(output_path, urls, header, aria2c_connections, aria2c_split)?;
+  let rpc_config = build_aria2c_rpc_config()?;
+  append_aria2c_rpc_args(&mut args, &rpc_config);
   append_log(
     &context.app_log_path,
     &format!(
@@ -1375,26 +2408,21 @@ async fn download_with_aria2c(
   );
 
   let context_clone = context.clone();
-  let output_path = output_path.to_path_buf();
+  let progress_key = progress_key.to_string();
+  let rpc_config_clone = rpc_config.clone();
   let exec_result = tauri::async_runtime::spawn_blocking(move || {
-    let mut last_progress = -1;
-    let mut update = |progress: i64| {
-      let progress = progress.min(99);
-      let mapped = if let Some((start, end)) = progress_range {
-        if end <= start {
-          end
-        } else {
-          start + ((progress * (end - start)) / 100)
-        }
-      } else {
-        progress
-      };
-      if mapped > last_progress {
-        last_progress = mapped;
-        let _ = update_download_status(&context_clone, record_id, 1, mapped);
-      }
+    let mut update = |content: u64, chunk: u64| {
+      let _ = update_download_bytes(&context_clone, record_id, &progress_key, content, chunk);
     };
-    run_aria2c_command(&args, track_progress, &mut update)
+    run_aria2c_command(
+      context_clone.app_log_path.as_ref(),
+      record_id,
+      &progress_key,
+      &args,
+      track_progress,
+      &mut update,
+      &rpc_config_clone,
+    )
   })
   .await
   .map_err(|_| "Failed to execute download task".to_string())?;
@@ -1411,8 +2439,6 @@ async fn download_with_aria2c(
         &context.app_log_path,
         &format!("aria2c_done record_id={} status=err msg={}", record_id, err),
       );
-      let _ = std::fs::remove_file(&output_path);
-      let _ = update_download_status(context, record_id, 1, 0);
     }
   }
 
@@ -1488,6 +2514,35 @@ fn collect_durl_urls(play_info: &Value, block_pcdn: bool) -> Result<Vec<String>,
     return Err("Missing mp4 url".to_string());
   }
   Ok(urls)
+}
+
+fn extract_play_duration_seconds(play_info: &Value) -> Option<i64> {
+  if let Some(value) = play_info.get("timelength").and_then(|item| item.as_i64()) {
+    if value > 0 {
+      return Some(((value + 999) / 1000).max(1));
+    }
+  }
+  if let Some(value) = play_info
+    .get("durl")
+    .and_then(|item| item.as_array())
+    .and_then(|list| list.get(0))
+    .and_then(|item| item.get("length"))
+    .and_then(|item| item.as_i64())
+  {
+    if value > 0 {
+      return Some(((value + 999) / 1000).max(1));
+    }
+  }
+  if let Some(value) = play_info
+    .get("dash")
+    .and_then(|item| item.get("duration"))
+    .and_then(|item| item.as_f64())
+  {
+    if value > 0.0 {
+      return Some(value.ceil() as i64);
+    }
+  }
+  None
 }
 
 fn candidate_codec_matches(candidate: &StreamCandidate, codec: &str) -> bool {
@@ -1723,6 +2778,213 @@ fn is_audio_complete(video_duration: f64, audio_duration: f64) -> bool {
   true
 }
 
+fn log_ffprobe_av_duration(
+  app_log_path: &Path,
+  record_id: i64,
+  source: &str,
+  output_path: &Path,
+  expected_duration: f64,
+  video_duration: f64,
+  audio_duration: f64,
+) {
+  let delta = if video_duration > 0.0 && audio_duration > 0.0 {
+    audio_duration - video_duration
+  } else {
+    0.0
+  };
+  append_log(
+    app_log_path,
+    &format!(
+      "ffprobe_av_duration record_id={} source={} output={} video={:.3} audio={:.3} expected={:.3} delta={:.3}",
+      record_id,
+      source,
+      output_path.to_string_lossy(),
+      video_duration,
+      audio_duration,
+      expected_duration,
+      delta
+    ),
+  );
+  if video_duration > 0.0 && audio_duration > 0.0 && delta.abs() >= 1.0 {
+    append_log(
+      app_log_path,
+      &format!(
+        "ffprobe_av_mismatch record_id={} source={} output={} video={:.3} audio={:.3} delta={:.3}",
+        record_id,
+        source,
+        output_path.to_string_lossy(),
+        video_duration,
+        audio_duration,
+        delta
+      ),
+    );
+  }
+}
+
+fn log_ffprobe_source_duration(
+  app_log_path: &Path,
+  record_id: i64,
+  source: &str,
+  path: &Path,
+) -> Option<StreamTiming> {
+  match probe_stream_timing(path) {
+    Ok(timing) => {
+      append_log(
+        app_log_path,
+        &format!(
+          "ffprobe_source_duration record_id={} source={} path={} video={:.3} audio={:.3} format={:.3} v_start={:.3} a_start={:.3} f_start={:.3}",
+          record_id,
+          source,
+          path.to_string_lossy(),
+          timing.video_duration,
+          timing.audio_duration,
+          timing.format_duration,
+          timing.video_start,
+          timing.audio_start,
+          timing.format_start
+        ),
+      );
+      Some(timing)
+    }
+    Err(err) => {
+      append_log(
+        app_log_path,
+        &format!(
+          "ffprobe_source_fail record_id={} source={} path={} err={}",
+          record_id,
+          source,
+          path.to_string_lossy(),
+          err
+        ),
+      );
+      None
+    }
+  }
+}
+
+#[derive(Default, Clone, Copy)]
+struct StreamTiming {
+  video_duration: f64,
+  audio_duration: f64,
+  format_duration: f64,
+  video_start: f64,
+  audio_start: f64,
+  format_start: f64,
+}
+
+fn log_ffprobe_av_timing(
+  app_log_path: &Path,
+  record_id: i64,
+  source: &str,
+  path: &Path,
+) {
+  match probe_stream_timing(path) {
+    Ok(timing) => {
+      let start_delta = timing.audio_start - timing.video_start;
+      append_log(
+        app_log_path,
+        &format!(
+          "ffprobe_av_timing record_id={} source={} output={} v_start={:.3} a_start={:.3} f_start={:.3} v_dur={:.3} a_dur={:.3} delta_start={:.3}",
+          record_id,
+          source,
+          path.to_string_lossy(),
+          timing.video_start,
+          timing.audio_start,
+          timing.format_start,
+          timing.video_duration,
+          timing.audio_duration,
+          start_delta
+        ),
+      );
+      if timing.video_duration > 0.0
+        && timing.audio_duration > 0.0
+        && start_delta.abs() >= 0.1
+      {
+        append_log(
+          app_log_path,
+          &format!(
+            "ffprobe_av_offset record_id={} source={} output={} delta_start={:.3}",
+            record_id,
+            source,
+            path.to_string_lossy(),
+            start_delta
+          ),
+        );
+      }
+    }
+    Err(err) => {
+      append_log(
+        app_log_path,
+        &format!(
+          "ffprobe_av_timing_fail record_id={} source={} output={} err={}",
+          record_id,
+          source,
+          path.to_string_lossy(),
+          err
+        ),
+      );
+    }
+  }
+}
+
+fn probe_stream_timing(path: &Path) -> Result<StreamTiming, String> {
+  let args = vec![
+    "-v".to_string(),
+    "error".to_string(),
+    "-show_streams".to_string(),
+    "-show_format".to_string(),
+    "-of".to_string(),
+    "json".to_string(),
+    path.to_string_lossy().to_string(),
+  ];
+  let data = run_ffprobe_json(&args)?;
+  let streams = data
+    .get("streams")
+    .and_then(|value| value.as_array())
+    .ok_or_else(|| "Missing stream info".to_string())?;
+  let mut timing = StreamTiming::default();
+  timing.format_duration = data
+    .get("format")
+    .and_then(|value| value.get("duration"))
+    .and_then(|value| value.as_str())
+    .and_then(|value| value.parse::<f64>().ok())
+    .unwrap_or(0.0);
+  timing.format_start = data
+    .get("format")
+    .and_then(|value| value.get("start_time"))
+    .and_then(|value| value.as_str())
+    .and_then(|value| value.parse::<f64>().ok())
+    .unwrap_or(0.0);
+  for stream in streams {
+    let codec_type = stream
+      .get("codec_type")
+      .and_then(|value| value.as_str())
+      .unwrap_or("");
+    let duration = stream
+      .get("duration")
+      .and_then(|value| value.as_str())
+      .and_then(|value| value.parse::<f64>().ok())
+      .unwrap_or(0.0);
+    let start_time = stream
+      .get("start_time")
+      .and_then(|value| value.as_str())
+      .and_then(|value| value.parse::<f64>().ok())
+      .unwrap_or(0.0);
+    if codec_type == "video" && timing.video_duration <= 0.0 {
+      timing.video_duration = duration;
+      timing.video_start = start_time;
+    }
+    if codec_type == "audio" && timing.audio_duration <= 0.0 {
+      timing.audio_duration = duration;
+      timing.audio_start = start_time;
+    }
+  }
+  if timing.video_duration <= 0.0 && timing.format_duration > 0.0 {
+    timing.video_duration = timing.format_duration;
+  }
+  Ok(timing)
+}
+
 fn dedup_urls(urls: Vec<String>) -> Vec<String> {
   let mut seen = HashSet::new();
   let mut result = Vec::new();
@@ -1887,6 +3149,7 @@ fn build_ffmpeg_headers(context: &DownloadContext) -> Option<String> {
   let auth = load_auth(context)?;
   let mut headers = String::new();
   headers.push_str("Referer: https://www.bilibili.com\r\n");
+  headers.push_str("Origin: https://www.bilibili.com\r\n");
   headers.push_str("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n");
   headers.push_str(&format!("Cookie: {}\r\n", auth.cookie));
   Some(headers)
@@ -1913,6 +3176,138 @@ fn update_download_status(
       Ok(())
     })
     .map_err(|err| format!("Failed to update download status: {}", err))
+}
+
+fn reset_download_record_progress(
+  context: &DownloadContext,
+  record_id: i64,
+) -> Result<(), String> {
+  let now = now_rfc3339();
+  context
+    .db
+    .with_conn(|conn| {
+      conn.execute(
+        "UPDATE video_download SET status = 0, progress = 0, progress_total = 0, progress_done = 0, update_time = ?1 WHERE id = ?2",
+        (&now, record_id),
+      )?;
+      Ok(())
+    })
+    .map_err(|err| format!("Failed to reset download progress: {}", err))
+}
+
+fn update_download_progress(
+  context: &DownloadContext,
+  record_id: i64,
+  progress: i64,
+) -> Result<(), String> {
+  let now = now_rfc3339();
+  context
+    .db
+    .with_conn(|conn| {
+      conn.execute(
+        "UPDATE video_download SET progress = CASE WHEN progress < ?1 THEN ?1 ELSE progress END, update_time = ?2 \
+         WHERE id = ?3 AND status = 1",
+        (progress, &now, record_id),
+      )?;
+      Ok(())
+    })
+    .map_err(|err| format!("Failed to update download progress: {}", err))
+}
+
+fn reset_download_progress_bytes(
+  context: &DownloadContext,
+  record_id: i64,
+) -> Result<(), String> {
+  let now = now_rfc3339();
+  context
+    .db
+    .with_conn(|conn| {
+      conn.execute(
+        "UPDATE video_download SET progress_total = 0, progress_done = 0, update_time = ?1 \
+         WHERE id = ?2 AND status = 1",
+        (&now, record_id),
+      )?;
+      Ok(())
+    })
+    .map_err(|err| format!("Failed to reset download bytes: {}", err))
+}
+
+fn update_download_status_only(
+  context: &DownloadContext,
+  record_id: i64,
+  status: i64,
+) -> Result<(), String> {
+  let now = now_rfc3339();
+  context
+    .db
+    .with_conn(|conn| {
+      conn.execute(
+        "UPDATE video_download SET status = ?1, update_time = ?2 WHERE id = ?3",
+        (status, &now, record_id),
+      )?;
+      Ok(())
+    })
+    .map_err(|err| format!("Failed to update download status: {}", err))
+}
+
+fn clear_download_progress(context: &DownloadContext, record_id: i64) {
+  if let Ok(mut state) = context.download_runtime.progress_state.lock() {
+    state.remove(&record_id);
+  }
+}
+
+fn update_download_bytes(
+  context: &DownloadContext,
+  record_id: i64,
+  key: &str,
+  content: u64,
+  chunk: u64,
+) -> Result<(), String> {
+  let mut state = context
+    .download_runtime
+    .progress_state
+    .lock()
+    .map_err(|_| "Download progress lock failed".to_string())?;
+  let entry = state.entry(record_id).or_insert_with(HashMap::new);
+  entry.insert(key.to_string(), (content, chunk.min(content)));
+  let total_content: u64 = entry.values().map(|(value, _)| *value).sum();
+  if total_content == 0 {
+    return Ok(());
+  }
+  let total_chunk: u64 = entry.values().map(|(_, value)| *value).sum();
+  let progress = ((total_chunk.saturating_mul(100)) / total_content) as i64;
+  let progress = progress.min(99);
+  let total_content = i64::try_from(total_content).unwrap_or(i64::MAX);
+  let total_chunk = i64::try_from(total_chunk).unwrap_or(i64::MAX);
+  let now = now_rfc3339();
+  context
+    .db
+    .with_conn(|conn| {
+      conn.execute(
+        "UPDATE video_download SET progress_total = CASE WHEN progress_total < ?1 THEN ?1 ELSE progress_total END, \
+         progress_done = CASE WHEN progress_done < ?2 THEN ?2 ELSE progress_done END, \
+         progress = CASE WHEN progress < ?3 THEN ?3 ELSE progress END, update_time = ?4 \
+         WHERE id = ?5 AND status = 1",
+        (total_content, total_chunk, progress, &now, record_id),
+      )?;
+      Ok(())
+    })
+    .map_err(|err| format!("Failed to update download progress: {}", err))
+}
+
+fn is_dir_empty(dir: &Path) -> bool {
+  let entries = match std::fs::read_dir(dir) {
+    Ok(value) => value,
+    Err(_) => return false,
+  };
+  for entry in entries.flatten() {
+    let name = entry.file_name().to_string_lossy().to_string();
+    if name == ".DS_Store" {
+      continue;
+    }
+    return false;
+  }
+  true
 }
 
 fn load_submission_status(context: &DownloadContext, task_id: &str) -> Result<String, String> {
@@ -1960,6 +3355,25 @@ fn update_relation_workflow_status(
       Ok(())
     })
     .map_err(|err| err.to_string())
+}
+
+fn update_workflow_instance_status(
+  context: &DownloadContext,
+  task_id: &str,
+  status: &str,
+) -> Result<(), String> {
+  let now = now_rfc3339();
+  context
+    .db
+    .with_conn(|conn| {
+      let updated = conn.execute(
+        "UPDATE workflow_instances SET status = ?1, updated_at = ?2 WHERE task_id = ?3",
+        (status, &now, task_id),
+      )?;
+      Ok(updated)
+    })
+    .map_err(|err| err.to_string())?;
+  Ok(())
 }
 
 fn load_workflow_instance_status(
@@ -2040,6 +3454,10 @@ async fn refresh_integration_status(
       return Ok(());
     }
     if let Some(status) = load_workflow_instance_status(context, &submission_task_id)? {
+      if status == "VIDEO_DOWNLOADING" {
+        let _ = update_workflow_instance_status(context, &submission_task_id, "COMPLETED");
+        return Ok(());
+      }
       if status == "RUNNING" || status == "COMPLETED" {
         return Ok(());
       }
@@ -2047,6 +3465,7 @@ async fn refresh_integration_status(
     let task_id = submission_task_id.clone();
     crate::commands::submission::start_submission_workflow(
       context.db.clone(),
+      context.app_log_path.clone(),
       context.edit_upload_state.clone(),
       task_id,
     );
@@ -2054,18 +3473,4 @@ async fn refresh_integration_status(
   }
 
   Ok(())
-}
-
-fn count_active_downloads(context: &DownloadContext) -> Result<i64, String> {
-  context
-    .db
-    .with_conn(|conn| {
-      let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM video_download WHERE status IN (0, 1)",
-        [],
-        |row| row.get(0),
-      )?;
-      Ok(count)
-    })
-    .map_err(|err| format!("Failed to count downloads: {}", err))
 }

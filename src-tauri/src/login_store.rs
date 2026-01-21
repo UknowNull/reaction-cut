@@ -60,6 +60,53 @@ impl LoginStore {
     Ok(auth_info)
   }
 
+  pub fn load_login_data(&self, db: &Db) -> Result<Option<Value>, LoginStoreError> {
+    if let Some(data) = self.load_login_data_from_file()? {
+      return Ok(Some(data));
+    }
+
+    let record = db.with_conn(|conn| {
+      let mut stmt =
+        conn.prepare("SELECT cookie_info FROM login_info ORDER BY login_time DESC LIMIT 1")?;
+      let mut rows = stmt.query([])?;
+      if let Some(row) = rows.next()? {
+        let cookie_info: String = row.get(0)?;
+        Ok(Some(cookie_info))
+      } else {
+        Ok(None)
+      }
+    })?;
+
+    let cookie_info = match record {
+      Some(info) => info,
+      None => return Ok(None),
+    };
+    let data: Value = serde_json::from_str(&cookie_info)?;
+    Ok(Some(data))
+  }
+
+  pub fn load_refresh_token(&self, db: &Db) -> Result<Option<String>, LoginStoreError> {
+    if let Some(data) = self.load_login_data(db)? {
+      if let Some(token) = extract_refresh_token(&data) {
+        return Ok(Some(token));
+      }
+    }
+
+    let record = db.with_conn(|conn| {
+      let mut stmt =
+        conn.prepare("SELECT refresh_token FROM login_info ORDER BY login_time DESC LIMIT 1")?;
+      let mut rows = stmt.query([])?;
+      if let Some(row) = rows.next()? {
+        let refresh_token: Option<String> = row.get(0)?;
+        Ok(refresh_token)
+      } else {
+        Ok(None)
+      }
+    })?;
+
+    Ok(record)
+  }
+
   pub fn save_login_info(&self, db: &Db, login_data: &Value) -> Result<Option<i64>, LoginStoreError> {
     let login_time_ms = Utc::now().timestamp_millis();
     let file_value = json!({
@@ -82,7 +129,7 @@ impl LoginStore {
     let avatar_url = extract_string(login_data, &["avatar", "avatar_url"]);
 
     let access_token = extract_url_param(login_data, "SESSDATA");
-    let refresh_token = extract_url_param(login_data, "bili_jct");
+    let refresh_token = extract_refresh_token(login_data);
 
     let cookie_info = serde_json::to_string(login_data)?;
 
@@ -101,7 +148,7 @@ impl LoginStore {
          nickname = excluded.nickname, \
          avatar_url = excluded.avatar_url, \
          access_token = excluded.access_token, \
-         refresh_token = excluded.refresh_token, \
+         refresh_token = COALESCE(excluded.refresh_token, login_info.refresh_token), \
          cookie_info = excluded.cookie_info, \
          login_time = excluded.login_time, \
          expire_time = excluded.expire_time, \
@@ -152,6 +199,17 @@ impl LoginStore {
 
     let auth_info = build_auth_info(data, login_time);
     Ok(auth_info)
+  }
+
+  fn load_login_data_from_file(&self) -> Result<Option<Value>, LoginStoreError> {
+    if !self.file_path.exists() {
+      return Ok(None);
+    }
+
+    let content = fs::read_to_string(&self.file_path)?;
+    let root: Value = serde_json::from_str(&content)?;
+    let data = root.get("data").cloned();
+    Ok(data)
   }
 
   fn load_from_db(&self, db: &Db) -> Result<Option<AuthInfo>, LoginStoreError> {
@@ -229,7 +287,7 @@ fn is_login_expired(data: &Value, login_time_ms: Option<i64>) -> bool {
   false
 }
 
-fn extract_cookie(data: &Value) -> Option<String> {
+pub(crate) fn extract_cookie(data: &Value) -> Option<String> {
   if let Some(cookie) = data.get("cookie").and_then(|value| value.as_str()) {
     return Some(cookie.to_string());
   }
@@ -262,7 +320,7 @@ fn build_cookie_from_url(url: &str) -> Option<String> {
   Some(format!("SESSDATA={}; bili_jct={}", sessdata, bili_jct))
 }
 
-fn extract_csrf(cookie: &str) -> Option<String> {
+pub(crate) fn extract_csrf(cookie: &str) -> Option<String> {
   cookie
     .split(';')
     .find_map(|item| {
@@ -324,6 +382,11 @@ fn extract_string(data: &Value, keys: &[&str]) -> Option<String> {
   }
 
   None
+}
+
+fn extract_refresh_token(data: &Value) -> Option<String> {
+  extract_string(data, &["refresh_token"])
+    .or_else(|| extract_url_param(data, "refresh_token"))
 }
 
 fn parse_url_params(url: &str) -> Option<HashMap<String, String>> {

@@ -153,6 +153,8 @@ export default function DownloadSection() {
   const [quickFillPage, setQuickFillPage] = useState(1);
   const [quickFillTotal, setQuickFillTotal] = useState(0);
   const quickFillPageSize = 10;
+  const [deleteConfirmRecord, setDeleteConfirmRecord] = useState(null);
+  const [deleteConfirmDeleteFile, setDeleteConfirmDeleteFile] = useState(false);
 
   const logClient = async (text) => {
     try {
@@ -219,8 +221,19 @@ export default function DownloadSection() {
     setLoadingDownloads(true);
     setMessage("");
     try {
-      const data = await invokeCommand("download_list_by_status", { status });
-      setDownloadList(data || []);
+      if (status === 1) {
+        const [downloading, paused] = await Promise.all([
+          invokeCommand("download_list_by_status", { status: 1 }),
+          invokeCommand("download_list_by_status", { status: 4 }),
+        ]);
+        const merged = [...(downloading || []), ...(paused || [])].sort(
+          (a, b) => (b.id || 0) - (a.id || 0),
+        );
+        setDownloadList(merged);
+      } else {
+        const data = await invokeCommand("download_list_by_status", { status });
+        setDownloadList(data || []);
+      }
     } catch (error) {
       setMessage(error.message);
     } finally {
@@ -235,8 +248,8 @@ export default function DownloadSection() {
       return;
     }
     try {
-      const opener = await import("@tauri-apps/plugin-opener");
-      await opener.open(folderPath);
+      const { openPath } = await import("@tauri-apps/plugin-opener");
+      await openPath(folderPath);
     } catch (error) {
       setMessage(error?.message || "打开文件夹失败");
     }
@@ -987,20 +1000,59 @@ export default function DownloadSection() {
     }
   };
 
-  const handleDeleteRecord = async (taskId) => {
+  const handleDeleteRecord = async (record, deleteFile = false) => {
     setMessage("");
     try {
-      await invokeCommand("download_delete", { taskId });
+      if (!record?.id) {
+        setMessage("缺少任务ID，无法删除");
+        return;
+      }
+      await invokeCommand("download_delete", { taskId: record.id, deleteFile });
       await loadDownloadList();
     } catch (error) {
       setMessage(error.message);
     }
   };
 
+  const handleRequestDeleteRecord = (record) => {
+    if (!record?.id) {
+      setMessage("缺少任务ID，无法删除");
+      return;
+    }
+    setDeleteConfirmRecord(record);
+    setDeleteConfirmDeleteFile(false);
+  };
+
+  const handleCancelDeleteRecord = () => {
+    setDeleteConfirmRecord(null);
+    setDeleteConfirmDeleteFile(false);
+  };
+
+  const handleConfirmDeleteRecord = () => {
+    if (!deleteConfirmRecord) {
+      return;
+    }
+    const record = deleteConfirmRecord;
+    const shouldDeleteFile = deleteConfirmDeleteFile;
+    setDeleteConfirmRecord(null);
+    setDeleteConfirmDeleteFile(false);
+    handleDeleteRecord(record, shouldDeleteFile);
+  };
+
   const handleRetryRecord = async (taskId) => {
     setMessage("");
     try {
       await invokeCommand("download_retry", { taskId });
+      await loadDownloadList();
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleResumeRecord = async (taskId) => {
+    setMessage("");
+    try {
+      await invokeCommand("download_resume", { taskId });
       await loadDownloadList();
     } catch (error) {
       setMessage(error.message);
@@ -1053,6 +1105,8 @@ export default function DownloadSection() {
         return "#4caf50";
       case 3:
         return "#ff5252";
+      case 4:
+        return "var(--desc-color)";
       default:
         return "var(--split-color)";
     }
@@ -1064,6 +1118,8 @@ export default function DownloadSection() {
         return "#4caf50";
       case 3:
         return "#ff5252";
+      case 4:
+        return "var(--desc-color)";
       default:
         return "var(--primary-color)";
     }
@@ -1841,7 +1897,12 @@ export default function DownloadSection() {
                   <div className="desc px-2 py-6 text-center">{emptyRecordText}</div>
                 ) : (
                   downloadList.map((record) => {
-                    const progressValue = Math.min(100, record.progress || 0);
+                    const progressTotal = Number(record.progressTotal || 0);
+                    const progressDone = Number(record.progressDone || 0);
+                    const progressValue =
+                      progressTotal > 0
+                        ? Math.min(100, Math.floor((progressDone / progressTotal) * 100))
+                        : Math.min(100, record.progress || 0);
                     return (
                       <div
                         key={record.id}
@@ -1875,6 +1936,14 @@ export default function DownloadSection() {
                           <span className="w-12 text-xs text-[var(--desc-color)]">
                             {progressValue}%
                           </span>
+                          {record.status === 4 ? (
+                            <button
+                              className="h-8 px-3 rounded-lg"
+                              onClick={() => handleResumeRecord(record.id)}
+                            >
+                              继续下载
+                            </button>
+                          ) : null}
                           {record.status === 3 ? (
                             <button
                               className="h-8 px-3 rounded-lg"
@@ -1893,7 +1962,7 @@ export default function DownloadSection() {
                           ) : null}
                           <button
                             className="h-8 px-3 rounded-lg"
-                            onClick={() => handleDeleteRecord(record.id)}
+                            onClick={() => handleRequestDeleteRecord(record)}
                           >
                             删除
                           </button>
@@ -1919,6 +1988,30 @@ export default function DownloadSection() {
           </div>
         </div>
       )}
+      {deleteConfirmRecord ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="w-[360px] rounded-2xl bg-[var(--block-color)] p-5 text-sm text-[var(--content-color)] shadow-xl">
+            <div className="text-base font-semibold">删除确认</div>
+            <div className="mt-2 text-[var(--desc-color)]">确定删除该下载记录？</div>
+            <label className="mt-3 flex items-center gap-2 text-[var(--desc-color)]">
+              <input
+                type="checkbox"
+                checked={deleteConfirmDeleteFile}
+                onChange={(event) => setDeleteConfirmDeleteFile(event.target.checked)}
+              />
+              同步删除视频文件
+            </label>
+            <div className="mt-4 flex justify-end gap-2">
+              <button className="h-9 rounded-lg px-4" onClick={handleCancelDeleteRecord}>
+                取消
+              </button>
+              <button className="h-9 rounded-lg px-4" onClick={handleConfirmDeleteRecord}>
+                确认
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

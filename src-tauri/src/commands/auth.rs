@@ -120,8 +120,9 @@ pub async fn auth_sms_login(
     None => return Ok(ApiResponse::error("短信登录未返回有效 Cookie")),
   };
 
+  let refresh_token = extract_refresh_token(&body);
   let profile = fetch_profile(&state.bilibili, &cookie).await.ok();
-  let login_data = build_login_payload(&cookie, profile);
+  let login_data = build_login_payload(&cookie, profile, refresh_token);
   if let Err(err) = state.login_store.save_login_info(&state.db, &login_data) {
     return Ok(ApiResponse::error(format!("保存登录信息失败: {}", err)));
   }
@@ -210,8 +211,9 @@ pub async fn auth_pwd_login(
     None => return Ok(ApiResponse::error("账号登录未返回有效 Cookie")),
   };
 
+  let refresh_token = extract_refresh_token(&body);
   let profile = fetch_profile(&state.bilibili, &cookie).await.ok();
-  let login_data = build_login_payload(&cookie, profile);
+  let login_data = build_login_payload(&cookie, profile, refresh_token);
   if let Err(err) = state.login_store.save_login_info(&state.db, &login_data) {
     return Ok(ApiResponse::error(format!("保存登录信息失败: {}", err)));
   }
@@ -239,7 +241,8 @@ pub async fn auth_status(
     let mut user_info = info.data.clone();
     if !has_basic_profile(&user_info) || needs_profile_refresh(&user_info) {
       if let Ok(profile) = fetch_profile(&state.bilibili, &info.cookie).await {
-        let login_data = build_login_payload(&info.cookie, Some(profile));
+        let refresh_token = extract_refresh_token(&info.data);
+        let login_data = build_login_payload(&info.cookie, Some(profile), refresh_token);
         let _ = state.login_store.save_login_info(&state.db, &login_data);
         user_info = login_data;
       }
@@ -425,6 +428,7 @@ async fn poll_qrcode_once_inner(
       }
     }
 
+    let refresh_token = extract_refresh_token(&data);
     let login_data = if let Some(cookie) = cookie {
       let profile = fetch_profile(bilibili, &cookie).await.ok();
       append_auth_log(
@@ -435,13 +439,13 @@ async fn poll_qrcode_once_inner(
           summarize_cookie_keys(&cookie)
         ),
       );
-      build_login_payload(&cookie, profile)
+      build_login_payload(&cookie, profile, refresh_token.clone())
     } else {
       append_auth_log(
         log_path,
         &format!("qr_poll save_cookie ts={} cookie_keys=none", now_millis()),
       );
-      match build_login_payload_with_qr(&data, bilibili).await {
+      match build_login_payload_with_qr(&data, bilibili, refresh_token.clone()).await {
         Ok(payload) => payload,
         Err(_) => data.clone(),
       }
@@ -472,9 +476,19 @@ async fn poll_qrcode_once_inner(
   })
 }
 
-fn build_login_payload(cookie: &str, profile: Option<Value>) -> Value {
+fn build_login_payload(
+  cookie: &str,
+  profile: Option<Value>,
+  refresh_token: Option<String>,
+) -> Value {
   let mut map = serde_json::Map::new();
   map.insert("cookie".to_string(), Value::String(cookie.to_string()));
+  if let Some(refresh_token) = refresh_token {
+    map.insert(
+      "refresh_token".to_string(),
+      Value::String(refresh_token),
+    );
+  }
   if let Some(profile) = profile {
     if let Value::Object(obj) = profile {
       for (key, value) in obj {
@@ -528,10 +542,11 @@ fn needs_profile_refresh(data: &Value) -> bool {
 async fn build_login_payload_with_qr(
   data: &Value,
   bilibili: &BilibiliClient,
+  refresh_token: Option<String>,
 ) -> Result<Value, String> {
   let cookie = extract_cookie(data).ok_or("Missing cookie")?;
   let profile = fetch_profile(bilibili, &cookie).await.ok();
-  Ok(build_login_payload(&cookie, profile))
+  Ok(build_login_payload(&cookie, profile, refresh_token))
 }
 
 async fn fetch_profile(bilibili: &BilibiliClient, cookie: &str) -> Result<Value, String> {
@@ -677,6 +692,20 @@ fn extract_cookie(data: &Value) -> Option<String> {
     return extract_cookie(inner);
   }
   None
+}
+
+fn extract_refresh_token(data: &Value) -> Option<String> {
+  data
+    .get("data")
+    .and_then(|value| value.get("refresh_token"))
+    .and_then(|value| value.as_str())
+    .map(|value| value.to_string())
+    .or_else(|| {
+      data
+        .get("refresh_token")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+    })
 }
 
 fn build_cookie_from_url(url: &str) -> Option<String> {

@@ -5,7 +5,7 @@ use std::process::Command;
 use serde::Serialize;
 
 use crate::api::ApiResponse;
-use crate::config::{default_download_dir, DEFAULT_FFMPEG_PATH};
+use crate::config::{default_download_dir, resolve_ffmpeg_path};
 
 #[derive(Serialize)]
 pub struct FileEntry {
@@ -98,7 +98,8 @@ pub fn video_duration(path: String) -> ApiResponse<i64> {
     return ApiResponse::error("Path is empty");
   }
 
-  let output = match Command::new(DEFAULT_FFMPEG_PATH).arg("-i").arg(trimmed).output() {
+  let ffmpeg_path = resolve_ffmpeg_path();
+  let output = match Command::new(ffmpeg_path).arg("-i").arg(trimmed).output() {
     Ok(output) => output,
     Err(err) => return ApiResponse::error(format!("Failed to start FFmpeg: {}", err)),
   };
