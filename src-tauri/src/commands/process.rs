@@ -6,7 +6,7 @@ use tauri::State;
 
 use crate::api::ApiResponse;
 use crate::config::{default_download_dir, default_temp_dir};
-use crate::processing::{clip_sources, merge_files, ClipSource};
+use crate::processing::{clip_sources, decide_clip_copy, merge_files, ClipSource};
 use crate::utils::{now_rfc3339, sanitize_filename};
 use crate::db::Db;
 use crate::AppState;
@@ -144,9 +144,16 @@ async fn run_process_task(
     .collect();
 
   let temp_dir = default_temp_dir().join(format!("process_{}", task_id));
-  let clip_outputs = tauri::async_runtime::spawn_blocking(move || clip_sources(&sources, &temp_dir))
-    .await
-    .map_err(|_| "Failed to clip videos".to_string())??;
+  let copy_decision = decide_clip_copy(&sources).unwrap_or_else(|_| crate::processing::ClipCopyDecision {
+    use_copy: false,
+    reason: None,
+  });
+  let use_copy = copy_decision.use_copy;
+  let clip_outputs = tauri::async_runtime::spawn_blocking(move || {
+    clip_sources(&sources, &temp_dir, use_copy)
+  })
+  .await
+  .map_err(|_| "Failed to clip videos".to_string())??;
 
   let output_name = format!("{}_merged.mp4", sanitize_filename(&request.task_name));
   let output_path = default_download_dir().join(output_name);

@@ -19,6 +19,7 @@ use tokio::time::sleep;
 use url::form_urlencoded;
 
 use crate::api::ApiResponse;
+use crate::baidu_sync;
 use crate::bilibili::client::BilibiliClient;
 use crate::commands::settings::{
   load_download_settings_from_db, DEFAULT_SUBMISSION_REMOTE_REFRESH_MINUTES,
@@ -28,7 +29,10 @@ use crate::config::default_download_dir;
 use crate::db::Db;
 use crate::login_refresh;
 use crate::login_store::{AuthInfo, LoginStore};
-use crate::processing::{can_concat_copy_sources, clip_sources, merge_files, segment_file, ClipSource};
+use crate::processing::{
+  clip_sources, decide_clip_copy, merge_files, parse_time_to_seconds, probe_duration_seconds,
+  segment_file, ClipSource,
+};
 use crate::utils::{append_log, now_rfc3339, sanitize_filename};
 use crate::AppState;
 
@@ -127,6 +131,9 @@ pub struct SubmissionTaskInput {
   pub tags: Option<String>,
   pub video_type: String,
   pub segment_prefix: Option<String>,
+  pub baidu_sync_enabled: Option<bool>,
+  pub baidu_sync_path: Option<String>,
+  pub baidu_sync_filename: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +159,9 @@ pub struct SubmissionUpdateRequest {
   pub task_id: String,
   pub source_videos: Vec<SourceVideoInput>,
   pub workflow_config: Option<Value>,
+  pub baidu_sync_enabled: Option<bool>,
+  pub baidu_sync_path: Option<String>,
+  pub baidu_sync_filename: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +176,9 @@ pub struct SubmissionResegmentRequest {
 pub struct SubmissionRepostRequest {
   pub task_id: String,
   pub integrate_current_bvid: bool,
+  pub baidu_sync_enabled: Option<bool>,
+  pub baidu_sync_path: Option<String>,
+  pub baidu_sync_filename: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -264,6 +277,9 @@ pub struct SubmissionTaskRecord {
   pub created_at: String,
   pub updated_at: String,
   pub segment_prefix: Option<String>,
+  pub baidu_sync_enabled: bool,
+  pub baidu_sync_path: Option<String>,
+  pub baidu_sync_filename: Option<String>,
   pub has_integrated_downloads: bool,
   pub workflow_status: Option<WorkflowStatusRecord>,
 }
@@ -437,8 +453,8 @@ pub async fn submission_create(
 
   let result = context.db.with_conn(|conn| {
     conn.execute(
-      "INSERT INTO submission_task (task_id, status, title, description, cover_url, partition_id, tags, video_type, collection_id, bvid, aid, created_at, updated_at, segment_prefix) \
-       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11)",
+      "INSERT INTO submission_task (task_id, status, title, description, cover_url, partition_id, tags, video_type, collection_id, bvid, aid, created_at, updated_at, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
+       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11, ?12, ?13, ?14)",
       (
         &task_id,
         &request.task.title,
@@ -451,6 +467,13 @@ pub async fn submission_create(
         &now,
         &now,
         request.task.segment_prefix.as_deref(),
+        if request.task.baidu_sync_enabled.unwrap_or(false) {
+          1
+        } else {
+          0
+        },
+        request.task.baidu_sync_path.as_deref(),
+        request.task.baidu_sync_filename.as_deref(),
       ),
     )?;
 
@@ -539,6 +562,15 @@ pub async fn submission_update(
   if let Err(err) = append_source_videos(&context, &task_id, &request.source_videos) {
     return Ok(ApiResponse::error(format!("追加源视频失败: {}", err)));
   }
+  if let Err(err) = update_baidu_sync_config(
+    &context,
+    &task_id,
+    request.baidu_sync_enabled,
+    normalize_optional_text(request.baidu_sync_path),
+    normalize_optional_text(request.baidu_sync_filename),
+  ) {
+    return Ok(ApiResponse::error(format!("更新百度同步配置失败: {}", err)));
+  }
   if let Err(err) = reset_workflow_instances(&context, &task_id) {
     return Ok(ApiResponse::error(format!("重置工作流失败: {}", err)));
   }
@@ -597,6 +629,15 @@ pub async fn submission_repost(
     if !has_bvid {
       return Ok(ApiResponse::error("当前任务没有BV号，无法集成投稿"));
     }
+  }
+  if let Err(err) = update_baidu_sync_config(
+    &context,
+    &task_id,
+    request.baidu_sync_enabled,
+    normalize_optional_text(request.baidu_sync_path),
+    normalize_optional_text(request.baidu_sync_filename),
+  ) {
+    return Ok(ApiResponse::error(format!("更新百度同步配置失败: {}", err)));
   }
 
   let missing_sources = collect_missing_source_files(&detail.source_videos);
@@ -2009,14 +2050,14 @@ fn load_tasks(
       };
       let offset = (page - 1).saturating_mul(page_size);
       let sql = if status.is_some() {
-        "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, \
+        "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                 CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                 wi.status, wi.current_step, wi.progress \
          FROM submission_task st \
          LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
          WHERE st.status = ?1 ORDER BY st.created_at DESC LIMIT ?2 OFFSET ?3"
       } else {
-        "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, \
+        "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                 CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                 wi.status, wi.current_step, wi.progress \
          FROM submission_task st \
@@ -2043,10 +2084,10 @@ fn load_tasks(
 }
 
 fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTaskRecord> {
-  let has_integrated_downloads: i64 = row.get(16)?;
-  let workflow_status = row.get::<_, Option<String>>(17)?;
-  let workflow_step = row.get::<_, Option<String>>(18)?;
-  let workflow_progress: Option<f64> = row.get(19)?;
+  let has_integrated_downloads: i64 = row.get(19)?;
+  let workflow_status = row.get::<_, Option<String>>(20)?;
+  let workflow_step = row.get::<_, Option<String>>(21)?;
+  let workflow_progress: Option<f64> = row.get(22)?;
   let workflow_status = workflow_status.map(|status| WorkflowStatusRecord {
     status,
     current_step: workflow_step,
@@ -2070,6 +2111,9 @@ fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTa
     created_at: row.get(13)?,
     updated_at: row.get(14)?,
     segment_prefix: row.get(15)?,
+    baidu_sync_enabled: row.get::<_, i64>(16)? != 0,
+    baidu_sync_path: row.get(17)?,
+    baidu_sync_filename: row.get(18)?,
     has_integrated_downloads: has_integrated_downloads != 0,
     workflow_status,
   })
@@ -2083,7 +2127,7 @@ fn load_task_detail(
     .db
     .with_conn(|conn| {
       let task = conn.query_row(
-        "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, \
+        "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                 CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                 wi.status, wi.current_step, wi.progress \
          FROM submission_task st \
@@ -2245,6 +2289,97 @@ fn create_workflow_instance(
   create_workflow_instance_for_task(context.db.as_ref(), task_id, config)
 }
 
+const SOURCE_READY_STABLE_DELAY_SECS: u64 = 2;
+const SOURCE_READY_MAX_RETRIES: u32 = 30;
+const SOURCE_READY_MAX_WAIT_SECS: u64 = 30;
+
+struct SourceReadyInfo {
+  path: String,
+  size: u64,
+  end_time: Option<f64>,
+}
+
+async fn check_sources_ready(sources: &[ClipSource]) -> Result<(), String> {
+  let mut infos = Vec::with_capacity(sources.len());
+  for source in sources {
+    let path = Path::new(&source.input_path);
+    let metadata =
+      fs::metadata(path).map_err(|err| format!("源文件不存在 input={} err={}", source.input_path, err))?;
+    let size = metadata.len();
+    if size == 0 {
+      return Err(format!("源文件大小为0 input={}", source.input_path));
+    }
+    let end_time = source
+      .end_time
+      .as_deref()
+      .and_then(|value| parse_time_to_seconds(value));
+    infos.push(SourceReadyInfo {
+      path: source.input_path.clone(),
+      size,
+      end_time,
+    });
+  }
+
+  sleep(Duration::from_secs(SOURCE_READY_STABLE_DELAY_SECS)).await;
+  for info in &infos {
+    let metadata = fs::metadata(&info.path)
+      .map_err(|err| format!("源文件不存在 input={} err={}", info.path, err))?;
+    if metadata.len() != info.size {
+      return Err(format!("源文件仍在写入 input={}", info.path));
+    }
+  }
+
+  for info in &infos {
+    let duration = probe_duration_seconds(Path::new(&info.path))
+      .map_err(|err| format!("源文件不可读 input={} err={}", info.path, err))?;
+    if let Some(end_time) = info.end_time {
+      if duration + 0.5 < end_time {
+        return Err(format!(
+          "源文件时长不足 input={} duration={} end={}",
+          info.path, duration, end_time
+        ));
+      }
+    }
+  }
+
+  Ok(())
+}
+
+async fn ensure_sources_ready(
+  context: &SubmissionContext,
+  task_id: &str,
+  sources: &[ClipSource],
+) -> Result<(), String> {
+  let mut attempt = 0;
+  let mut wait_secs = SOURCE_READY_STABLE_DELAY_SECS;
+  loop {
+    let _ = wait_for_workflow_ready(context, task_id).await?;
+    match check_sources_ready(sources).await {
+      Ok(()) => return Ok(()),
+      Err(err) => {
+        attempt += 1;
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "submission_sources_not_ready task_id={} attempt={} err={}",
+            task_id, attempt, err
+          ),
+        );
+        let _ = update_workflow_status(context, task_id, "VIDEO_DOWNLOADING", None, 0.0);
+        let _ = update_submission_status(context, task_id, "PENDING");
+        if attempt >= SOURCE_READY_MAX_RETRIES {
+          let _ = update_workflow_status(context, task_id, "FAILED", None, 0.0);
+          let _ = update_submission_status(context, task_id, "FAILED");
+          return Err(err);
+        }
+        let sleep_secs = wait_secs.min(SOURCE_READY_MAX_WAIT_SECS);
+        sleep(Duration::from_secs(sleep_secs)).await;
+        wait_secs = (wait_secs * 2).min(SOURCE_READY_MAX_WAIT_SECS);
+      }
+    }
+  }
+}
+
 async fn run_submission_workflow(
   context: SubmissionContext,
   task_id: String,
@@ -2253,8 +2388,6 @@ async fn run_submission_workflow(
     .unwrap_or_else(|| "VIDEO_SUBMISSION".to_string());
   let is_update_workflow = workflow_type == "VIDEO_UPDATE";
   let _ = wait_for_workflow_ready(&context, &task_id).await?;
-  let _ = update_workflow_status(&context, &task_id, "RUNNING", Some("CLIPPING"), 0.0);
-  update_submission_status(&context, &task_id, "CLIPPING")?;
 
   let sources = if is_update_workflow {
     match load_update_sources(&context, &task_id)? {
@@ -2269,6 +2402,11 @@ async fn run_submission_workflow(
     return Err("No source videos".to_string());
   }
 
+  ensure_sources_ready(&context, &task_id, &sources).await?;
+  let _ = wait_for_workflow_ready(&context, &task_id).await?;
+  let _ = update_workflow_status(&context, &task_id, "RUNNING", Some("CLIPPING"), 0.0);
+  update_submission_status(&context, &task_id, "CLIPPING")?;
+
   let base_dir = resolve_submission_base_dir(&context, &task_id);
   let workflow_dir = if is_update_workflow {
     let update_stamp = sanitize_filename(&format!("update_{}", now_rfc3339()));
@@ -2277,16 +2415,29 @@ async fn run_submission_workflow(
     base_dir.clone()
   };
   let clip_dir = workflow_dir.join("cut");
-  let use_copy = match can_concat_copy_sources(&sources) {
-    Ok(value) => value,
+  let copy_decision = match decide_clip_copy(&sources) {
+    Ok(decision) => decision,
     Err(err) => {
       append_log(
         &context.app_log_path,
         &format!("submission_clip_copy_check_err task_id={} err={}", task_id, err),
       );
-      false
+      crate::processing::ClipCopyDecision {
+        use_copy: false,
+        reason: Some(format!("timestamp_probe_failed err={}", err)),
+      }
     }
   };
+  let use_copy = copy_decision.use_copy;
+  if let Some(reason) = copy_decision.reason.as_deref() {
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "submission_clip_copy_decision task_id={} use_copy={} reason={}",
+        task_id, use_copy, reason
+      ),
+    );
+  }
   append_log(
     &context.app_log_path,
     &format!(
@@ -2313,7 +2464,7 @@ async fn run_submission_workflow(
   let sources_clone = sources.clone();
   let clip_dir_clone = clip_dir.clone();
   let clip_outputs = match tauri::async_runtime::spawn_blocking(move || {
-    clip_sources(&sources_clone, &clip_dir_clone)
+    clip_sources(&sources_clone, &clip_dir_clone, use_copy)
   })
   .await
   {
@@ -2393,6 +2544,16 @@ async fn run_submission_workflow(
 
   let _ = wait_for_workflow_ready(&context, &task_id).await?;
   save_merged_video(&context, &task_id, &merge_output)?;
+  if let Err(err) = baidu_sync::enqueue_submission_sync(
+    context.db.as_ref(),
+    context.app_log_path.as_ref(),
+    &task_id,
+  ) {
+    append_log(
+      &context.app_log_path,
+      &format!("baidu_sync_enqueue_fail task_id={} err={}", task_id, err),
+    );
+  }
 
   let workflow_settings = load_workflow_settings(&context, &task_id);
   if workflow_settings.enable_segmentation {
@@ -2647,7 +2808,7 @@ async fn run_submission_upload(
       return Err(err);
     }
   };
-  let mut csrf = match auth.csrf.clone() {
+  let csrf = match auth.csrf.clone() {
     Some(value) => value,
     None => {
       auth = match refresh_auth(&context, "submission_upload_csrf").await {
@@ -4837,7 +4998,7 @@ fn append_source_videos(
     .map_err(|err| err.to_string())
 }
 
-fn attach_update_sources(mut config: Value, sources: &[SourceVideoInput]) -> Value {
+fn attach_update_sources(config: Value, sources: &[SourceVideoInput]) -> Value {
   let list = sources
     .iter()
     .enumerate()
@@ -5419,6 +5580,17 @@ fn default_part_name_from_path(path: &str) -> String {
   }
 }
 
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+  value.and_then(|raw| {
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+      None
+    } else {
+      Some(trimmed)
+    }
+  })
+}
+
 fn update_submission_task_for_edit(
   context: &SubmissionContext,
   task_id: &str,
@@ -5438,6 +5610,48 @@ fn update_submission_task_for_edit(
           &task.video_type,
           task.collection_id,
           task.segment_prefix.as_deref(),
+          &now,
+          task_id,
+        ),
+      )?;
+      Ok(())
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn update_baidu_sync_config(
+  context: &SubmissionContext,
+  task_id: &str,
+  enabled: Option<bool>,
+  path: Option<String>,
+  filename: Option<String>,
+) -> Result<(), String> {
+  if enabled.is_none() && path.is_none() && filename.is_none() {
+    return Ok(());
+  }
+  let now = now_rfc3339();
+  context
+    .db
+    .with_conn(|conn| {
+      let (current_enabled, current_path, current_filename) = conn.query_row(
+        "SELECT baidu_sync_enabled, baidu_sync_path, baidu_sync_filename FROM submission_task WHERE task_id = ?1",
+        [task_id],
+        |row| {
+          let enabled: i64 = row.get(0)?;
+          let path: Option<String> = row.get(1)?;
+          let filename: Option<String> = row.get(2)?;
+          Ok((enabled != 0, path, filename))
+        },
+      )?;
+      let next_enabled = enabled.unwrap_or(current_enabled);
+      let next_path = path.or(current_path);
+      let next_filename = filename.or(current_filename);
+      conn.execute(
+        "UPDATE submission_task SET baidu_sync_enabled = ?1, baidu_sync_path = ?2, baidu_sync_filename = ?3, updated_at = ?4 WHERE task_id = ?5",
+        (
+          if next_enabled { 1 } else { 0 },
+          next_path.as_deref(),
+          next_filename.as_deref(),
           &now,
           task_id,
         ),

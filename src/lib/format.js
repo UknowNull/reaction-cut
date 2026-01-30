@@ -30,6 +30,20 @@ export function formatDateTime(value) {
   return date.toLocaleString();
 }
 
+export function formatDateTimeBeijing(value) {
+  if (!value) {
+    return "-";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    hour12: false,
+  });
+}
+
 export function parseVideoInput(input) {
   if (!input) {
     return { bvid: null, aid: null };

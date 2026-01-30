@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invokeCommand } from "../lib/tauri";
 import { formatDateTime, formatDuration, formatNumber, parseVideoInput } from "../lib/format";
+import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
 
 const recordTabs = [
   { key: "pending", label: "待下载", status: 0 },
@@ -145,6 +146,9 @@ export default function DownloadSection() {
     videoType: "ORIGINAL",
     collectionId: "",
     segmentPrefix: "",
+    baiduSyncEnabled: false,
+    baiduSyncPath: "",
+    baiduSyncFilename: "",
   });
   const [partitions, setPartitions] = useState([]);
   const [collections, setCollections] = useState([]);
@@ -153,6 +157,7 @@ export default function DownloadSection() {
   const [quickFillPage, setQuickFillPage] = useState(1);
   const [quickFillTotal, setQuickFillTotal] = useState(0);
   const quickFillPageSize = 10;
+  const [syncPickerOpen, setSyncPickerOpen] = useState(false);
   const [deleteConfirmRecord, setDeleteConfirmRecord] = useState(null);
   const [deleteConfirmDeleteFile, setDeleteConfirmDeleteFile] = useState(false);
 
@@ -698,10 +703,30 @@ export default function DownloadSection() {
       collectionId: task.collectionId ? String(task.collectionId) : "",
       videoType: task.videoType || "ORIGINAL",
       segmentPrefix: task.segmentPrefix || "",
+      baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
+      baiduSyncPath: task.baiduSyncPath || "",
+      baiduSyncFilename: task.baiduSyncFilename || "",
     }));
     setTags(tagList);
     setTagInput("");
     closeQuickFill();
+  };
+
+  const handleOpenSyncPicker = () => {
+    setSyncPickerOpen(true);
+  };
+
+  const handleCloseSyncPicker = () => {
+    setSyncPickerOpen(false);
+  };
+
+  const handleConfirmSyncPicker = (path) => {
+    setSubmissionConfig((prev) => ({ ...prev, baiduSyncPath: path }));
+    setSyncPickerOpen(false);
+  };
+
+  const handleSyncPathChange = (path) => {
+    setSubmissionConfig((prev) => ({ ...prev, baiduSyncPath: path }));
   };
 
   const ensureDownloadPathReady = async () => {
@@ -930,6 +955,9 @@ export default function DownloadSection() {
             ? Number(submissionConfig.collectionId)
             : null,
           segmentPrefix: submissionConfig.segmentPrefix || null,
+          baiduSyncEnabled: Boolean(submissionConfig.baiduSyncEnabled),
+          baiduSyncPath: submissionConfig.baiduSyncPath || null,
+          baiduSyncFilename: submissionConfig.baiduSyncFilename || null,
           videoParts: selectedPartsConfig.map((part) => ({
             originalTitle: part.title,
             filePath: part.filePath,
@@ -1656,6 +1684,56 @@ export default function DownloadSection() {
                     <div className="text-xs text-[var(--desc-color)]">
                       分段前缀会作为分段文件名的前缀（可选）
                     </div>
+                    <div className="rounded-lg border border-[var(--split-color)] bg-white/70 p-3">
+                      <div className="text-xs uppercase tracking-[0.2em] text-[var(--desc-color)]">
+                        百度网盘同步
+                      </div>
+                      <label className="mt-2 flex items-center gap-2 text-xs text-[var(--desc-color)]">
+                        <input
+                          type="checkbox"
+                          checked={submissionConfig.baiduSyncEnabled}
+                          onChange={(event) =>
+                            setSubmissionConfig((prev) => ({
+                              ...prev,
+                              baiduSyncEnabled: event.target.checked,
+                            }))
+                          }
+                        />
+                        投稿完成后同步上传
+                      </label>
+                      {submissionConfig.baiduSyncEnabled ? (
+                        <div className="mt-3 grid gap-2">
+                          <div>
+                            <div className="text-xs text-[var(--desc-color)]">远端路径</div>
+                            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                              <div className="flex-1 rounded-lg border border-[var(--split-color)] bg-white/70 px-3 py-2 text-[var(--content-color)]">
+                                {submissionConfig.baiduSyncPath || "未配置"}
+                              </div>
+                              <button
+                                className="rounded-lg border border-[var(--split-color)] bg-white/70 px-3 py-1 font-semibold text-[var(--content-color)]"
+                                onClick={handleOpenSyncPicker}
+                              >
+                                选择目录
+                              </button>
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-xs text-[var(--desc-color)]">上传文件名</div>
+                            <input
+                              value={submissionConfig.baiduSyncFilename}
+                              onChange={(event) =>
+                                setSubmissionConfig((prev) => ({
+                                  ...prev,
+                                  baiduSyncFilename: event.target.value,
+                                }))
+                              }
+                              placeholder="文件名"
+                              className="mt-2 w-full rounded-lg border border-[var(--split-color)] bg-white/70 px-3 py-2 text-sm focus:border-[var(--primary-color)]"
+                            />
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
                   </div>
 
                   <div className="space-y-3">
@@ -1988,6 +2066,13 @@ export default function DownloadSection() {
           </div>
         </div>
       )}
+      <BaiduSyncPathPicker
+        open={syncPickerOpen}
+        value={submissionConfig.baiduSyncPath}
+        onConfirm={handleConfirmSyncPicker}
+        onClose={handleCloseSyncPicker}
+        onChange={handleSyncPathChange}
+      />
       {deleteConfirmRecord ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
           <div className="w-[360px] rounded-2xl bg-[var(--block-color)] p-5 text-sm text-[var(--content-color)] shadow-xl">

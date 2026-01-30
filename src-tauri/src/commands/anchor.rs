@@ -31,6 +31,8 @@ pub struct Anchor {
   pub live_title: Option<String>,
   pub category: Option<String>,
   pub auto_record: bool,
+  pub baidu_sync_enabled: bool,
+  pub baidu_sync_path: Option<String>,
   pub recording_status: Option<String>,
   pub recording_file: Option<String>,
   pub recording_start_time: Option<String>,
@@ -140,13 +142,14 @@ pub async fn anchor_subscribe(
 pub fn anchor_list(state: State<'_, AppState>) -> ApiResponse<Vec<Anchor>> {
   match state.db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1) \
+      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1), IFNULL(l.baidu_sync_enabled, 0), l.baidu_sync_path \
        FROM anchor a LEFT JOIN live_room_settings l ON a.uid = l.room_id ORDER BY a.id DESC",
     )?;
     let anchors = stmt
       .query_map([], |row| {
         let uid: String = row.get(1)?;
         let auto_record: i64 = row.get(7)?;
+        let sync_enabled: i64 = row.get(8)?;
         let record_info = state.live_runtime.get_record_info(&uid);
         Ok(Anchor {
           id: row.get(0)?,
@@ -160,6 +163,8 @@ pub fn anchor_list(state: State<'_, AppState>) -> ApiResponse<Vec<Anchor>> {
           live_title: None,
           category: None,
           auto_record: auto_record != 0,
+          baidu_sync_enabled: sync_enabled != 0,
+          baidu_sync_path: row.get(9)?,
           recording_status: record_info.as_ref().map(|_| "RECORDING".to_string()),
           recording_file: record_info.as_ref().map(|info| info.file_path.clone()),
           recording_start_time: record_info.map(|info| info.start_time),
@@ -206,11 +211,12 @@ pub async fn anchor_check(state: State<'_, AppState>) -> Result<ApiResponse<Vec<
   };
   let anchors = match state.db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1) \
+      "SELECT a.id, a.uid, a.nickname, a.live_status, a.last_check_time, a.create_time, a.update_time, IFNULL(l.auto_record, 1), IFNULL(l.baidu_sync_enabled, 0), l.baidu_sync_path \
        FROM anchor a LEFT JOIN live_room_settings l ON a.uid = l.room_id ORDER BY a.id DESC",
     )?;
     let list = stmt
       .query_map([], |row| {
+        let sync_enabled: i64 = row.get(8)?;
         Ok(Anchor {
           id: row.get(0)?,
           uid: row.get(1)?,
@@ -223,6 +229,8 @@ pub async fn anchor_check(state: State<'_, AppState>) -> Result<ApiResponse<Vec<
           live_title: None,
           category: None,
           auto_record: row.get::<_, i64>(7)? != 0,
+          baidu_sync_enabled: sync_enabled != 0,
+          baidu_sync_path: row.get(9)?,
           recording_status: None,
           recording_file: None,
           recording_start_time: None,
@@ -277,6 +285,8 @@ pub async fn anchor_check(state: State<'_, AppState>) -> Result<ApiResponse<Vec<
       live_title: info.live_title,
       category: info.category,
       auto_record: anchor.auto_record,
+      baidu_sync_enabled: anchor.baidu_sync_enabled,
+      baidu_sync_path: anchor.baidu_sync_path,
       recording_status: record_info.as_ref().map(|_| "RECORDING".to_string()),
       recording_file: record_info.as_ref().map(|info| info.file_path.clone()),
       recording_start_time: record_info.map(|info| info.start_time),

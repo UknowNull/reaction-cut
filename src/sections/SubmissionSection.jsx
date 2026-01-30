@@ -4,6 +4,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { invokeCommand } from "../lib/tauri";
 import { formatDateTime } from "../lib/format";
+import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
 
 const statusFilters = [
   { value: "ALL", label: "全部" },
@@ -42,6 +43,9 @@ export default function SubmissionSection() {
     collectionId: "",
     videoType: "ORIGINAL",
     segmentPrefix: "",
+    baiduSyncEnabled: false,
+    baiduSyncPath: "",
+    baiduSyncFilename: "",
   });
   const [tagInput, setTagInput] = useState("");
   const [tags, setTags] = useState([]);
@@ -78,11 +82,23 @@ export default function SubmissionSection() {
   const [repostHasBvid, setRepostHasBvid] = useState(false);
   const [repostUseCurrentBvid, setRepostUseCurrentBvid] = useState(false);
   const [repostSubmitting, setRepostSubmitting] = useState(false);
+  const [repostBaiduSync, setRepostBaiduSync] = useState({
+    enabled: false,
+    path: "",
+    filename: "",
+  });
   const [updateTaskId, setUpdateTaskId] = useState("");
   const [updateSourceVideos, setUpdateSourceVideos] = useState([emptySource(0)]);
   const [updateSegmentationEnabled, setUpdateSegmentationEnabled] = useState(true);
   const [updateWorkflowConfig, setUpdateWorkflowConfig] = useState(defaultWorkflowConfig);
   const [updateSegmentPrefix, setUpdateSegmentPrefix] = useState("");
+  const [updateBaiduSync, setUpdateBaiduSync] = useState({
+    enabled: false,
+    path: "",
+    filename: "",
+  });
+  const [syncPickerOpen, setSyncPickerOpen] = useState(false);
+  const [syncTarget, setSyncTarget] = useState("");
   const [updateSubmitting, setUpdateSubmitting] = useState(false);
   const [retryingSegmentIds, setRetryingSegmentIds] = useState(() => new Set());
   const [editSegments, setEditSegments] = useState([]);
@@ -165,6 +181,9 @@ export default function SubmissionSection() {
       collectionId: "",
       videoType: "ORIGINAL",
       segmentPrefix: "",
+      baiduSyncEnabled: false,
+      baiduSyncPath: "",
+      baiduSyncFilename: "",
     });
     setTagInput("");
     setTags([]);
@@ -179,6 +198,7 @@ export default function SubmissionSection() {
     setUpdateSegmentationEnabled(true);
     setUpdateWorkflowConfig(defaultWorkflowConfig);
     setUpdateSegmentPrefix("");
+    setUpdateBaiduSync({ enabled: false, path: "", filename: "" });
     setUpdateSubmitting(false);
   };
 
@@ -197,6 +217,11 @@ export default function SubmissionSection() {
     setUpdateOpen(true);
     setUpdateTaskId(task?.taskId || "");
     setUpdateSegmentPrefix(task?.segmentPrefix || "");
+    setUpdateBaiduSync({
+      enabled: Boolean(task?.baiduSyncEnabled),
+      path: task?.baiduSyncPath || "",
+      filename: task?.baiduSyncFilename || "",
+    });
     setUpdateSourceVideos([emptySource(0)]);
     setUpdateSegmentationEnabled(true);
     setUpdateWorkflowConfig(defaultWorkflowConfig);
@@ -262,6 +287,11 @@ export default function SubmissionSection() {
     setRepostHasBvid(hasBvid);
     setRepostUseCurrentBvid(hasBvid);
     setRepostSubmitting(false);
+    setRepostBaiduSync({
+      enabled: Boolean(task?.baiduSyncEnabled),
+      path: task?.baiduSyncPath || "",
+      filename: task?.baiduSyncFilename || "",
+    });
   };
 
   const closeRepostModal = () => {
@@ -270,6 +300,7 @@ export default function SubmissionSection() {
     setRepostHasBvid(false);
     setRepostUseCurrentBvid(false);
     setRepostSubmitting(false);
+    setRepostBaiduSync({ enabled: false, path: "", filename: "" });
     setMessage("");
   };
 
@@ -421,6 +452,53 @@ export default function SubmissionSection() {
     } catch (error) {
       setMessage(error.message);
     }
+  };
+
+  const resolveSyncPath = (target) => {
+    if (target === "update") {
+      return updateBaiduSync.path || "";
+    }
+    if (target === "repost") {
+      return repostBaiduSync.path || "";
+    }
+    return taskForm.baiduSyncPath || "";
+  };
+
+  const applySyncPath = (target, path) => {
+    if (target === "update") {
+      setUpdateBaiduSync((prev) => ({ ...prev, path }));
+      return;
+    }
+    if (target === "repost") {
+      setRepostBaiduSync((prev) => ({ ...prev, path }));
+      return;
+    }
+    setTaskForm((prev) => ({ ...prev, baiduSyncPath: path }));
+  };
+
+  const handleOpenSyncPicker = (target) => {
+    setSyncTarget(target);
+    setSyncPickerOpen(true);
+  };
+
+  const handleCloseSyncPicker = () => {
+    setSyncPickerOpen(false);
+    setSyncTarget("");
+  };
+
+  const handleConfirmSyncPicker = (path) => {
+    if (syncTarget) {
+      applySyncPath(syncTarget, path);
+    }
+    setSyncPickerOpen(false);
+    setSyncTarget("");
+  };
+
+  const handleSyncPathChange = (path) => {
+    if (!syncTarget) {
+      return;
+    }
+    applySyncPath(syncTarget, path);
   };
 
   useEffect(() => {
@@ -771,6 +849,9 @@ export default function SubmissionSection() {
             tags: uniqueTags.join(","),
             videoType: taskForm.videoType,
             segmentPrefix: taskForm.segmentPrefix || null,
+            baiduSyncEnabled: Boolean(taskForm.baiduSyncEnabled),
+            baiduSyncPath: taskForm.baiduSyncPath || null,
+            baiduSyncFilename: taskForm.baiduSyncFilename || null,
           },
           sourceVideos: validSources.map((item, index) => ({
             sourceFilePath: item.sourceFilePath,
@@ -842,6 +923,9 @@ export default function SubmissionSection() {
       const payload = {
         request: {
           taskId,
+          baiduSyncEnabled: Boolean(updateBaiduSync.enabled),
+          baiduSyncPath: updateBaiduSync.path || null,
+          baiduSyncFilename: updateBaiduSync.filename || null,
           sourceVideos: validSources.map((item, index) => ({
             sourceFilePath: item.sourceFilePath,
             sortOrder: index + 1,
@@ -983,6 +1067,9 @@ export default function SubmissionSection() {
       partitionId: task.partitionId ? String(task.partitionId) : "",
       collectionId: task.collectionId ? String(task.collectionId) : "",
       videoType: task.videoType || "ORIGINAL",
+      baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
+      baiduSyncPath: task.baiduSyncPath || "",
+      baiduSyncFilename: task.baiduSyncFilename || "",
     }));
     setTags(tagList);
     setTagInput("");
@@ -1021,6 +1108,9 @@ export default function SubmissionSection() {
       collectionId: task.collectionId ? String(task.collectionId) : "",
       videoType: task.videoType || "ORIGINAL",
       segmentPrefix: task.segmentPrefix || "",
+      baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
+      baiduSyncPath: task.baiduSyncPath || "",
+      baiduSyncFilename: task.baiduSyncFilename || "",
     });
     setTags(tagList);
     setTagInput("");
@@ -1263,6 +1353,9 @@ export default function SubmissionSection() {
         request: {
           taskId: repostTaskId,
           integrateCurrentBvid: repostUseCurrentBvid,
+          baiduSyncEnabled: Boolean(repostBaiduSync.enabled),
+          baiduSyncPath: repostBaiduSync.path || null,
+          baiduSyncFilename: repostBaiduSync.filename || null,
         },
       });
       setMessage(result || "已提交重新投稿");
@@ -1851,6 +1944,11 @@ export default function SubmissionSection() {
     return Number(task?.remoteState) === -2;
   };
 
+  const isRemoteFailed = (task) => {
+    const state = Number(task?.remoteState);
+    return state === -2 || state === -4;
+  };
+
   const resolveRejectReason = (task) => {
     if (!isRemoteRejected(task)) {
       return "-";
@@ -1867,10 +1965,47 @@ export default function SubmissionSection() {
   };
 
   const formatSegmentUploadStatus = (status) => {
-    if (status === "RATE_LIMITED") {
-      return "等待中";
+    if (!status) {
+      return "-";
     }
-    return status || "-";
+    switch (status) {
+      case "PENDING":
+        return "待上传";
+      case "UPLOADING":
+        return "上传中";
+      case "SUCCESS":
+        return "已上传";
+      case "FAILED":
+        return "上传失败";
+      case "RATE_LIMITED":
+        return "等待中";
+      case "PAUSED":
+        return "已暂停";
+      case "CANCELLED":
+        return "已取消";
+      default:
+        return "未知";
+    }
+  };
+
+  const formatMergedVideoStatus = (status) => {
+    const value = Number(status);
+    if (!Number.isFinite(value)) {
+      return "未知";
+    }
+    if (value === 0) {
+      return "待处理";
+    }
+    if (value === 1) {
+      return "处理中";
+    }
+    if (value === 2) {
+      return "已完成";
+    }
+    if (value === 3) {
+      return "失败";
+    }
+    return "未知";
   };
 
   const resolveResegmentCount = (durationSeconds, segmentSecondsValue) => {
@@ -2097,6 +2232,59 @@ export default function SubmissionSection() {
           </div>
           <div className="text-xs text-[var(--muted)]">
             分段前缀会作为分段文件名的前缀（可选）
+          </div>
+          <div className="rounded-xl border border-black/5 bg-white/80 p-3">
+            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              百度网盘同步
+            </div>
+            <label className="mt-2 flex items-center gap-2 text-sm text-[var(--muted)]">
+              <input
+                type="checkbox"
+                checked={taskForm.baiduSyncEnabled}
+                onChange={(event) =>
+                  setTaskForm((prev) => ({
+                    ...prev,
+                    baiduSyncEnabled: event.target.checked,
+                  }))
+                }
+                disabled={isReadOnly}
+              />
+              投稿完成后同步上传到百度网盘
+            </label>
+            {taskForm.baiduSyncEnabled ? (
+              <div className="mt-3 grid gap-2 lg:grid-cols-2">
+                <div>
+                  <div className="text-xs text-[var(--muted)]">远端路径</div>
+                  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                    <div className="flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-[var(--ink)]">
+                      {taskForm.baiduSyncPath || "未配置"}
+                    </div>
+                    <button
+                      className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
+                      onClick={() => handleOpenSyncPicker("create")}
+                      disabled={isReadOnly}
+                    >
+                      选择目录
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-[var(--muted)]">上传文件名</div>
+                  <input
+                    value={taskForm.baiduSyncFilename}
+                    onChange={(event) =>
+                      setTaskForm((prev) => ({
+                        ...prev,
+                        baiduSyncFilename: event.target.value,
+                      }))
+                    }
+                    placeholder="文件名"
+                    readOnly={isReadOnly}
+                    className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                  />
+                </div>
+              </div>
+            ) : null}
           </div>
           <div className="rounded-xl border border-black/5 bg-white/80 p-3">
             <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
@@ -2380,6 +2568,56 @@ export default function SubmissionSection() {
                         className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
                       />
                     </div>
+                  </div>
+                  <div className="rounded-lg border border-black/5 bg-white/80 p-3">
+                    <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                      百度网盘同步
+                    </div>
+                    <label className="mt-2 flex items-center gap-2 text-sm text-[var(--muted)]">
+                      <input
+                        type="checkbox"
+                        checked={updateBaiduSync.enabled}
+                        onChange={(event) =>
+                          setUpdateBaiduSync((prev) => ({
+                            ...prev,
+                            enabled: event.target.checked,
+                          }))
+                        }
+                      />
+                      同步上传到百度网盘
+                    </label>
+                    {updateBaiduSync.enabled ? (
+                      <div className="mt-3 grid gap-2 lg:grid-cols-2">
+                        <div>
+                          <div className="text-xs text-[var(--muted)]">远端路径</div>
+                          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                            <div className="flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-[var(--ink)]">
+                              {updateBaiduSync.path || "未配置"}
+                            </div>
+                            <button
+                              className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
+                              onClick={() => handleOpenSyncPicker("update")}
+                            >
+                              选择目录
+                            </button>
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-xs text-[var(--muted)]">上传文件名</div>
+                          <input
+                            value={updateBaiduSync.filename}
+                            onChange={(event) =>
+                              setUpdateBaiduSync((prev) => ({
+                                ...prev,
+                                filename: event.target.value,
+                              }))
+                            }
+                            placeholder="文件名"
+                            className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                          />
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                   <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
                     是否分段
@@ -2745,7 +2983,9 @@ export default function SubmissionSection() {
                             一键投稿
                           </button>
                         ) : null}
-                        {["COMPLETED", "FAILED"].includes(task.status) ? (
+                        {["COMPLETED", "FAILED"].includes(task.status) ||
+                        task.workflowStatus?.status === "FAILED" ||
+                        isRemoteFailed(task) ? (
                           <button
                             className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
                             onClick={() => openRepostModal(task)}
@@ -2920,6 +3160,56 @@ export default function SubmissionSection() {
                   {!repostHasBvid ? (
                     <div className="text-xs text-amber-700">
                       当前任务没有BV号，将创建新投稿。
+                    </div>
+                  ) : null}
+                </div>
+                <div className="mt-4 rounded-lg border border-black/5 bg-white/80 p-3 text-sm text-[var(--ink)]">
+                  <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                    百度网盘同步
+                  </div>
+                  <label className="mt-2 flex items-center gap-2 text-sm text-[var(--muted)]">
+                    <input
+                      type="checkbox"
+                      checked={repostBaiduSync.enabled}
+                      onChange={(event) =>
+                        setRepostBaiduSync((prev) => ({
+                          ...prev,
+                          enabled: event.target.checked,
+                        }))
+                      }
+                    />
+                    同步上传到百度网盘
+                  </label>
+                  {repostBaiduSync.enabled ? (
+                    <div className="mt-3 grid gap-2">
+                      <div>
+                        <div className="text-xs text-[var(--muted)]">远端路径</div>
+                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                          <div className="flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-[var(--ink)]">
+                            {repostBaiduSync.path || "未配置"}
+                          </div>
+                          <button
+                            className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
+                            onClick={() => handleOpenSyncPicker("repost")}
+                          >
+                            选择目录
+                          </button>
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-[var(--muted)]">上传文件名</div>
+                        <input
+                          value={repostBaiduSync.filename}
+                          onChange={(event) =>
+                            setRepostBaiduSync((prev) => ({
+                              ...prev,
+                              filename: event.target.value,
+                            }))
+                          }
+                          placeholder="文件名"
+                          className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                        />
+                      </div>
                     </div>
                   ) : null}
                 </div>
@@ -3313,7 +3603,9 @@ export default function SubmissionSection() {
                         <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
                         <td className="px-4 py-2 text-[var(--ink)]">{item.fileName}</td>
                         <td className="px-4 py-2 text-[var(--muted)]">{item.videoPath}</td>
-                        <td className="px-4 py-2 text-[var(--muted)]">{item.status}</td>
+                        <td className="px-4 py-2 text-[var(--muted)]">
+                          {formatMergedVideoStatus(item.status)}
+                        </td>
                         <td className="px-4 py-2 text-[var(--muted)]">
                           {formatDateTime(item.createTime)}
                         </td>
@@ -3623,6 +3915,13 @@ export default function SubmissionSection() {
           ) : null}
         </div>
       ) : null}
+      <BaiduSyncPathPicker
+        open={syncPickerOpen}
+        value={resolveSyncPath(syncTarget)}
+        onConfirm={handleConfirmSyncPicker}
+        onClose={handleCloseSyncPicker}
+        onChange={handleSyncPathChange}
+      />
     </div>
   );
 }

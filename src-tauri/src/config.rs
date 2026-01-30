@@ -10,10 +10,13 @@ use tauri::Manager;
 pub const DEFAULT_FFMPEG_PATH: &str = "/opt/homebrew/bin/ffmpeg";
 pub const DEFAULT_FFPROBE_PATH: &str = "/opt/homebrew/bin/ffprobe";
 pub const DEFAULT_ARIA2C_PATH: &str = "/opt/homebrew/bin/aria2c";
+pub const DEFAULT_BAIDU_PCS_PATH: &str = "/opt/homebrew/bin/BaiduPCS-Go";
 
 const ENV_FFMPEG_PATH: &str = "REACTION_CUT_FFMPEG_PATH";
 const ENV_FFPROBE_PATH: &str = "REACTION_CUT_FFPROBE_PATH";
 const ENV_ARIA2C_PATH: &str = "REACTION_CUT_ARIA2C_PATH";
+const ENV_BAIDU_PCS_PATH: &str = "REACTION_CUT_BAIDU_PCS_PATH";
+const ENV_BAIDU_PCS_CONFIG_DIR: &str = "BAIDUPCS_GO_CONFIG_DIR";
 
 fn resolve_home_dir() -> Option<PathBuf> {
   if cfg!(target_os = "windows") {
@@ -53,6 +56,16 @@ pub fn default_temp_dir() -> PathBuf {
 }
 
 pub fn init_resource_bins(app_handle: &AppHandle) {
+  let config_dir = app_handle
+    .path()
+    .app_data_dir()
+    .ok()
+    .map(|dir| dir.join("baidu_pcs"));
+  if let Some(path) = config_dir {
+    if std::fs::create_dir_all(&path).is_ok() {
+      set_env_if_dir(ENV_BAIDU_PCS_CONFIG_DIR, path);
+    }
+  }
   let base_dir = match app_handle.path().resolve("bin", BaseDirectory::Resource) {
     Ok(path) => path,
     Err(_) => return,
@@ -71,6 +84,10 @@ pub fn init_resource_bins(app_handle: &AppHandle) {
   let aria2c_path = resolve_bin_in_dirs(&runtime_dir, &platform_dir, &base_dir, "aria2c");
   if let Some(path) = aria2c_path {
     set_env_if_exists(ENV_ARIA2C_PATH, path);
+  }
+  let baidu_pcs_path = resolve_bin_in_dirs(&runtime_dir, &platform_dir, &base_dir, "BaiduPCS-Go");
+  if let Some(path) = baidu_pcs_path {
+    set_env_if_exists(ENV_BAIDU_PCS_PATH, path);
   }
 }
 
@@ -100,6 +117,28 @@ pub fn resolve_aria2c_candidates() -> Vec<String> {
   candidates
 }
 
+pub fn resolve_baidu_pcs_path() -> PathBuf {
+  resolve_bin_path(ENV_BAIDU_PCS_PATH, DEFAULT_BAIDU_PCS_PATH)
+}
+
+pub fn resolve_baidu_pcs_candidates() -> Vec<String> {
+  let mut candidates = Vec::new();
+  if let Ok(value) = env::var(ENV_BAIDU_PCS_PATH) {
+    if !value.trim().is_empty() {
+      candidates.push(value);
+    }
+  }
+  if !candidates.iter().any(|item| item == DEFAULT_BAIDU_PCS_PATH) {
+    candidates.push(DEFAULT_BAIDU_PCS_PATH.to_string());
+  }
+  candidates.push("BaiduPCS-Go".to_string());
+  if cfg!(target_os = "windows") {
+    candidates.push("BaiduPCS-Go.exe".to_string());
+  }
+  candidates.dedup();
+  candidates
+}
+
 fn resolve_bin_path(env_key: &str, fallback: &str) -> PathBuf {
   if let Ok(value) = env::var(env_key) {
     if !value.trim().is_empty() {
@@ -115,6 +154,12 @@ fn set_env_if_exists(key: &str, path: PathBuf) {
     {
       let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
     }
+    env::set_var(key, path.to_string_lossy().to_string());
+  }
+}
+
+fn set_env_if_dir(key: &str, path: PathBuf) {
+  if path.is_dir() {
     env::set_var(key, path.to_string_lossy().to_string());
   }
 }

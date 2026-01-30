@@ -1,7 +1,14 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
+use crate::config::resolve_ffprobe_path;
 use crate::ffmpeg::{run_ffmpeg, run_ffprobe_json};
+
+const START_DIFF_THRESHOLD_SECONDS: f64 = 1.0;
+const TIMESTAMP_GAP_THRESHOLD_SECONDS: f64 = 2.0;
+const NEGATIVE_JUMP_THRESHOLD_SECONDS: f64 = -0.5;
 
 #[derive(Clone)]
 pub struct ClipSource {
@@ -11,10 +18,18 @@ pub struct ClipSource {
   pub order: i64,
 }
 
-pub fn clip_sources(sources: &[ClipSource], output_dir: &Path) -> Result<Vec<PathBuf>, String> {
+pub struct ClipCopyDecision {
+  pub use_copy: bool,
+  pub reason: Option<String>,
+}
+
+pub fn clip_sources(
+  sources: &[ClipSource],
+  output_dir: &Path,
+  use_copy: bool,
+) -> Result<Vec<PathBuf>, String> {
   fs::create_dir_all(output_dir).map_err(|err| format!("Failed to create output dir: {}", err))?;
 
-  let use_copy = can_concat_copy_sources(sources).unwrap_or(false);
   let mut outputs = Vec::new();
   for source in sources {
     let output_path = output_dir.join(format!("clip_{:03}.mp4", source.order));
@@ -237,7 +252,226 @@ pub fn can_concat_copy_sources(sources: &[ClipSource]) -> Result<bool, String> {
   can_concat_copy(&files)
 }
 
-fn probe_duration_seconds(path: &Path) -> Result<f64, String> {
+pub fn decide_clip_copy(sources: &[ClipSource]) -> Result<ClipCopyDecision, String> {
+  let can_copy = can_concat_copy_sources(sources)?;
+  if !can_copy {
+    return Ok(ClipCopyDecision {
+      use_copy: false,
+      reason: Some("codec_mismatch".to_string()),
+    });
+  }
+
+  for source in sources {
+    match detect_timestamp_anomaly(source) {
+      Ok(Some(reason)) => {
+        return Ok(ClipCopyDecision {
+          use_copy: false,
+          reason: Some(format!("timestamp_anomaly input={} {}", source.input_path, reason)),
+        });
+      }
+      Ok(None) => {}
+      Err(err) => {
+        return Ok(ClipCopyDecision {
+          use_copy: false,
+          reason: Some(format!(
+            "timestamp_probe_failed input={} err={}",
+            source.input_path, err
+          )),
+        });
+      }
+    }
+  }
+
+  Ok(ClipCopyDecision {
+    use_copy: true,
+    reason: None,
+  })
+}
+
+struct TimestampScanResult {
+  video_start: Option<f64>,
+  audio_start: Option<f64>,
+  max_gap_video: f64,
+  max_gap_audio: f64,
+  neg_jump_video: usize,
+  neg_jump_audio: usize,
+}
+
+fn detect_timestamp_anomaly(source: &ClipSource) -> Result<Option<String>, String> {
+  let input_path = Path::new(&source.input_path);
+  let interval = build_read_intervals(source);
+  let scan = scan_timestamp_gaps(input_path, interval.clone())?;
+  let range_label = interval.unwrap_or_else(|| "full".to_string());
+
+  if let (Some(video_start), Some(audio_start)) = (scan.video_start, scan.audio_start) {
+    let diff = (video_start - audio_start).abs();
+    if diff > START_DIFF_THRESHOLD_SECONDS {
+      return Ok(Some(format!("start_diff={:.3} range={}", diff, range_label)));
+    }
+  }
+  if scan.max_gap_video > TIMESTAMP_GAP_THRESHOLD_SECONDS {
+    return Ok(Some(format!(
+      "video_gap={:.3} range={}",
+      scan.max_gap_video, range_label
+    )));
+  }
+  if scan.max_gap_audio > TIMESTAMP_GAP_THRESHOLD_SECONDS {
+    return Ok(Some(format!(
+      "audio_gap={:.3} range={}",
+      scan.max_gap_audio, range_label
+    )));
+  }
+  if scan.neg_jump_video > 0 {
+    return Ok(Some(format!(
+      "video_negative_jump={} range={}",
+      scan.neg_jump_video, range_label
+    )));
+  }
+  if scan.neg_jump_audio > 0 {
+    return Ok(Some(format!(
+      "audio_negative_jump={} range={}",
+      scan.neg_jump_audio, range_label
+    )));
+  }
+
+  Ok(None)
+}
+
+fn build_read_intervals(source: &ClipSource) -> Option<String> {
+  let start = source
+    .start_time
+    .as_deref()
+    .and_then(|value| parse_time_to_seconds(value));
+  let end = source
+    .end_time
+    .as_deref()
+    .and_then(|value| parse_time_to_seconds(value));
+  match (start, end) {
+    (Some(start), Some(end)) if end > start => {
+      let duration = end - start;
+      Some(format!("{:.3}%+{:.3}", start, duration))
+    }
+    _ => None,
+  }
+}
+
+pub fn parse_time_to_seconds(value: &str) -> Option<f64> {
+  let trimmed = value.trim();
+  if trimmed.is_empty() || trimmed == "00:00:00" {
+    return None;
+  }
+  let parts: Vec<&str> = trimmed.split(':').collect();
+  let (hours, minutes, seconds) = match parts.len() {
+    3 => (
+      parts[0].parse::<f64>().ok()?,
+      parts[1].parse::<f64>().ok()?,
+      parts[2].parse::<f64>().ok()?,
+    ),
+    2 => (0.0, parts[0].parse::<f64>().ok()?, parts[1].parse::<f64>().ok()?),
+    1 => (0.0, 0.0, parts[0].parse::<f64>().ok()?),
+    _ => return None,
+  };
+  Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+fn scan_timestamp_gaps(path: &Path, interval: Option<String>) -> Result<TimestampScanResult, String> {
+  let ffprobe_path = resolve_ffprobe_path();
+  let mut command = Command::new(ffprobe_path);
+  command
+    .arg("-v")
+    .arg("error")
+    .arg("-show_entries")
+    .arg("packet=stream_index,pts_time")
+    .arg("-of")
+    .arg("compact=p=0:nk=1");
+  if let Some(interval_value) = &interval {
+    command.arg("-read_intervals").arg(interval_value);
+  }
+  command.arg(path);
+
+  let mut child = command
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .map_err(|err| format!("Failed to start FFprobe: {}", err))?;
+
+  let stdout = child
+    .stdout
+    .take()
+    .ok_or_else(|| "Failed to capture FFprobe stdout".to_string())?;
+  let reader = BufReader::new(stdout);
+
+  let mut video_prev: Option<f64> = None;
+  let mut audio_prev: Option<f64> = None;
+  let mut video_start: Option<f64> = None;
+  let mut audio_start: Option<f64> = None;
+  let mut max_gap_video = 0.0;
+  let mut max_gap_audio = 0.0;
+  let mut neg_jump_video = 0;
+  let mut neg_jump_audio = 0;
+
+  for line in reader.lines().flatten() {
+    let value = line.trim();
+    if value.is_empty() {
+      continue;
+    }
+    let mut parts = value.split('|');
+    let stream_index = parts.next().and_then(|item| item.parse::<i64>().ok());
+    let pts = parts.next().and_then(|item| item.parse::<f64>().ok());
+    let (stream_index, pts) = match (stream_index, pts) {
+      (Some(idx), Some(value)) => (idx, value),
+      _ => continue,
+    };
+
+    if stream_index == 0 {
+      if video_start.is_none() {
+        video_start = Some(pts);
+      }
+      if let Some(prev) = video_prev {
+        let gap = pts - prev;
+        if gap < NEGATIVE_JUMP_THRESHOLD_SECONDS {
+          neg_jump_video += 1;
+        }
+        if gap > max_gap_video {
+          max_gap_video = gap;
+        }
+      }
+      video_prev = Some(pts);
+    } else if stream_index == 1 {
+      if audio_start.is_none() {
+        audio_start = Some(pts);
+      }
+      if let Some(prev) = audio_prev {
+        let gap = pts - prev;
+        if gap < NEGATIVE_JUMP_THRESHOLD_SECONDS {
+          neg_jump_audio += 1;
+        }
+        if gap > max_gap_audio {
+          max_gap_audio = gap;
+        }
+      }
+      audio_prev = Some(pts);
+    }
+  }
+
+  let status = child
+    .wait()
+    .map_err(|err| format!("Failed to wait FFprobe: {}", err))?;
+  if !status.success() {
+    return Err("FFprobe failed".to_string());
+  }
+
+  Ok(TimestampScanResult {
+    video_start,
+    audio_start,
+    max_gap_video,
+    max_gap_audio,
+    neg_jump_video,
+    neg_jump_audio,
+  })
+}
+
+pub fn probe_duration_seconds(path: &Path) -> Result<f64, String> {
   let args = vec![
     "-v".to_string(),
     "error".to_string(),

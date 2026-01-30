@@ -50,6 +50,7 @@ pub struct LiveSettings {
   pub cutting_mode: i64,
   pub cutting_number: i64,
   pub cutting_by_title: bool,
+  pub title_split_min_seconds: i64,
   pub danmaku_transport: i64,
   pub record_danmaku: bool,
   pub record_danmaku_raw: bool,
@@ -62,6 +63,8 @@ pub struct LiveSettings {
   pub check_interval_sec: i64,
   pub flv_fix_split_on_missing: bool,
   pub flv_fix_disable_on_annexb: bool,
+  pub baidu_sync_enabled: bool,
+  pub baidu_sync_path: String,
 }
 
 #[tauri::command]
@@ -201,8 +204,8 @@ pub fn update_live_settings(
   let now = Utc::now().to_rfc3339();
   let result = state.db.with_conn(|conn| {
     conn.execute(
-      "INSERT INTO live_settings (id, file_name_template, record_path, write_metadata, save_cover, recording_quality, record_mode, cutting_mode, cutting_number, cutting_by_title, danmaku_transport, record_danmaku, record_danmaku_raw, record_danmaku_superchat, record_danmaku_gift, record_danmaku_guard, stream_retry_ms, stream_retry_no_qn_sec, stream_connect_timeout_ms, check_interval_sec, flv_fix_split_on_missing, flv_fix_disable_on_annexb, create_time, update_time) \
-       VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23) \
+      "INSERT INTO live_settings (id, file_name_template, record_path, write_metadata, save_cover, recording_quality, record_mode, cutting_mode, cutting_number, cutting_by_title, title_split_min_seconds, danmaku_transport, record_danmaku, record_danmaku_raw, record_danmaku_superchat, record_danmaku_gift, record_danmaku_guard, stream_retry_ms, stream_retry_no_qn_sec, stream_connect_timeout_ms, check_interval_sec, flv_fix_split_on_missing, flv_fix_disable_on_annexb, baidu_sync_enabled, baidu_sync_path, create_time, update_time) \
+       VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26) \
        ON CONFLICT(id) DO UPDATE SET \
        file_name_template = excluded.file_name_template, \
        record_path = excluded.record_path, \
@@ -213,6 +216,7 @@ pub fn update_live_settings(
        cutting_mode = excluded.cutting_mode, \
        cutting_number = excluded.cutting_number, \
        cutting_by_title = excluded.cutting_by_title, \
+       title_split_min_seconds = excluded.title_split_min_seconds, \
        danmaku_transport = excluded.danmaku_transport, \
        record_danmaku = excluded.record_danmaku, \
        record_danmaku_raw = excluded.record_danmaku_raw, \
@@ -225,6 +229,8 @@ pub fn update_live_settings(
        check_interval_sec = excluded.check_interval_sec, \
        flv_fix_split_on_missing = excluded.flv_fix_split_on_missing, \
        flv_fix_disable_on_annexb = excluded.flv_fix_disable_on_annexb, \
+       baidu_sync_enabled = excluded.baidu_sync_enabled, \
+       baidu_sync_path = excluded.baidu_sync_path, \
        update_time = excluded.update_time",
       params![
         payload.file_name_template.as_str(),
@@ -236,6 +242,7 @@ pub fn update_live_settings(
         payload.cutting_mode,
         payload.cutting_number,
         payload.cutting_by_title as i64,
+        payload.title_split_min_seconds,
         payload.danmaku_transport,
         payload.record_danmaku as i64,
         payload.record_danmaku_raw as i64,
@@ -248,6 +255,8 @@ pub fn update_live_settings(
         payload.check_interval_sec,
         payload.flv_fix_split_on_missing as i64,
         payload.flv_fix_disable_on_annexb as i64,
+        payload.baidu_sync_enabled as i64,
+        payload.baidu_sync_path.as_str(),
         &now,
         &now,
       ],
@@ -365,7 +374,7 @@ pub fn load_download_settings_from_db(db: &Db) -> Result<DownloadSettings, crate
 pub fn load_live_settings_from_db(db: &Db) -> Result<LiveSettings, crate::db::DbError> {
   db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT file_name_template, record_path, write_metadata, save_cover, recording_quality, record_mode, cutting_mode, cutting_number, cutting_by_title, danmaku_transport, record_danmaku, record_danmaku_raw, record_danmaku_superchat, record_danmaku_gift, record_danmaku_guard, stream_retry_ms, stream_retry_no_qn_sec, stream_connect_timeout_ms, check_interval_sec, flv_fix_split_on_missing, flv_fix_disable_on_annexb \
+      "SELECT file_name_template, record_path, write_metadata, save_cover, recording_quality, record_mode, cutting_mode, cutting_number, cutting_by_title, title_split_min_seconds, danmaku_transport, record_danmaku, record_danmaku_raw, record_danmaku_superchat, record_danmaku_gift, record_danmaku_guard, stream_retry_ms, stream_retry_no_qn_sec, stream_connect_timeout_ms, check_interval_sec, flv_fix_split_on_missing, flv_fix_disable_on_annexb, baidu_sync_enabled, baidu_sync_path \
        FROM live_settings WHERE id = 1",
     )?;
 
@@ -380,18 +389,21 @@ pub fn load_live_settings_from_db(db: &Db) -> Result<LiveSettings, crate::db::Db
         cutting_mode: row.get(6)?,
         cutting_number: row.get(7)?,
         cutting_by_title: row.get::<_, i64>(8)? != 0,
-        danmaku_transport: row.get(9)?,
-        record_danmaku: row.get::<_, i64>(10)? != 0,
-        record_danmaku_raw: row.get::<_, i64>(11)? != 0,
-        record_danmaku_superchat: row.get::<_, i64>(12)? != 0,
-        record_danmaku_gift: row.get::<_, i64>(13)? != 0,
-        record_danmaku_guard: row.get::<_, i64>(14)? != 0,
-        stream_retry_ms: row.get(15)?,
-        stream_retry_no_qn_sec: row.get(16)?,
-        stream_connect_timeout_ms: row.get(17)?,
-        check_interval_sec: row.get(18)?,
-        flv_fix_split_on_missing: row.get::<_, i64>(19)? != 0,
-        flv_fix_disable_on_annexb: row.get::<_, i64>(20)? != 0,
+        title_split_min_seconds: row.get(9)?,
+        danmaku_transport: row.get(10)?,
+        record_danmaku: row.get::<_, i64>(11)? != 0,
+        record_danmaku_raw: row.get::<_, i64>(12)? != 0,
+        record_danmaku_superchat: row.get::<_, i64>(13)? != 0,
+        record_danmaku_gift: row.get::<_, i64>(14)? != 0,
+        record_danmaku_guard: row.get::<_, i64>(15)? != 0,
+        stream_retry_ms: row.get(16)?,
+        stream_retry_no_qn_sec: row.get(17)?,
+        stream_connect_timeout_ms: row.get(18)?,
+        check_interval_sec: row.get(19)?,
+        flv_fix_split_on_missing: row.get::<_, i64>(20)? != 0,
+        flv_fix_disable_on_annexb: row.get::<_, i64>(21)? != 0,
+        baidu_sync_enabled: row.get::<_, i64>(22)? != 0,
+        baidu_sync_path: row.get::<_, Option<String>>(23)?.unwrap_or_default(),
       })
     });
 
@@ -424,6 +436,7 @@ pub fn default_live_settings() -> LiveSettings {
     cutting_mode: 0,
     cutting_number: 100,
     cutting_by_title: false,
+    title_split_min_seconds: 1800,
     danmaku_transport: 0,
     record_danmaku: false,
     record_danmaku_raw: false,
@@ -436,5 +449,7 @@ pub fn default_live_settings() -> LiveSettings {
     check_interval_sec: 180,
     flv_fix_split_on_missing: false,
     flv_fix_disable_on_annexb: false,
+    baidu_sync_enabled: false,
+    baidu_sync_path: "/录播".to_string(),
   }
 }

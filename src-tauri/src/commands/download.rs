@@ -117,6 +117,9 @@ pub struct SubmissionRequest {
   pub video_type: String,
   pub collection_id: Option<i64>,
   pub segment_prefix: Option<String>,
+  pub baidu_sync_enabled: Option<bool>,
+  pub baidu_sync_path: Option<String>,
+  pub baidu_sync_filename: Option<String>,
   pub video_parts: Vec<SubmissionVideoPart>,
 }
 
@@ -378,6 +381,7 @@ pub async fn download_retry(
     Some(value) => value,
     None => return Ok(ApiResponse::error("缺少本地路径，无法重试")),
   };
+  let _ = reset_integrated_submission_status(&context, task_id);
 
   let part = DownloadPart {
     cid,
@@ -611,6 +615,7 @@ async fn requeue_download_record(
     Some(value) => value,
     None => return Err("缺少本地路径，无法重新下载".to_string()),
   };
+  let _ = reset_integrated_submission_status(context, record_id);
 
   let part = DownloadPart {
     cid,
@@ -744,8 +749,8 @@ async fn handle_integration_download(
 
   let insert_result = context.db.with_conn(|conn| {
     conn.execute(
-      "INSERT INTO submission_task (task_id, status, title, description, cover_url, partition_id, tags, video_type, collection_id, bvid, aid, created_at, updated_at, segment_prefix) \
-       VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11)",
+      "INSERT INTO submission_task (task_id, status, title, description, cover_url, partition_id, tags, video_type, collection_id, bvid, aid, created_at, updated_at, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
+       VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11, ?12, ?13, ?14)",
       (
         &submission_id,
         "PENDING",
@@ -758,6 +763,13 @@ async fn handle_integration_download(
         &now,
         &now,
         submission.segment_prefix,
+        if submission.baidu_sync_enabled.unwrap_or(false) {
+          1
+        } else {
+          0
+        },
+        submission.baidu_sync_path.as_deref(),
+        submission.baidu_sync_filename.as_deref(),
       ),
     )?;
 
@@ -3321,6 +3333,22 @@ fn load_submission_status(context: &DownloadContext, task_id: &str) -> Result<St
     .map_err(|err| err.to_string())
 }
 
+fn load_relation_workflow_status(
+  context: &DownloadContext,
+  task_id: &str,
+) -> Result<Option<String>, String> {
+  context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT workflow_status FROM task_relations WHERE submission_task_id = ?1 ORDER BY updated_at DESC LIMIT 1",
+      )?;
+      let status: Option<String> = stmt.query_row([task_id], |row| row.get(0)).ok();
+      Ok(status)
+    })
+    .map_err(|err| err.to_string())
+}
+
 fn update_submission_status(
   context: &DownloadContext,
   task_id: &str,
@@ -3376,6 +3404,23 @@ fn update_workflow_instance_status(
   Ok(())
 }
 
+fn reset_workflow_instance_state(
+  context: &DownloadContext,
+  task_id: &str,
+) -> Result<(), String> {
+  let now = now_rfc3339();
+  context
+    .db
+    .with_conn(|conn| {
+      conn.execute(
+        "UPDATE workflow_instances SET status = 'PENDING', current_step = NULL, progress = 0, updated_at = ?1 WHERE task_id = ?2",
+        (&now, task_id),
+      )?;
+      Ok(())
+    })
+    .map_err(|err| err.to_string())
+}
+
 fn load_workflow_instance_status(
   context: &DownloadContext,
   task_id: &str,
@@ -3390,6 +3435,50 @@ fn load_workflow_instance_status(
       Ok(status)
     })
     .map_err(|err| err.to_string())
+}
+
+fn reset_integrated_submission_status(
+  context: &DownloadContext,
+  record_id: i64,
+) -> Result<(), String> {
+  let submission_task_id = context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT submission_task_id FROM task_relations WHERE download_task_id = ?1 AND relation_type = 'INTEGRATED' LIMIT 1",
+      )?;
+      let value: Option<String> = stmt.query_row([record_id], |row| row.get(0)).ok();
+      Ok(value)
+    })
+    .map_err(|err| err.to_string())?;
+
+  let submission_task_id = match submission_task_id {
+    Some(task_id) => task_id,
+    None => return Ok(()),
+  };
+
+  let submission_status = load_submission_status(context, &submission_task_id).unwrap_or_default();
+  let relation_status = load_relation_workflow_status(context, &submission_task_id)?;
+  let workflow_status = load_workflow_instance_status(context, &submission_task_id)?;
+  let should_reset = submission_status == "FAILED"
+    || relation_status.as_deref() == Some("DOWNLOAD_FAILED")
+    || workflow_status.as_deref() == Some("FAILED");
+
+  if !should_reset {
+    return Ok(());
+  }
+
+  let _ = update_submission_status(context, &submission_task_id, "PENDING");
+  let _ = update_relation_workflow_status(context, &submission_task_id, "PENDING_DOWNLOAD");
+  let _ = reset_workflow_instance_state(context, &submission_task_id);
+  append_log(
+    &context.app_log_path,
+    &format!(
+      "download_retry_reset_submission task_id={} download_id={}",
+      submission_task_id, record_id
+    ),
+  );
+  Ok(())
 }
 
 async fn refresh_integration_status(

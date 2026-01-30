@@ -12,6 +12,8 @@ export default function SettingsSection() {
   const [aria2cConnections, setAria2cConnections] = useState(4);
   const [aria2cSplit, setAria2cSplit] = useState(4);
   const [message, setMessage] = useState("");
+  const [syncConcurrency, setSyncConcurrency] = useState(3);
+  const [syncConfigMessage, setSyncConfigMessage] = useState("");
   const [liveMessage, setLiveMessage] = useState("");
   const [liveSettings, setLiveSettings] = useState({
     fileNameTemplate: "live/{{ roomId }}/{{ liveDate }}/录制-{{ roomId }}-{{ now }}-{{ title }}.flv",
@@ -23,6 +25,7 @@ export default function SettingsSection() {
     cuttingMode: 0,
     cuttingNumber: 100,
     cuttingByTitle: false,
+    titleSplitMinSeconds: 1800,
     danmakuTransport: 0,
     recordDanmaku: false,
     recordDanmakuRaw: false,
@@ -35,6 +38,8 @@ export default function SettingsSection() {
     checkIntervalSec: 180,
     flvFixSplitOnMissing: false,
     flvFixDisableOnAnnexb: false,
+    baiduSyncEnabled: false,
+    baiduSyncPath: "/录播",
   });
 
   const logClient = async (text) => {
@@ -77,9 +82,34 @@ export default function SettingsSection() {
     }
   };
 
+  const loadBaiduSyncSettings = async () => {
+    setSyncConfigMessage("");
+    try {
+      const data = await invokeCommand("baidu_sync_settings");
+      const concurrency = Math.max(1, Number(data?.concurrency || 3));
+      setSyncConcurrency(concurrency);
+    } catch (error) {
+      setSyncConfigMessage(error?.message || "加载同步配置失败");
+    }
+  };
+
+  const handleSaveBaiduSyncSettings = async () => {
+    setSyncConfigMessage("");
+    try {
+      await invokeCommand("baidu_sync_update_settings", {
+        request: { concurrency: Number(syncConcurrency || 1) },
+      });
+      setSyncConfigMessage("同步配置已保存");
+      await loadBaiduSyncSettings();
+    } catch (error) {
+      setSyncConfigMessage(error?.message || "保存同步配置失败");
+    }
+  };
+
   useEffect(() => {
     loadSettings();
     loadLiveSettings();
+    loadBaiduSyncSettings();
   }, []);
 
   const loadLiveSettings = async () => {
@@ -97,6 +127,7 @@ export default function SettingsSection() {
           cuttingMode: Number(data.cuttingMode || 0),
           cuttingNumber: Number(data.cuttingNumber || 0),
           cuttingByTitle: Boolean(data.cuttingByTitle),
+          titleSplitMinSeconds: Number(data.titleSplitMinSeconds || 0),
           danmakuTransport: Number(data.danmakuTransport || 0),
           recordDanmaku: Boolean(data.recordDanmaku),
           recordDanmakuRaw: Boolean(data.recordDanmakuRaw),
@@ -109,6 +140,8 @@ export default function SettingsSection() {
           checkIntervalSec: Number(data.checkIntervalSec || 0),
           flvFixSplitOnMissing: Boolean(data.flvFixSplitOnMissing),
           flvFixDisableOnAnnexb: Boolean(data.flvFixDisableOnAnnexb),
+          baiduSyncEnabled: Boolean(data.baiduSyncEnabled),
+          baiduSyncPath: data.baiduSyncPath || "/录播",
         });
       }
     } catch (error) {
@@ -202,6 +235,7 @@ export default function SettingsSection() {
           cuttingMode: Number(liveSettings.cuttingMode || 0),
           cuttingNumber: Number(liveSettings.cuttingNumber || 0),
           cuttingByTitle: liveSettings.cuttingByTitle,
+          titleSplitMinSeconds: Number(liveSettings.titleSplitMinSeconds || 0),
           danmakuTransport: Number(liveSettings.danmakuTransport || 0),
           recordDanmaku: liveSettings.recordDanmaku,
           recordDanmakuRaw: liveSettings.recordDanmakuRaw,
@@ -214,6 +248,8 @@ export default function SettingsSection() {
           checkIntervalSec: Number(liveSettings.checkIntervalSec || 0),
           flvFixSplitOnMissing: liveSettings.flvFixSplitOnMissing,
           flvFixDisableOnAnnexb: liveSettings.flvFixDisableOnAnnexb,
+          baiduSyncEnabled: liveSettings.baiduSyncEnabled,
+          baiduSyncPath: liveSettings.baiduSyncPath,
         },
       });
       setLiveMessage("直播录制设置已保存");
@@ -239,6 +275,7 @@ export default function SettingsSection() {
       setLiveMessage(error.message);
     }
   };
+
 
   return (
     <div className="space-y-6">
@@ -374,6 +411,46 @@ export default function SettingsSection() {
 
       <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
         <div>
+          <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">同步</p>
+          <h2 className="text-2xl font-semibold text-[var(--ink)]">同步配置</h2>
+        </div>
+        <div className="mt-4 grid gap-3 lg:grid-cols-2">
+          <div>
+            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              最大同时同步数
+            </div>
+            <input
+              type="number"
+              value={syncConcurrency}
+              onChange={(event) => setSyncConcurrency(event.target.value)}
+              min={1}
+              className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+            />
+          </div>
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:brightness-110"
+            onClick={handleSaveBaiduSyncSettings}
+          >
+            保存
+          </button>
+          <button
+            className="rounded-full border border-black/10 bg-white px-4 py-2 text-sm font-semibold text-[var(--ink)] transition hover:border-black/20"
+            onClick={loadBaiduSyncSettings}
+          >
+            刷新
+          </button>
+        </div>
+        {syncConfigMessage ? (
+          <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+            {syncConfigMessage}
+          </div>
+        ) : null}
+      </div>
+
+      <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
+        <div>
           <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">直播录制</p>
           <h2 className="text-2xl font-semibold text-[var(--ink)]">基础设置</h2>
         </div>
@@ -452,6 +529,36 @@ export default function SettingsSection() {
             >
               选择路径
             </button>
+          </div>
+          <div className="lg:col-span-2">
+            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              百度网盘同步
+            </div>
+            <label className="mt-2 flex items-center gap-2 text-sm text-[var(--muted)]">
+              <input
+                type="checkbox"
+                checked={liveSettings.baiduSyncEnabled}
+                onChange={(event) =>
+                  setLiveSettings((prev) => ({
+                    ...prev,
+                    baiduSyncEnabled: event.target.checked,
+                  }))
+                }
+              />
+              启用录播同步上传
+            </label>
+            <input
+              type="text"
+              value={liveSettings.baiduSyncPath}
+              onChange={(event) =>
+                setLiveSettings((prev) => ({
+                  ...prev,
+                  baiduSyncPath: event.target.value,
+                }))
+              }
+              className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+              placeholder="/录播/直播间"
+            />
           </div>
           <label className="flex items-center gap-2 text-sm text-[var(--muted)]">
             <input
@@ -536,6 +643,22 @@ export default function SettingsSection() {
             />
             改标题后自动分段
           </label>
+          <div>
+            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              标题分段最小时长（秒）
+            </div>
+            <input
+              type="number"
+              value={liveSettings.titleSplitMinSeconds}
+              onChange={(event) =>
+                setLiveSettings((prev) => ({
+                  ...prev,
+                  titleSplitMinSeconds: event.target.value,
+                }))
+              }
+              className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+            />
+          </div>
           <label className="flex items-center gap-2 text-sm text-[var(--muted)]">
             <input
               type="checkbox"
@@ -750,6 +873,7 @@ export default function SettingsSection() {
           </div>
         ) : null}
       </div>
+
     </div>
   );
 }

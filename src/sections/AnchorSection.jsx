@@ -8,6 +8,15 @@ export default function AnchorSection() {
   const [anchorAvatars, setAnchorAvatars] = useState({});
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
+  const [syncAnchor, setSyncAnchor] = useState(null);
+  const [syncPath, setSyncPath] = useState("");
+  const [syncLoading, setSyncLoading] = useState(false);
+  const [syncMessage, setSyncMessage] = useState("");
+  const [syncPickerOpen, setSyncPickerOpen] = useState(false);
+  const [syncBrowserPath, setSyncBrowserPath] = useState("/");
+  const [syncFolders, setSyncFolders] = useState([]);
+  const [syncBrowseLoading, setSyncBrowseLoading] = useState(false);
+  const [syncBrowseError, setSyncBrowseError] = useState("");
 
   const logClient = async (text) => {
     try {
@@ -136,6 +145,136 @@ export default function AnchorSection() {
     }
   };
 
+  const handleSyncToggle = async (anchor) => {
+    setMessage("");
+    if (!anchor.baiduSyncEnabled && !anchor.baiduSyncPath) {
+      setSyncAnchor(anchor);
+      setSyncPath("");
+      setSyncBrowserPath("/");
+      setSyncMessage("请先选择同步路径");
+      setSyncPickerOpen(true);
+      loadSyncFolders("/");
+      return;
+    }
+    try {
+      await invokeCommand("live_room_baidu_sync_toggle", {
+        roomId: anchor.uid,
+        enabled: !anchor.baiduSyncEnabled,
+      });
+      await loadAnchors();
+    } catch (error) {
+      setMessage(error.message || "同步设置失败");
+    }
+  };
+
+  const loadSyncFolders = async (path) => {
+    setSyncBrowseError("");
+    setSyncBrowseLoading(true);
+    try {
+      const data = await invokeCommand("baidu_sync_remote_dirs", {
+        request: { path },
+      });
+      setSyncFolders(Array.isArray(data) ? data : []);
+    } catch (error) {
+      setSyncBrowseError(error?.message || "读取目录失败");
+      setSyncFolders([]);
+    } finally {
+      setSyncBrowseLoading(false);
+    }
+  };
+
+  const handleOpenSyncConfig = (anchor) => {
+    const initialPath = anchor?.baiduSyncPath || "";
+    const normalizedPath = initialPath.trim() || "/";
+    setSyncAnchor(anchor);
+    setSyncPath(initialPath.trim());
+    setSyncBrowserPath(normalizedPath);
+    setSyncMessage("");
+  };
+
+  const handleCloseSyncConfig = () => {
+    if (syncLoading) {
+      return;
+    }
+    setSyncAnchor(null);
+    setSyncPath("");
+    setSyncMessage("");
+    setSyncFolders([]);
+    setSyncBrowseError("");
+    setSyncBrowserPath("/");
+    setSyncPickerOpen(false);
+  };
+
+  const handleSaveSyncConfig = async () => {
+    if (!syncAnchor) {
+      return;
+    }
+    setSyncLoading(true);
+    setSyncMessage("");
+    try {
+      await invokeCommand("live_room_baidu_sync_update", {
+        roomId: syncAnchor.uid,
+        baiduSyncPath: syncPath,
+      });
+      await loadAnchors();
+      setMessage("同步配置已保存");
+      setSyncAnchor(null);
+      setSyncPath("");
+      setSyncMessage("");
+      setSyncFolders([]);
+      setSyncBrowseError("");
+      setSyncBrowserPath("/");
+      setSyncPickerOpen(false);
+    } catch (error) {
+      setSyncMessage(error?.message || "保存失败");
+    } finally {
+      setSyncLoading(false);
+    }
+  };
+
+  const handleSyncSelectCurrent = () => {
+    setSyncPath(syncBrowserPath);
+  };
+
+  const handleOpenSyncPicker = () => {
+    if (!syncAnchor) {
+      return;
+    }
+    setSyncPickerOpen(true);
+    loadSyncFolders(syncBrowserPath);
+  };
+
+  const handleCloseSyncPicker = () => {
+    if (syncBrowseLoading) {
+      return;
+    }
+    setSyncPickerOpen(false);
+  };
+
+  const handleConfirmSyncPicker = () => {
+    setSyncPath(syncBrowserPath);
+    setSyncPickerOpen(false);
+  };
+
+  const handleSyncEnterFolder = (folder) => {
+    if (!folder?.path) {
+      return;
+    }
+    setSyncBrowserPath(folder.path);
+    loadSyncFolders(folder.path);
+  };
+
+  const handleSyncGoParent = () => {
+    if (syncBrowserPath === "/") {
+      return;
+    }
+    const trimmed = syncBrowserPath.replace(/\/+$/, "");
+    const index = trimmed.lastIndexOf("/");
+    const parent = index <= 0 ? "/" : trimmed.slice(0, index);
+    setSyncBrowserPath(parent);
+    loadSyncFolders(parent);
+  };
+
   const extractUidFromInput = (input) => {
     if (!input) {
       return "";
@@ -160,6 +299,7 @@ export default function AnchorSection() {
     }
     return "未直播";
   };
+
 
   return (
     <div className="space-y-6">
@@ -280,6 +420,16 @@ export default function AnchorSection() {
                 >
                   {anchor.autoRecord ? "关闭" : "开启"}
                 </button>
+                <span>同步上传：{anchor.baiduSyncEnabled ? "已开启" : "未开启"}</span>
+                <button
+                  className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                  onClick={() => handleSyncToggle(anchor)}
+                >
+                  {anchor.baiduSyncEnabled ? "关闭" : "开启"}
+                </button>
+                {anchor.baiduSyncEnabled && anchor.baiduSyncPath ? (
+                  <span>同步路径：{anchor.baiduSyncPath}</span>
+                ) : null}
                 <span>上次检查：{formatDateTime(anchor.lastCheckTime)}</span>
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
@@ -304,6 +454,14 @@ export default function AnchorSection() {
                 >
                   取消订阅
                 </button>
+                {anchor.baiduSyncEnabled ? (
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)]"
+                    onClick={() => handleOpenSyncConfig(anchor)}
+                  >
+                    同步配置
+                  </button>
+                ) : null}
               </div>
               {anchor.recordingFile ? (
                 <div className="mt-2 text-xs text-[var(--muted)]">
@@ -322,6 +480,103 @@ export default function AnchorSection() {
           <div className="mt-4 text-sm text-[var(--muted)]">暂无订阅记录。</div>
         ) : null}
       </div>
+      {syncAnchor ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="w-[420px] rounded-2xl bg-[var(--block-color)] p-5 text-sm text-[var(--content-color)] shadow-xl">
+            <div className="text-base font-semibold">同步配置</div>
+            <div className="mt-2 text-xs text-[var(--desc-color)]">
+              主播：{syncAnchor.nickname || syncAnchor.uid}
+            </div>
+            <div className="mt-3 text-xs text-[var(--desc-color)]">
+              录播分段上传到百度网盘的目录路径
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+              <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-[var(--ink)]">
+                {syncPath || "未配置"}
+              </div>
+              <button
+                className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
+                onClick={handleOpenSyncPicker}
+              >
+                选择目录
+              </button>
+            </div>
+            {syncMessage ? (
+              <div className="mt-3 text-xs text-amber-600">{syncMessage}</div>
+            ) : null}
+            <div className="mt-4 flex justify-end gap-2">
+              <button className="h-9 rounded-lg px-4" onClick={handleCloseSyncConfig}>
+                取消
+              </button>
+              <button
+                className="h-9 rounded-lg px-4"
+                onClick={handleSaveSyncConfig}
+                disabled={syncLoading}
+              >
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {syncPickerOpen ? (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50">
+          <div className="w-[520px] rounded-2xl bg-[var(--block-color)] p-5 text-sm text-[var(--content-color)] shadow-xl">
+            <div className="text-base font-semibold">选择百度网盘目录</div>
+            <div className="mt-2 flex items-center gap-2">
+              <div className="flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-xs text-[var(--ink)]">
+                {syncBrowserPath}
+              </div>
+              <button
+                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                onClick={handleSyncGoParent}
+                disabled={syncBrowserPath === "/"}
+              >
+                上级
+              </button>
+              <button
+                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                onClick={() => loadSyncFolders(syncBrowserPath)}
+                disabled={syncBrowseLoading}
+              >
+                刷新
+              </button>
+            </div>
+            <div className="mt-3 max-h-64 overflow-auto rounded-xl border border-black/10 bg-white/80 p-2 text-xs text-[var(--ink)]">
+              {syncBrowseLoading ? (
+                <div className="py-6 text-center text-[var(--desc-color)]">加载中...</div>
+              ) : syncBrowseError ? (
+                <div className="py-6 text-center text-amber-600">{syncBrowseError}</div>
+              ) : syncFolders.length === 0 ? (
+                <div className="py-6 text-center text-[var(--desc-color)]">暂无目录</div>
+              ) : (
+                syncFolders.map((folder) => (
+                  <button
+                    key={folder.path}
+                    className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left hover:bg-black/5"
+                    onClick={() => handleSyncEnterFolder(folder)}
+                  >
+                    <span className="text-[10px] font-semibold text-[var(--muted)]">DIR</span>
+                    <span className="text-sm">{folder.name}</span>
+                  </button>
+                ))
+              )}
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button className="h-9 rounded-lg px-4" onClick={handleCloseSyncPicker}>
+                取消
+              </button>
+              <button
+                className="h-9 rounded-lg px-4"
+                onClick={handleConfirmSyncPicker}
+                disabled={syncBrowseLoading}
+              >
+                选择当前目录
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

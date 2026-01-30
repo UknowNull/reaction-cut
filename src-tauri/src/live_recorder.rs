@@ -2,29 +2,34 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{
   atomic::{AtomicBool, Ordering},
-  Arc, Mutex,
+  mpsc, Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use reqwest::blocking::Client;
-use reqwest::header::{HeaderValue, REFERER, USER_AGENT};
+use reqwest::header::{
+  HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, REFERER, USER_AGENT,
+};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
+use url::Url;
 
 use crate::bilibili::client::BilibiliClient;
 use crate::commands::settings::{
   load_download_settings_from_db, load_live_settings_from_db, LiveSettings,
 };
-use crate::config::default_download_dir;
+use crate::config::{default_download_dir, resolve_ffmpeg_path};
 use crate::db::Db;
 use crate::ffmpeg::run_ffmpeg;
 use crate::login_store::{AuthInfo, LoginStore};
+use crate::baidu_sync;
 use crate::utils::{append_log, now_rfc3339, sanitize_filename};
 
 pub struct LiveRuntime {
@@ -34,6 +39,7 @@ pub struct LiveRuntime {
 pub struct LiveRecordHandle {
   pub stop_flag: Arc<AtomicBool>,
   pub split_flag: Arc<AtomicBool>,
+  pub title_split_flag: Arc<AtomicBool>,
   pub last_title: Arc<Mutex<String>>,
   pub current_file: Arc<Mutex<String>>,
   pub start_time: String,
@@ -64,6 +70,11 @@ pub struct LiveRoomInfo {
   pub area_name: Option<String>,
   pub parent_area_name: Option<String>,
 }
+
+const INVALID_STREAM_TAG_LIMIT: usize = 300;
+const INVALID_STREAM_STALL_SECS: u64 = 10;
+const STREAM_URL_REFRESH_LEAD_SECS: u64 = 30;
+const MISSING_SEGMENT_WINDOW_SECS: u64 = 60;
 
 pub fn new_live_runtime() -> LiveRuntime {
   LiveRuntime {
@@ -137,7 +148,7 @@ pub fn start_auto_record_loop(context: LiveContext) {
                     let mut last_title = handle.last_title.lock().unwrap_or_else(|e| e.into_inner());
                     if *last_title != info.title {
                       *last_title = info.title.clone();
-                      handle.split_flag.store(true, Ordering::SeqCst);
+                      handle.title_split_flag.store(true, Ordering::SeqCst);
                     }
                   }
                 }
@@ -171,11 +182,13 @@ pub fn start_recording(
   let nickname = load_anchor_nickname(&context.db, room_id).ok().flatten();
   let stop_flag = Arc::new(AtomicBool::new(false));
   let split_flag = Arc::new(AtomicBool::new(false));
+  let title_split_flag = Arc::new(AtomicBool::new(false));
   let current_title = room_info.title.clone();
   let start_time = Utc::now();
   let handle = LiveRecordHandle {
     stop_flag: Arc::clone(&stop_flag),
     split_flag: Arc::clone(&split_flag),
+    title_split_flag: Arc::clone(&title_split_flag),
     last_title: Arc::new(Mutex::new(current_title)),
     current_file: Arc::new(Mutex::new(String::new())),
     start_time: start_time.to_rfc3339(),
@@ -189,9 +202,80 @@ pub fn start_recording(
   let runtime = Arc::clone(&context.live_runtime);
   let room_id_owned = room_id.to_string();
   tauri::async_runtime::spawn_blocking(move || {
-    let result = run_record_loop(context.clone(), room_id_owned.clone(), room_info, nickname, settings);
-    if let Err(err) = result {
-      append_log(&context.app_log_path, &format!("record_loop_error room={} err={}", room_id_owned, err));
+    let mut retry_count = 0;
+    let mut current_room_info = room_info;
+    loop {
+      let started_at = Instant::now();
+      let result = run_record_loop(
+        context.clone(),
+        room_id_owned.clone(),
+        current_room_info.clone(),
+        nickname.clone(),
+        settings.clone(),
+      );
+      if let Err(err) = result {
+        append_log(
+          &context.app_log_path,
+          &format!("record_loop_error room={} err={}", room_id_owned, err),
+        );
+      } else {
+        break;
+      }
+
+      if stop_flag.load(Ordering::SeqCst) {
+        break;
+      }
+
+      if started_at.elapsed().as_secs() < 60 {
+        append_log(
+          &context.app_log_path,
+          &format!("record_retry_skip room={} reason=short_session", room_id_owned),
+        );
+        break;
+      }
+
+      if retry_count >= 10 {
+        append_log(
+          &context.app_log_path,
+          &format!("record_retry_skip room={} reason=retry_limit", room_id_owned),
+        );
+        break;
+      }
+
+      let next_info = tauri::async_runtime::block_on(fetch_room_info(
+        &context.bilibili,
+        &room_id_owned,
+      ));
+      let next_info = match next_info {
+        Ok(info) if info.live_status == 1 => info,
+        Ok(_) => {
+          append_log(
+            &context.app_log_path,
+            &format!("record_retry_skip room={} reason=not_living", room_id_owned),
+          );
+          break;
+        }
+        Err(err) => {
+          append_log(
+            &context.app_log_path,
+            &format!("record_retry_skip room={} reason=live_info_err err={}", room_id_owned, err),
+          );
+          break;
+        }
+      };
+
+      retry_count += 1;
+      append_log(
+        &context.app_log_path,
+        &format!("record_retry_start room={} retry={}", room_id_owned, retry_count),
+      );
+      if let Ok(mut map) = runtime.records.lock() {
+        if let Some(handle) = map.get_mut(&room_id_owned) {
+          let mut last_title = handle.last_title.lock().unwrap_or_else(|e| e.into_inner());
+          *last_title = next_info.title.clone();
+        }
+      }
+      current_room_info = next_info;
     }
     if let Ok(mut map) = runtime.records.lock() {
       map.remove(&room_id_owned);
@@ -243,6 +327,12 @@ fn run_record_loop(
       .map(|handle| Arc::clone(&handle.split_flag))
       .ok_or_else(|| "Record handle missing".to_string())?
   };
+  let title_split_flag = {
+    let map = context.live_runtime.records.lock().map_err(|_| "Lock error")?;
+    map.get(&room_id)
+      .map(|handle| Arc::clone(&handle.title_split_flag))
+      .ok_or_else(|| "Record handle missing".to_string())?
+  };
 
   let mut segment_index = 1;
   let mut current_title = room_info.title.clone();
@@ -256,6 +346,12 @@ fn run_record_loop(
     segment_index,
   );
   update_current_file(&context, &room_id, &current_file_path);
+  let mut segment: Option<SegmentWriter> = None;
+  let mut segment_start = Instant::now();
+  let mut pending_split = false;
+  let mut pending_title: Option<String> = None;
+  let mut missing_started_at: Option<Instant> = None;
+  let title_split_min = settings.title_split_min_seconds.max(0) as u64;
 
   if settings.save_cover {
     if let Some(cover) = room_info.cover.as_ref() {
@@ -284,55 +380,156 @@ fn run_record_loop(
   }
 
   let client = Client::builder()
-    .timeout(Duration::from_millis(settings.stream_connect_timeout_ms.max(1000) as u64))
+    .connect_timeout(Duration::from_millis(
+      settings.stream_connect_timeout_ms.max(1000) as u64,
+    ))
     .build()
     .map_err(|err| format!("Failed to build client: {}", err))?;
   let auth = context.login_store.load_auth_info(&context.db).ok().flatten();
+  let mut stream_urls: Vec<String> = Vec::new();
+  let mut stream_url_index: usize = 0;
+  let mut force_no_qn_until: Option<i64> = None;
 
   loop {
     if stop_flag.load(Ordering::SeqCst) {
+      if let Some(mut seg) = segment.take() {
+        let record_id = seg.record_id;
+        let file_path = seg.file_path.clone();
+        seg.finish("STOPPED", None)?;
+        drop(seg);
+        spawn_segment_remux(context.clone(), record_id, file_path);
+      }
       break;
     }
 
-    let stream_url = match fetch_stream_url(
-      &context.bilibili,
-      &room_info.room_id,
-      &settings,
-      auth.as_ref(),
-      true,
-    ) {
-      Ok(url) => url,
-      Err(err) => {
-        append_log(&context.app_log_path, &format!("fetch_stream_url_error room={} err={}", room_id, err));
-        if settings.stream_retry_no_qn_sec > 0 {
-          std::thread::sleep(Duration::from_secs(settings.stream_retry_no_qn_sec.max(1) as u64));
-          match fetch_stream_url(
-            &context.bilibili,
-            &room_info.room_id,
-            &settings,
-            auth.as_ref(),
-            false,
-          ) {
-            Ok(url) => url,
-            Err(err) => {
-              append_log(&context.app_log_path, &format!("fetch_stream_url_fallback_error room={} err={}", room_id, err));
-              std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
-              continue;
-            }
-          }
-        } else {
-          std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
-          continue;
+    if stream_urls.is_empty() {
+      let now = Utc::now().timestamp();
+      let use_quality = match force_no_qn_until {
+        Some(until) if now < until => false,
+        _ => {
+          force_no_qn_until = None;
+          true
         }
+      };
+      if !use_quality {
+        append_log(
+          &context.app_log_path,
+          &format!("stream_fetch_no_qn room={} reason=forced", room_id),
+        );
+      }
+      stream_urls = match fetch_stream_urls(
+        &context.bilibili,
+        &room_info.room_id,
+        &settings,
+        auth.as_ref(),
+        use_quality,
+      ) {
+        Ok(urls) => urls,
+        Err(err) => {
+          append_log(&context.app_log_path, &format!("fetch_stream_url_error room={} err={}", room_id, err));
+          if settings.stream_retry_no_qn_sec > 0 {
+            std::thread::sleep(Duration::from_secs(settings.stream_retry_no_qn_sec.max(1) as u64));
+            match fetch_stream_urls(
+              &context.bilibili,
+              &room_info.room_id,
+              &settings,
+              auth.as_ref(),
+              false,
+            ) {
+              Ok(urls) => urls,
+              Err(err) => {
+                append_log(&context.app_log_path, &format!("fetch_stream_url_fallback_error room={} err={}", room_id, err));
+                std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
+                continue;
+              }
+            }
+          } else {
+            std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
+            continue;
+          }
+        }
+      };
+      stream_url_index = 0;
+    }
+
+    let stream_url = match stream_urls.get(stream_url_index) {
+      Some(url) => url.clone(),
+      None => {
+        stream_urls.clear();
+        continue;
       }
     };
+    if !stream_urls.is_empty() {
+      stream_url_index = (stream_url_index + 1) % stream_urls.len();
+    }
 
+    if let Some((expire, now)) = should_refresh_stream_url(&stream_url, STREAM_URL_REFRESH_LEAD_SECS) {
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "stream_url_expired room={} expire={} now={}",
+          room_id, expire, now
+        ),
+      );
+      stream_urls.clear();
+      std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
+      continue;
+    }
+
+    if is_hls_url(&stream_url) {
+      let hls_file_path = normalize_hls_path(&current_file_path);
+      update_current_file(&context, &room_id, &hls_file_path);
+      append_log(
+        &context.app_log_path,
+        &format!("stream_hls_detected room={} path={}", room_id, hls_file_path),
+      );
+      if let Err(err) = record_hls_stream(
+        &context,
+        &room_id,
+        &room_info,
+        nickname.as_deref(),
+        &current_title,
+        &hls_file_path,
+        segment_index,
+        &settings,
+        &stop_flag,
+        &stream_url,
+      ) {
+        append_log(
+          &context.app_log_path,
+          &format!("stream_hls_error room={} err={}", room_id, err),
+        );
+      }
+      if stop_flag.load(Ordering::SeqCst) {
+        return Ok(());
+      }
+      stream_urls.clear();
+      segment_index += 1;
+      current_title = load_current_title(&context, &room_id, &current_title);
+      current_file_path = build_record_path(
+        &settings.file_name_template,
+        &base_dir,
+        &room_info,
+        nickname.as_deref(),
+        &record_start_date,
+        segment_index,
+      );
+      update_current_file(&context, &room_id, &current_file_path);
+      std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
+      continue;
+    }
+
+    append_log(
+      &context.app_log_path,
+      &format!("stream_url_info room={} {}", room_id, summarize_stream_url(&stream_url)),
+    );
     let referer_value = format!("https://live.bilibili.com/{}", room_info.room_id);
     let mut request = client.get(&stream_url);
     request = request.header(
       USER_AGENT,
       HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
     );
+    request = request.header(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     if let Ok(value) = HeaderValue::from_str(&referer_value) {
       request = request.header(REFERER, value);
     }
@@ -346,20 +543,85 @@ fn run_record_loop(
       Ok(resp) => resp,
       Err(err) => {
         append_log(&context.app_log_path, &format!("stream_connect_error room={} err={}", room_id, err));
+        stream_urls.clear();
         std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
         continue;
       }
     };
 
     if !response.status().is_success() {
+      let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+      let content_encoding = response
+        .headers()
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+      let content_length = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
       append_log(
         &context.app_log_path,
         &format!(
-          "stream_response_error room={} status={}",
+          "stream_response_error room={} status={} content_type={} content_encoding={} content_length={}",
           room_id,
-          response.status().as_u16()
+          response.status().as_u16(),
+          content_type,
+          content_encoding,
+          content_length
         ),
       );
+      mark_force_no_qn(
+        &mut force_no_qn_until,
+        &settings,
+        context.app_log_path.as_ref(),
+        room_id.as_str(),
+        "response_status",
+      );
+      stream_urls.clear();
+      std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
+      continue;
+    }
+
+    let content_type = response
+      .headers()
+      .get(CONTENT_TYPE)
+      .and_then(|value| value.to_str().ok())
+      .unwrap_or("-");
+    let content_encoding = response
+      .headers()
+      .get(CONTENT_ENCODING)
+      .and_then(|value| value.to_str().ok())
+      .unwrap_or("-");
+    let normalized_type = content_type.to_ascii_lowercase();
+    let normalized_encoding = content_encoding.to_ascii_lowercase();
+    let has_unexpected_type = normalized_type.starts_with("text/")
+      || normalized_type.contains("json")
+      || normalized_type.contains("html");
+    let has_unexpected_encoding = normalized_encoding != "-"
+      && normalized_encoding != "identity"
+      && !normalized_encoding.is_empty();
+    if has_unexpected_type || has_unexpected_encoding {
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "stream_response_unexpected room={} content_type={} content_encoding={}",
+          room_id, content_type, content_encoding
+        ),
+      );
+      mark_force_no_qn(
+        &mut force_no_qn_until,
+        &settings,
+        context.app_log_path.as_ref(),
+        room_id.as_str(),
+        "response_unexpected",
+      );
+      stream_urls.clear();
       std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
       continue;
     }
@@ -367,8 +629,9 @@ fn run_record_loop(
     let mut buf = vec![0u8; 8192];
     let mut parser = FlvStreamParser::new();
     let mut cache = FlvHeaderCache::new();
-    let mut segment: Option<SegmentWriter> = None;
-    let mut segment_start = Instant::now();
+    let mut last_tag_timestamp: Option<u32> = None;
+    let mut stagnant_count: usize = 0;
+    let mut last_progress_at = Instant::now();
 
     loop {
       if stop_flag.load(Ordering::SeqCst) {
@@ -384,7 +647,11 @@ fn run_record_loop(
 
       match response.read(&mut buf) {
         Ok(0) => {
-          if settings.flv_fix_split_on_missing && !settings.flv_fix_disable_on_annexb {
+          let missing_since = missing_started_at.get_or_insert_with(Instant::now);
+          let missing_elapsed = missing_since.elapsed().as_secs();
+          let should_split = settings.flv_fix_split_on_missing && !settings.flv_fix_disable_on_annexb;
+          let force_split = should_split || missing_elapsed >= MISSING_SEGMENT_WINDOW_SECS;
+          if force_split {
             if let Some(mut seg) = segment.take() {
               let record_id = seg.record_id;
               let file_path = seg.file_path.clone();
@@ -393,6 +660,9 @@ fn run_record_loop(
               spawn_segment_remux(context.clone(), record_id, file_path);
             }
             segment_index += 1;
+            pending_title = None;
+            pending_split = false;
+            missing_started_at = None;
             current_title = load_current_title(&context, &room_id, &current_title);
             current_file_path = build_record_path(
               &settings.file_name_template,
@@ -403,27 +673,21 @@ fn run_record_loop(
               segment_index,
             );
             update_current_file(&context, &room_id, &current_file_path);
-            break;
-          } else {
-            if let Some(mut seg) = segment.take() {
-              seg.finish("FAILED", Some("网络中断"))?;
-            }
-            segment_index += 1;
-            current_title = load_current_title(&context, &room_id, &current_title);
-            current_file_path = build_record_path(
-              &settings.file_name_template,
-              &base_dir,
-              &room_info,
-              nickname.as_deref(),
-              &record_start_date,
-              segment_index,
-            );
-            update_current_file(&context, &room_id, &current_file_path);
-            std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
             break;
           }
+          append_log(
+            &context.app_log_path,
+            &format!(
+              "stream_read_end_keep_segment room={} elapsed={} window={}",
+              room_id, missing_elapsed, MISSING_SEGMENT_WINDOW_SECS
+            ),
+          );
+          stream_urls.clear();
+          std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
+          break;
         }
         Ok(n) => {
+          missing_started_at = None;
           let items = match parser.push(&buf[..n]) {
             Ok(items) => items,
             Err(err) => {
@@ -431,11 +695,20 @@ fn run_record_loop(
                 &context.app_log_path,
                 &format!("stream_invalid_header room={} err={}", room_id, err),
               );
+              mark_force_no_qn(
+                &mut force_no_qn_until,
+                &settings,
+                context.app_log_path.as_ref(),
+                room_id.as_str(),
+                "invalid_header",
+              );
+              stream_urls.clear();
               std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
               break;
             }
           };
 
+          let mut invalid_stream = false;
           for item in items {
             match item {
               FlvParsedItem::Header(header) => {
@@ -458,9 +731,45 @@ fn run_record_loop(
               }
               FlvParsedItem::Tag(tag) => {
                 cache.update_from_tag(&tag);
-                if split_flag.load(Ordering::SeqCst) {
+                let request_split = split_flag.swap(false, Ordering::SeqCst);
+                let title_split_requested = title_split_flag.swap(false, Ordering::SeqCst);
+                if title_split_requested {
+                  let latest_title = load_current_title(&context, &room_id, &current_title);
+                  if latest_title != current_title {
+                    if title_split_min > 0 && segment_start.elapsed().as_secs() < title_split_min {
+                      pending_title = Some(latest_title);
+                      append_log(
+                        &context.app_log_path,
+                        &format!(
+                          "stream_split_defer room={} reason=title_min elapsed={} min={}",
+                          room_id,
+                          segment_start.elapsed().as_secs(),
+                          title_split_min
+                        ),
+                      );
+                    } else {
+                      pending_title = Some(latest_title);
+                      pending_split = true;
+                    }
+                  }
+                }
+                if request_split {
+                  if pending_title.is_none() && settings.cutting_by_title {
+                    let latest_title = load_current_title(&context, &room_id, &current_title);
+                    if latest_title != current_title {
+                      pending_title = Some(latest_title);
+                    }
+                  }
+                  pending_split = true;
+                }
+                if pending_title.is_some() && title_split_min > 0 {
+                  if segment_start.elapsed().as_secs() >= title_split_min {
+                    pending_split = true;
+                  }
+                }
+
+                if pending_split && is_video_keyframe(&tag) {
                   if cache.has_header() {
-                    split_flag.store(false, Ordering::SeqCst);
                     if let Some(mut seg) = segment.take() {
                       let record_id = seg.record_id;
                       let file_path = seg.file_path.clone();
@@ -469,7 +778,9 @@ fn run_record_loop(
                       spawn_segment_remux(context.clone(), record_id, file_path);
                     }
                     segment_index += 1;
-                    current_title = load_current_title(&context, &room_id, &current_title);
+                    current_title = pending_title
+                      .take()
+                      .unwrap_or_else(|| load_current_title(&context, &room_id, &current_title));
                     current_file_path = build_record_path(
                       &settings.file_name_template,
                       &base_dir,
@@ -492,6 +803,7 @@ fn run_record_loop(
                     cache.write_preamble(&mut new_segment)?;
                     segment_start = Instant::now();
                     segment = Some(new_segment);
+                    pending_split = false;
                   } else {
                     append_log(
                       &context.app_log_path,
@@ -513,14 +825,64 @@ fn run_record_loop(
                       split_flag.store(true, Ordering::SeqCst);
                     }
                   }
+                  let timestamp = parse_flv_timestamp(&tag);
+                  if let Some(prev) = last_tag_timestamp {
+                    if timestamp > prev {
+                      last_tag_timestamp = Some(timestamp);
+                      stagnant_count = 0;
+                      last_progress_at = Instant::now();
+                    } else {
+                      stagnant_count += 1;
+                    }
+                  } else {
+                    last_tag_timestamp = Some(timestamp);
+                    stagnant_count = 0;
+                    last_progress_at = Instant::now();
+                  }
+                  if stagnant_count >= INVALID_STREAM_TAG_LIMIT
+                    && last_progress_at.elapsed().as_secs() >= INVALID_STREAM_STALL_SECS
+                  {
+                    append_log(
+                      &context.app_log_path,
+                      &format!(
+                        "stream_invalid_flow room={} timestamp={} stagnant={}",
+                        room_id, timestamp, stagnant_count
+                      ),
+                    );
+                    mark_force_no_qn(
+                      &mut force_no_qn_until,
+                      &settings,
+                      context.app_log_path.as_ref(),
+                      room_id.as_str(),
+                      "invalid_flow",
+                    );
+                    invalid_stream = true;
+                    break;
+                  }
                 }
               }
             }
           }
+          if invalid_stream {
+            stream_urls.clear();
+            std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
+            break;
+          }
         }
         Err(err) => {
           append_log(&context.app_log_path, &format!("stream_read_error room={} err={}", room_id, err));
-          if settings.flv_fix_split_on_missing && !settings.flv_fix_disable_on_annexb {
+          mark_force_no_qn(
+            &mut force_no_qn_until,
+            &settings,
+            context.app_log_path.as_ref(),
+            room_id.as_str(),
+            "read_error",
+          );
+          let missing_since = missing_started_at.get_or_insert_with(Instant::now);
+          let missing_elapsed = missing_since.elapsed().as_secs();
+          let should_split = settings.flv_fix_split_on_missing && !settings.flv_fix_disable_on_annexb;
+          let force_split = should_split || missing_elapsed >= MISSING_SEGMENT_WINDOW_SECS;
+          if force_split {
             if let Some(mut seg) = segment.take() {
               let record_id = seg.record_id;
               let file_path = seg.file_path.clone();
@@ -529,6 +891,9 @@ fn run_record_loop(
               spawn_segment_remux(context.clone(), record_id, file_path);
             }
             segment_index += 1;
+            pending_title = None;
+            pending_split = false;
+            missing_started_at = None;
             current_title = load_current_title(&context, &room_id, &current_title);
             current_file_path = build_record_path(
               &settings.file_name_template,
@@ -539,25 +904,18 @@ fn run_record_loop(
               segment_index,
             );
             update_current_file(&context, &room_id, &current_file_path);
-            break;
-          } else {
-            if let Some(mut seg) = segment.take() {
-              seg.finish("FAILED", Some("读取异常"))?;
-            }
-            segment_index += 1;
-            current_title = load_current_title(&context, &room_id, &current_title);
-            current_file_path = build_record_path(
-              &settings.file_name_template,
-              &base_dir,
-              &room_info,
-              nickname.as_deref(),
-              &record_start_date,
-              segment_index,
-            );
-            update_current_file(&context, &room_id, &current_file_path);
-            std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
             break;
           }
+          append_log(
+            &context.app_log_path,
+            &format!(
+              "stream_read_error_keep_segment room={} elapsed={} window={}",
+              room_id, missing_elapsed, MISSING_SEGMENT_WINDOW_SECS
+            ),
+          );
+          stream_urls.clear();
+          std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
+          break;
         }
       }
     }
@@ -577,6 +935,18 @@ impl FlvTag {
   fn data(&self) -> &[u8] {
     &self.bytes[self.data_offset..self.data_offset + self.data_len]
   }
+}
+
+fn is_video_keyframe(tag: &FlvTag) -> bool {
+  if tag.tag_type != 9 {
+    return false;
+  }
+  let data = tag.data();
+  if data.is_empty() {
+    return false;
+  }
+  let frame_type = data[0] >> 4;
+  frame_type == 1
 }
 
 enum FlvParsedItem {
@@ -721,6 +1091,17 @@ fn read_u24_be(slice: &[u8]) -> usize {
   ((slice[0] as usize) << 16) | ((slice[1] as usize) << 8) | slice[2] as usize
 }
 
+fn parse_flv_timestamp(tag: &FlvTag) -> u32 {
+  if tag.bytes.len() < 8 {
+    return 0;
+  }
+  let ts = ((tag.bytes[7] as u32) << 24)
+    | ((tag.bytes[4] as u32) << 16)
+    | ((tag.bytes[5] as u32) << 8)
+    | (tag.bytes[6] as u32);
+  ts
+}
+
 fn normalize_header_tag(tag: &[u8]) -> Vec<u8> {
   let mut normalized = tag.to_vec();
   if normalized.len() >= 11 {
@@ -759,6 +1140,7 @@ fn is_video_header(data: &[u8], has_header: bool) -> bool {
 
 struct SegmentWriter {
   db: Arc<Db>,
+  log_path: Arc<PathBuf>,
   record_id: i64,
   file_path: String,
   file: File,
@@ -785,7 +1167,15 @@ impl SegmentWriter {
       error,
     )?;
     if let Some(path) = self.metadata_path.as_ref() {
-      update_metadata_file(path, &end_time, self.bytes_written)?;
+      if let Err(err) = update_metadata_file(path, &end_time, self.bytes_written) {
+        append_log(
+          self.log_path.as_ref(),
+          &format!(
+            "record_metadata_update_failed record_id={} err={}",
+            self.record_id, err
+          ),
+        );
+      }
     }
     Ok(())
   }
@@ -820,6 +1210,7 @@ fn open_segment(
   };
   Ok(SegmentWriter {
     db: Arc::clone(&context.db),
+    log_path: Arc::clone(&context.app_log_path),
     record_id,
     file_path: file_path.to_string(),
     file,
@@ -878,6 +1269,12 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
           log_path.as_ref(),
           &format!("live_remux_done record_id={} status=ok", record_id),
         );
+        if let Err(err) = baidu_sync::enqueue_live_sync(&db, log_path.as_ref(), record_id) {
+          append_log(
+            log_path.as_ref(),
+            &format!("baidu_sync_enqueue_fail record_id={} err={}", record_id, err),
+          );
+        }
       }
       Ok(Err(err)) => {
         append_log(
@@ -1134,6 +1531,11 @@ fn update_metadata_file(path: &str, end_time: &str, file_size: u64) -> Result<()
   let obj = value.as_object_mut().ok_or_else(|| "metadata 结构异常".to_string())?;
   obj.insert("endTime".to_string(), Value::String(end_time.to_string()));
   obj.insert("fileSize".to_string(), Value::Number(file_size.into()));
+  if let Some(parent) = Path::new(path).parent() {
+    if !parent.as_os_str().is_empty() {
+      std::fs::create_dir_all(parent).map_err(|err| format!("创建 metadata 目录失败: {}", err))?;
+    }
+  }
   std::fs::write(path, value.to_string()).map_err(|err| format!("更新 metadata 失败: {}", err))?;
   Ok(())
 }
@@ -1165,13 +1567,13 @@ fn download_cover(target_file: &str, cover_url: &str) -> Result<(), String> {
   Ok(())
 }
 
-fn fetch_stream_url(
+fn fetch_stream_urls(
   client: &BilibiliClient,
   room_id: &str,
   settings: &LiveSettings,
   auth: Option<&AuthInfo>,
   with_quality: bool,
-) -> Result<String, String> {
+) -> Result<Vec<String>, String> {
   let mut params = vec![
     ("cid".to_string(), room_id.to_string()),
     ("platform".to_string(), "web".to_string()),
@@ -1188,9 +1590,274 @@ fn fetch_stream_url(
     false,
   ))?;
 
-  let durl = data.get("durl").and_then(|value| value.as_array()).ok_or("缺少直播流地址")?;
-  let first = durl.get(0).and_then(|value| value.get("url")).and_then(|value| value.as_str());
-  first.map(|value| value.to_string()).ok_or("直播流地址为空".to_string())
+  let durl = data
+    .get("durl")
+    .and_then(|value| value.as_array())
+    .ok_or("缺少直播流地址")?;
+  let mut urls = Vec::new();
+  for item in durl {
+    if let Some(url) = item.get("url").and_then(|value| value.as_str()) {
+      if !urls.contains(&url.to_string()) {
+        urls.push(url.to_string());
+      }
+    }
+  }
+  if urls.is_empty() {
+    return Err("直播流地址为空".to_string());
+  }
+  Ok(urls)
+}
+
+fn is_hls_url(url: &str) -> bool {
+  url.contains(".m3u8")
+}
+
+fn normalize_hls_path(path: &str) -> String {
+  let mut target = PathBuf::from(path);
+  let ext = target
+    .extension()
+    .and_then(|value| value.to_str())
+    .unwrap_or("")
+    .to_ascii_lowercase();
+  if ext == "ts" || ext == "m4s" || ext == "mp4" {
+    return target.to_string_lossy().to_string();
+  }
+  target.set_extension("ts");
+  target.to_string_lossy().to_string()
+}
+
+fn record_hls_stream(
+  context: &LiveContext,
+  room_id: &str,
+  room_info: &LiveRoomInfo,
+  nickname: Option<&str>,
+  title: &str,
+  file_path: &str,
+  segment_index: i64,
+  settings: &LiveSettings,
+  stop_flag: &Arc<AtomicBool>,
+  stream_url: &str,
+) -> Result<(), String> {
+  if let Some(parent) = Path::new(file_path).parent() {
+    std::fs::create_dir_all(parent).map_err(|err| format!("创建目录失败: {}", err))?;
+  }
+
+  let record_id = insert_record_task(&context.db, room_id, file_path, segment_index, title)?;
+  let metadata_path = if settings.write_metadata {
+    Some(write_metadata_file(file_path, room_info, nickname, title)?)
+  } else {
+    None
+  };
+
+  let referer_value = format!("Referer:https://live.bilibili.com/{}\r\n", room_info.room_id);
+  let args = vec![
+    "-hide_banner".to_string(),
+    "-loglevel".to_string(),
+    "error".to_string(),
+    "-rw_timeout".to_string(),
+    "10000000".to_string(),
+    "-timeout".to_string(),
+    "10000000".to_string(),
+    "-reconnect".to_string(),
+    "1".to_string(),
+    "-reconnect_streamed".to_string(),
+    "1".to_string(),
+    "-reconnect_delay_max".to_string(),
+    "3".to_string(),
+    "-user_agent".to_string(),
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36".to_string(),
+    "-headers".to_string(),
+    referer_value,
+    "-i".to_string(),
+    stream_url.to_string(),
+    "-c".to_string(),
+    "copy".to_string(),
+    "-f".to_string(),
+    "mpegts".to_string(),
+    file_path.to_string(),
+  ];
+
+  let mut child = Command::new(resolve_ffmpeg_path())
+    .args(&args)
+    .stdin(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|err| format!("启动FFmpeg失败: {}", err))?;
+
+  let stderr = child.stderr.take();
+  let (stderr_tx, stderr_rx) = mpsc::channel();
+  std::thread::spawn(move || {
+    if let Some(mut stderr) = stderr {
+      let mut buffer = String::new();
+      let _ = stderr.read_to_string(&mut buffer);
+      let _ = stderr_tx.send(buffer);
+    }
+  });
+
+  let mut stdin = child.stdin.take();
+  let mut exit_status = None;
+  loop {
+    if stop_flag.load(Ordering::SeqCst) {
+      if let Some(mut input) = stdin.take() {
+        let _ = input.write_all(b"q");
+      }
+    }
+
+    match child.try_wait() {
+      Ok(Some(status)) => {
+        exit_status = Some(status);
+        break;
+      }
+      Ok(None) => {}
+      Err(err) => {
+        return Err(format!("FFmpeg运行失败: {}", err));
+      }
+    }
+
+    std::thread::sleep(Duration::from_millis(500));
+  }
+
+  let status = match exit_status {
+    Some(status) => status,
+    None => child
+      .wait()
+      .map_err(|err| format!("等待FFmpeg退出失败: {}", err))?,
+  };
+  let stderr_output = stderr_rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+
+  let file_size = std::fs::metadata(file_path)
+    .map(|meta| meta.len())
+    .unwrap_or(0);
+  let end_time = now_rfc3339();
+  let mut record_status = if stop_flag.load(Ordering::SeqCst) {
+    "STOPPED"
+  } else if status.success() {
+    "COMPLETED"
+  } else {
+    "FAILED"
+  };
+  let mut error_message = stderr_output.trim().to_string();
+  if !stop_flag.load(Ordering::SeqCst) && !status.success() {
+    if let Ok(info) = tauri::async_runtime::block_on(fetch_room_info(&context.bilibili, room_id)) {
+      if info.live_status != 1 {
+        record_status = "COMPLETED";
+      }
+    }
+  }
+  if record_status != "FAILED" {
+    error_message.clear();
+  }
+
+  update_record_task(
+    &context.db,
+    record_id,
+    record_status,
+    Some(end_time.clone()),
+    file_size,
+    if error_message.is_empty() { None } else { Some(error_message.as_str()) },
+  )?;
+  if let Some(path) = metadata_path.as_ref() {
+    if let Err(err) = update_metadata_file(path, &end_time, file_size) {
+      append_log(
+        context.app_log_path.as_ref(),
+        &format!("record_metadata_update_failed record_id={} err={}", record_id, err),
+      );
+    }
+  }
+  if record_status == "COMPLETED" {
+    if let Err(err) = baidu_sync::enqueue_live_sync(&context.db, context.app_log_path.as_ref(), record_id) {
+      append_log(
+        context.app_log_path.as_ref(),
+        &format!("baidu_sync_enqueue_fail record_id={} err={}", record_id, err),
+      );
+    }
+  }
+  Ok(())
+}
+
+fn summarize_stream_url(url: &str) -> String {
+  if let Ok(parsed) = Url::parse(url) {
+    let host = parsed.host_str().unwrap_or("-");
+    let path = parsed.path();
+    let mut expires = String::from("-");
+    let mut tx_time = String::from("-");
+    let mut ws_time = String::from("-");
+    for (key, value) in parsed.query_pairs() {
+      if key == "expires" || key == "expire" {
+        expires = value.to_string();
+      } else if key == "txTime" {
+        tx_time = value.to_string();
+      } else if key == "wsTime" {
+        ws_time = value.to_string();
+      }
+    }
+    return format!(
+      "host={} path={} expires={} txTime={} wsTime={}",
+      host, path, expires, tx_time, ws_time
+    );
+  }
+  "host=- path=- expires=- txTime=- wsTime=-".to_string()
+}
+
+fn parse_stream_expire_value(value: &str) -> Option<u64> {
+  if value.is_empty() {
+    return None;
+  }
+  if value.chars().all(|ch| ch.is_ascii_digit()) {
+    value.parse::<u64>().ok()
+  } else {
+    u64::from_str_radix(value, 16).ok().or_else(|| value.parse::<u64>().ok())
+  }
+}
+
+fn stream_url_expire_at(url: &str) -> Option<u64> {
+  let parsed = Url::parse(url).ok()?;
+  let mut result: Option<u64> = None;
+  for (key, value) in parsed.query_pairs() {
+    let key = key.as_ref();
+    if key == "expires" || key == "expire" || key == "deadline" || key == "txTime" || key == "wsTime" {
+      if let Some(ts) = parse_stream_expire_value(value.as_ref()) {
+        result = Some(result.map_or(ts, |prev| prev.min(ts)));
+      }
+    }
+  }
+  result
+}
+
+fn should_refresh_stream_url(url: &str, lead_secs: u64) -> Option<(u64, u64)> {
+  let expire = stream_url_expire_at(url)?;
+  let now = Utc::now().timestamp();
+  if now < 0 {
+    return None;
+  }
+  let now = now as u64;
+  if expire <= now.saturating_add(lead_secs) {
+    Some((expire, now))
+  } else {
+    None
+  }
+}
+
+fn mark_force_no_qn(
+  force_no_qn_until: &mut Option<i64>,
+  settings: &LiveSettings,
+  log_path: &Path,
+  room_id: &str,
+  reason: &str,
+) {
+  if settings.stream_retry_no_qn_sec <= 0 {
+    return;
+  }
+  let now = Utc::now().timestamp();
+  let until = now + settings.stream_retry_no_qn_sec.max(1);
+  *force_no_qn_until = Some(until);
+  append_log(
+    log_path,
+    &format!(
+      "stream_force_no_qn room={} reason={} until={}",
+      room_id, reason, until
+    ),
+  );
 }
 
 fn parse_quality(value: &str) -> i64 {
@@ -1283,29 +1950,46 @@ impl DanmakuWriter {
   }
 
   fn ensure_file(&mut self) -> Result<(), String> {
-    let current_video = self
-      .live_runtime
-      .get_record_info(&self.runtime_room_id)
-      .map(|info| info.file_path)
-      .unwrap_or_else(|| self.fallback_path.clone());
-    let target_path = Path::new(&current_video)
-      .with_extension("danmaku.jsonl")
-      .to_string_lossy()
-      .to_string();
-    if self.current_path.as_deref() == Some(target_path.as_str()) {
-      return Ok(());
+    let mut candidates = Vec::new();
+    if let Some(info) = self.live_runtime.get_record_info(&self.runtime_room_id) {
+      if !info.file_path.trim().is_empty() {
+        candidates.push(info.file_path);
+      }
     }
-    if let Some(parent) = Path::new(&target_path).parent() {
-      std::fs::create_dir_all(parent).map_err(|err| format!("创建弹幕目录失败: {}", err))?;
+    if !self.fallback_path.trim().is_empty() {
+      candidates.push(self.fallback_path.clone());
     }
-    let file = OpenOptions::new()
-      .create(true)
-      .append(true)
-      .open(&target_path)
-      .map_err(|err| format!("创建弹幕文件失败: {}", err))?;
-    self.current_path = Some(target_path);
-    self.file = Some(file);
-    Ok(())
+    candidates.dedup();
+
+    let mut last_error: Option<String> = None;
+    for candidate in candidates {
+      let target_path = Path::new(&candidate)
+        .with_extension("danmaku.jsonl")
+        .to_string_lossy()
+        .to_string();
+      if self.current_path.as_deref() == Some(target_path.as_str()) {
+        return Ok(());
+      }
+      if let Some(parent) = Path::new(&target_path).parent() {
+        if !parent.as_os_str().is_empty() {
+          if let Err(err) = std::fs::create_dir_all(parent) {
+            last_error = Some(format!("创建弹幕目录失败: {} path={}", err, target_path));
+            continue;
+          }
+        }
+      }
+      match OpenOptions::new().create(true).append(true).open(&target_path) {
+        Ok(file) => {
+          self.current_path = Some(target_path);
+          self.file = Some(file);
+          return Ok(());
+        }
+        Err(err) => {
+          last_error = Some(format!("创建弹幕文件失败: {} path={}", err, target_path));
+        }
+      }
+    }
+    Err(last_error.unwrap_or_else(|| "弹幕文件路径为空".to_string()))
   }
 
   fn write_line(&mut self, line: &str) -> Result<(), String> {

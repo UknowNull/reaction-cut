@@ -8,6 +8,7 @@ use tauri::Manager;
 
 mod api;
 mod app_log;
+mod baidu_sync;
 mod bilibili;
 mod commands;
 mod config;
@@ -28,6 +29,8 @@ struct AppState {
     download_runtime: Arc<DownloadRuntime>,
     live_runtime: Arc<live_recorder::LiveRuntime>,
     edit_upload_state: Arc<Mutex<commands::submission::EditUploadState>>,
+    baidu_sync_runtime: Arc<baidu_sync::BaiduSyncRuntime>,
+    baidu_login_runtime: Arc<Mutex<commands::baidu_sync::BaiduLoginRuntime>>,
 }
 
 struct DownloadRuntime {
@@ -101,13 +104,15 @@ pub fn run() {
             let ffmpeg_path = config::resolve_ffmpeg_path();
             let ffprobe_path = config::resolve_ffprobe_path();
             let aria2c_candidates = config::resolve_aria2c_candidates();
+            let baidu_pcs_candidates = config::resolve_baidu_pcs_candidates();
             utils::append_log(
                 &app_log_path,
                 &format!(
-                    "bin_paths ffmpeg={} ffprobe={} aria2c={}",
+                    "bin_paths ffmpeg={} ffprobe={} aria2c={} baidu_pcs={}",
                     ffmpeg_path.to_string_lossy(),
                     ffprobe_path.to_string_lossy(),
-                    aria2c_candidates.join(",")
+                    aria2c_candidates.join(","),
+                    baidu_pcs_candidates.join(",")
                 ),
             );
             init_panic_log(Arc::new(panic_log_path));
@@ -128,6 +133,10 @@ pub fn run() {
                 live_runtime: Arc::new(live_recorder::new_live_runtime()),
                 edit_upload_state: Arc::new(Mutex::new(
                     commands::submission::EditUploadState::default(),
+                )),
+                baidu_sync_runtime: Arc::new(baidu_sync::BaiduSyncRuntime::new()),
+                baidu_login_runtime: Arc::new(Mutex::new(
+                    commands::baidu_sync::BaiduLoginRuntime::default(),
                 )),
             };
             commands::download::recover_stale_downloads(&state);
@@ -153,6 +162,12 @@ pub fn run() {
                 Arc::clone(&state.app_log_path),
                 Arc::clone(&state.edit_upload_state),
             );
+            let baidu_context = baidu_sync::BaiduSyncContext {
+                db: Arc::clone(&state.db),
+                app_log_path: Arc::clone(&state.app_log_path),
+                runtime: Arc::clone(&state.baidu_sync_runtime),
+            };
+            baidu_sync::start_baidu_sync_loop(baidu_context);
             app.manage(state);
             Ok(())
         })
@@ -165,6 +180,7 @@ pub fn run() {
             commands::auth::auth_sms_login,
             commands::auth::auth_pwd_login,
             commands::auth::auth_status,
+            commands::auth::auth_refresh,
             commands::auth::auth_client_log,
             commands::auth::auth_logout,
             commands::auth::auth_perform_qrcode_login,
@@ -179,6 +195,8 @@ pub fn run() {
             commands::live::live_record_start,
             commands::live::live_record_stop,
             commands::live::live_room_auto_record_update,
+            commands::live::live_room_baidu_sync_update,
+            commands::live::live_room_baidu_sync_toggle,
             commands::video::video_detail,
             commands::video::video_playurl,
             commands::video::video_playurl_by_aid,
@@ -194,6 +212,24 @@ pub fn run() {
             commands::process::process_create,
             commands::process::process_status,
             commands::toolbox::toolbox_remux,
+            commands::baidu_sync::baidu_sync_settings,
+            commands::baidu_sync::baidu_sync_status,
+            commands::baidu_sync::baidu_sync_login,
+            commands::baidu_sync::baidu_sync_logout,
+            commands::baidu_sync::baidu_sync_web_login,
+            commands::baidu_sync::baidu_sync_account_login_start,
+            commands::baidu_sync::baidu_sync_account_login_status,
+            commands::baidu_sync::baidu_sync_account_login_input,
+            commands::baidu_sync::baidu_sync_account_login_cancel,
+            commands::baidu_sync::baidu_sync_list,
+            commands::baidu_sync::baidu_sync_remote_dirs,
+            commands::baidu_sync::baidu_sync_create_dir,
+            commands::baidu_sync::baidu_sync_rename_dir,
+            commands::baidu_sync::baidu_sync_retry,
+            commands::baidu_sync::baidu_sync_cancel,
+            commands::baidu_sync::baidu_sync_pause,
+            commands::baidu_sync::baidu_sync_delete,
+            commands::baidu_sync::baidu_sync_update_settings,
             commands::submission::submission_create,
             commands::submission::submission_update,
             commands::submission::submission_repost,

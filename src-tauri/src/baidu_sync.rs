@@ -1,0 +1,1591 @@
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use tokio::time::{sleep, Duration};
+
+use crate::config::resolve_baidu_pcs_path;
+use crate::db::Db;
+use crate::utils::{append_log, now_rfc3339, sanitize_filename};
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaiduSyncSettings {
+  pub enabled: bool,
+  pub exec_path: String,
+  pub target_path: String,
+  pub policy: String,
+  pub retry: i64,
+  pub concurrency: i64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaiduLoginInfo {
+  pub status: String,
+  pub uid: Option<String>,
+  pub username: Option<String>,
+  pub login_type: Option<String>,
+  pub login_time: Option<String>,
+  pub last_check_time: Option<String>,
+}
+
+#[derive(Clone)]
+struct BaiduLoginCredential {
+  login_type: String,
+  cookie: Option<String>,
+  bduss: Option<String>,
+  stoken: Option<String>,
+  last_attempt_time: Option<String>,
+  last_attempt_error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaiduSyncTaskRecord {
+  pub id: i64,
+  pub source_type: String,
+  pub source_id: Option<String>,
+  pub source_title: Option<String>,
+  pub local_path: String,
+  pub remote_dir: String,
+  pub remote_name: String,
+  pub status: String,
+  pub progress: f64,
+  pub error: Option<String>,
+  pub retry_count: i64,
+  pub policy: Option<String>,
+  pub created_at: String,
+  pub updated_at: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaiduRemoteDir {
+  pub name: String,
+  pub path: String,
+}
+
+#[derive(Clone)]
+pub struct BaiduSyncContext {
+  pub db: Arc<Db>,
+  pub app_log_path: Arc<PathBuf>,
+  pub runtime: Arc<BaiduSyncRuntime>,
+}
+
+pub struct BaiduSyncRuntime {
+  active_count: Mutex<i64>,
+}
+
+impl BaiduSyncRuntime {
+  pub fn new() -> Self {
+    Self {
+      active_count: Mutex::new(0),
+    }
+  }
+}
+
+#[derive(Clone)]
+struct BaiduSyncTask {
+  id: i64,
+  local_path: String,
+  remote_dir: String,
+  remote_name: String,
+  retry_count: i64,
+  policy: Option<String>,
+}
+
+pub fn load_baidu_sync_settings(db: &Db) -> Result<BaiduSyncSettings, String> {
+  db.with_conn(|conn| {
+    let enabled = true;
+    let exec_path = read_setting(conn, "baidu_sync_exec_path").unwrap_or_default();
+    let target_path = read_setting(conn, "baidu_sync_target_path").unwrap_or_else(|| "/录播".to_string());
+    let policy = read_setting(conn, "baidu_sync_policy").unwrap_or_else(|| "overwrite".to_string());
+    let retry = read_setting(conn, "baidu_sync_retry")
+      .and_then(|value| value.parse::<i64>().ok())
+      .unwrap_or(2);
+    let concurrency_value = read_setting(conn, "baidu_sync_concurrency");
+    let concurrency = concurrency_value
+      .as_deref()
+      .and_then(|value| value.parse::<i64>().ok())
+      .unwrap_or(3)
+      .max(1);
+    if concurrency_value.is_none() {
+      let now = now_rfc3339();
+      let _ = upsert_setting(conn, "baidu_sync_concurrency", "3", &now);
+    }
+    Ok(BaiduSyncSettings {
+      enabled,
+      exec_path,
+      target_path,
+      policy,
+      retry,
+      concurrency,
+    })
+  })
+  .map_err(|err| err.to_string())
+}
+
+pub fn load_baidu_login_info(db: &Db) -> Result<Option<BaiduLoginInfo>, String> {
+  db.with_conn(|conn| {
+    let mut stmt = conn.prepare(
+      "SELECT status, uid, username, login_type, login_time, last_check_time FROM baidu_login_info WHERE id = 1",
+    )?;
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+      Ok(Some(BaiduLoginInfo {
+        status: row.get(0)?,
+        uid: row.get(1)?,
+        username: row.get(2)?,
+        login_type: row.get(3)?,
+        login_time: row.get(4)?,
+        last_check_time: row.get(5)?,
+      }))
+    } else {
+      Ok(None)
+    }
+  })
+  .map_err(|err| err.to_string())
+}
+
+pub fn upsert_baidu_login_info(db: &Db, info: &BaiduLoginInfo) -> Result<(), String> {
+  let now = now_rfc3339();
+  db.with_conn(|conn| {
+    conn.execute(
+      "INSERT INTO baidu_login_info (id, status, uid, username, login_type, login_time, last_check_time, create_time, update_time) \
+       VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+       ON CONFLICT(id) DO UPDATE SET \
+       status = excluded.status, \
+       uid = excluded.uid, \
+       username = excluded.username, \
+       login_type = excluded.login_type, \
+       login_time = excluded.login_time, \
+       last_check_time = excluded.last_check_time, \
+       update_time = excluded.update_time",
+      (
+        info.status.as_str(),
+        info.uid.as_deref(),
+        info.username.as_deref(),
+        info.login_type.as_deref(),
+        info.login_time.as_deref(),
+        info.last_check_time.as_deref(),
+        &now,
+        &now,
+      ),
+    )?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+pub fn update_baidu_sync_settings(db: &Db, settings: &BaiduSyncSettings) -> Result<(), String> {
+  let now = now_rfc3339();
+  db.with_conn(|conn| {
+    upsert_setting(conn, "baidu_sync_exec_path", &settings.exec_path, &now)?;
+    upsert_setting(conn, "baidu_sync_target_path", &settings.target_path, &now)?;
+    upsert_setting(conn, "baidu_sync_policy", &settings.policy, &now)?;
+    upsert_setting(conn, "baidu_sync_retry", &settings.retry.to_string(), &now)?;
+    upsert_setting(conn, "baidu_sync_concurrency", &settings.concurrency.to_string(), &now)?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+pub fn list_baidu_sync_tasks(
+  db: &Db,
+  status: Option<String>,
+  page: i64,
+  page_size: i64,
+) -> Result<Vec<BaiduSyncTaskRecord>, String> {
+  let status_filter = status.filter(|value| !value.trim().is_empty());
+  let page_size = page_size.clamp(1, 200);
+  let offset = (page - 1).max(0) * page_size;
+  db.with_conn(|conn| {
+    let mut stmt = if status_filter.is_some() {
+      conn.prepare(
+        "SELECT id, source_type, source_id, source_title, local_path, remote_dir, remote_name, status, progress, error, retry_count, policy, created_at, updated_at \
+         FROM baidu_sync_task WHERE status = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+      )?
+    } else {
+      conn.prepare(
+        "SELECT id, source_type, source_id, source_title, local_path, remote_dir, remote_name, status, progress, error, retry_count, policy, created_at, updated_at \
+         FROM baidu_sync_task ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+      )?
+    };
+
+    let rows = if let Some(status) = status_filter {
+      stmt.query_map((status, page_size, offset), map_baidu_sync_task)?
+    } else {
+      stmt.query_map((page_size, offset), map_baidu_sync_task)?
+    };
+    let list = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(list)
+  })
+  .map_err(|err| err.to_string())
+}
+
+pub fn list_baidu_remote_dirs(
+  db: &Db,
+  path: &str,
+) -> Result<Vec<BaiduRemoteDir>, String> {
+  let settings = load_baidu_sync_settings(db)?;
+  let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+  let target_path = normalize_baidu_path(path);
+  let output = run_baidu_pcs_command(&exec_path, &["ls".to_string(), target_path.clone()])?;
+  let content = if output.stdout.trim().is_empty() {
+    output.stderr
+  } else {
+    output.stdout
+  };
+  Ok(parse_baidu_ls_dirs(&content, &target_path))
+}
+
+pub fn create_baidu_remote_dir(
+  db: &Db,
+  parent_path: &str,
+  name: &str,
+) -> Result<BaiduRemoteDir, String> {
+  let settings = load_baidu_sync_settings(db)?;
+  let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+  let safe_name = sanitize_filename(name.trim());
+  if safe_name.is_empty() {
+    return Err("目录名称不能为空".to_string());
+  }
+  let base_path = normalize_baidu_path(parent_path);
+  let full_path = join_baidu_path(&base_path, &safe_name);
+  run_baidu_pcs_command(&exec_path, &["mkdir".to_string(), full_path.clone()])?;
+  Ok(BaiduRemoteDir {
+    name: safe_name,
+    path: full_path,
+  })
+}
+
+pub fn rename_baidu_remote_dir(
+  db: &Db,
+  from_path: &str,
+  name: &str,
+) -> Result<BaiduRemoteDir, String> {
+  let settings = load_baidu_sync_settings(db)?;
+  let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+  let normalized_from = normalize_baidu_path(from_path);
+  if normalized_from == "/" {
+    return Err("无法重命名根目录".to_string());
+  }
+  let safe_name = sanitize_filename(name.trim());
+  if safe_name.is_empty() {
+    return Err("目录名称不能为空".to_string());
+  }
+  let parent_path = {
+    let mut segments: Vec<&str> = normalized_from.split('/').filter(|value| !value.is_empty()).collect();
+    segments.pop();
+    if segments.is_empty() {
+      "/".to_string()
+    } else {
+      format!("/{}", segments.join("/"))
+    }
+  };
+  let target_path = join_baidu_path(&parent_path, &safe_name);
+  if target_path != normalized_from {
+    run_baidu_pcs_command(
+      &exec_path,
+      &["mv".to_string(), normalized_from.clone(), target_path.clone()],
+    )?;
+    update_submission_sync_paths(db, &normalized_from, &target_path)?;
+  }
+  Ok(BaiduRemoteDir {
+    name: safe_name,
+    path: target_path,
+  })
+}
+
+fn update_submission_sync_paths(db: &Db, from_path: &str, to_path: &str) -> Result<(), String> {
+  let from_path = normalize_baidu_path(from_path);
+  let to_path = normalize_baidu_path(to_path);
+  let like_pattern = format!("{}/%", from_path.trim_end_matches('/'));
+  db.with_conn(|conn| {
+    conn.execute(
+      "UPDATE submission_task \
+       SET baidu_sync_path = CASE \
+         WHEN baidu_sync_path = ?1 THEN ?2 \
+         WHEN baidu_sync_path LIKE ?3 THEN ?2 || SUBSTR(baidu_sync_path, LENGTH(?1) + 1) \
+         ELSE baidu_sync_path \
+       END \
+       WHERE baidu_sync_path = ?1 OR baidu_sync_path LIKE ?3",
+      (&from_path, &to_path, &like_pattern),
+    )?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+pub fn enqueue_submission_sync(
+  db: &Db,
+  app_log_path: &Path,
+  task_id: &str,
+) -> Result<(), String> {
+  let settings = load_baidu_sync_settings(db)?;
+  append_log(
+    app_log_path,
+    &format!("baidu_sync_enqueue_submission_start task_id={}", task_id),
+  );
+  let task = db.with_conn(|conn| {
+    conn.query_row(
+      "SELECT title, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename FROM submission_task WHERE task_id = ?1",
+      [task_id],
+      |row| {
+        let title: String = row.get(0)?;
+        let enabled: i64 = row.get(1)?;
+        let path: Option<String> = row.get(2)?;
+        let filename: Option<String> = row.get(3)?;
+        Ok((title, enabled != 0, path, filename))
+      },
+    )
+  });
+  let (title, task_enabled, task_path, task_filename) = match task {
+    Ok(value) => value,
+    Err(err) => return Err(err.to_string()),
+  };
+  if !task_enabled {
+    append_log(
+      app_log_path,
+      &format!("baidu_sync_enqueue_skip task_id={} reason=disabled", task_id),
+    );
+    return Ok(());
+  }
+  let merged = db
+    .with_conn(|conn| {
+      conn.query_row(
+        "SELECT video_path, file_name FROM merged_video WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+        [task_id],
+        |row| {
+          let path: Option<String> = row.get(0)?;
+          let name: Option<String> = row.get(1)?;
+          Ok((path, name))
+        },
+      )
+    })
+    .map_err(|err| err.to_string())?;
+  let local_path = match merged.0 {
+    Some(path) if !path.trim().is_empty() => path,
+    _ => {
+      append_log(
+        app_log_path,
+        &format!("baidu_sync_enqueue_skip task_id={} reason=missing_merged_path", task_id),
+      );
+      return Ok(());
+    }
+  };
+  let local_name = merged
+    .1
+    .or_else(|| Path::new(&local_path).file_name().and_then(|v| v.to_str()).map(|v| v.to_string()))
+    .unwrap_or_else(|| "merged.mp4".to_string());
+  let base_path = normalize_baidu_path(task_path.as_deref().unwrap_or(&settings.target_path));
+  let remote_dir = base_path;
+  let remote_name = task_filename
+    .as_deref()
+    .map(|name| name.trim())
+    .filter(|name| !name.is_empty())
+    .map(sanitize_filename)
+    .unwrap_or_else(|| sanitize_filename(&local_name));
+  append_log(
+    app_log_path,
+    &format!(
+      "baidu_sync_enqueue_submission task_id={} local={} remote_dir={} remote_name={}",
+      task_id, local_path, remote_dir, remote_name
+    ),
+  );
+  insert_baidu_sync_task(
+    db,
+    "submission_merged",
+    Some(task_id.to_string()),
+    Some(title),
+    &local_path,
+    &remote_dir,
+    &remote_name,
+    &settings.policy,
+  )?;
+  Ok(())
+}
+
+pub fn enqueue_live_sync(
+  db: &Db,
+  app_log_path: &Path,
+  record_id: i64,
+) -> Result<(), String> {
+  let settings = load_baidu_sync_settings(db)?;
+  append_log(
+    app_log_path,
+    &format!("baidu_sync_enqueue_live_start record_id={}", record_id),
+  );
+  let record = db.with_conn(|conn| {
+    conn.query_row(
+      "SELECT room_id, title, file_path, start_time FROM live_record_task WHERE id = ?1",
+      [record_id],
+      |row| {
+        let room_id: String = row.get(0)?;
+        let title: Option<String> = row.get(1)?;
+        let file_path: String = row.get(2)?;
+        let start_time: String = row.get(3)?;
+        Ok((room_id, title, file_path, start_time))
+      },
+    )
+  });
+  let (room_id, title, file_path, start_time) = match record {
+    Ok(value) => value,
+    Err(err) => return Err(err.to_string()),
+  };
+  if file_path.trim().is_empty() {
+    append_log(
+      app_log_path,
+      &format!("baidu_sync_enqueue_skip record_id={} reason=missing_record_path", record_id),
+    );
+    return Ok(());
+  }
+  let local_name = Path::new(&file_path)
+    .file_name()
+    .and_then(|value| value.to_str())
+    .unwrap_or("record.mp4")
+    .to_string();
+  let live_date = parse_date(&start_time).unwrap_or_else(|| Utc::now().format("%Y%m%d").to_string());
+  let (sync_enabled, room_path) =
+    load_room_baidu_sync_config(db, &room_id).unwrap_or((false, None));
+  if !sync_enabled {
+    append_log(
+      app_log_path,
+      &format!("baidu_sync_enqueue_skip record_id={} reason=disabled", record_id),
+    );
+    return Ok(());
+  }
+  let base_path = match room_path {
+    Some(value) if !value.trim().is_empty() => normalize_baidu_path(&value),
+    _ => {
+      append_log(
+        app_log_path,
+        &format!("baidu_sync_enqueue_skip record_id={} reason=missing_path", record_id),
+      );
+      return Ok(());
+    }
+  };
+  let remote_dir = join_baidu_path(&base_path, &live_date);
+  let remote_name = render_filename(None, &local_name, &live_date, None, &local_name);
+  append_log(
+    app_log_path,
+    &format!(
+      "baidu_sync_enqueue_live record_id={} local={} remote_dir={} remote_name={}",
+      record_id, file_path, remote_dir, remote_name
+    ),
+  );
+  insert_baidu_sync_task(
+    db,
+    "live_segment",
+    Some(record_id.to_string()),
+    title,
+    &file_path,
+    &remote_dir,
+    &remote_name,
+    &settings.policy,
+  )?;
+  Ok(())
+}
+
+pub fn start_baidu_sync_loop(context: BaiduSyncContext) {
+  recover_baidu_sync_tasks(context.db.as_ref(), context.app_log_path.as_ref());
+  tauri::async_runtime::spawn(async move {
+    loop {
+      let settings = match load_baidu_sync_settings(context.db.as_ref()) {
+        Ok(value) => value,
+        Err(_) => {
+          sleep(Duration::from_secs(10)).await;
+          continue;
+        }
+      };
+      let mut launched = 0;
+      loop {
+        let active = context.runtime.active_count.lock().map(|value| *value).unwrap_or(0);
+        if active >= settings.concurrency {
+          break;
+        }
+        let task = match load_next_pending_task(context.db.as_ref()) {
+          Ok(Some(task)) => task,
+          Ok(None) => break,
+          Err(_) => break,
+        };
+        if let Ok(mut guard) = context.runtime.active_count.lock() {
+          *guard += 1;
+        }
+        let task_context = context.clone();
+        let runtime = Arc::clone(&context.runtime);
+        let app_log_path = Arc::clone(&context.app_log_path);
+        let settings_clone = settings.clone();
+        tauri::async_runtime::spawn(async move {
+          let result = run_baidu_sync_task(task_context, settings_clone, task).await;
+          if let Ok(mut guard) = runtime.active_count.lock() {
+            *guard = (*guard - 1).max(0);
+          }
+          if let Err(err) = result {
+            append_log(
+              app_log_path.as_ref(),
+              &format!("baidu_sync_task_fail err={}", err),
+            );
+          }
+        });
+        launched += 1;
+        if launched >= settings.concurrency {
+          break;
+        }
+      }
+      sleep(Duration::from_secs(3)).await;
+    }
+  });
+}
+
+pub fn recover_baidu_sync_tasks(db: &Db, app_log_path: &Path) {
+  let now = now_rfc3339();
+  let result = db.with_conn(|conn| {
+    conn.execute(
+      "UPDATE baidu_sync_task SET status = 'PENDING', progress = 0.0, updated_at = ?1 WHERE status = 'UPLOADING'",
+      [&now],
+    )?;
+    Ok(())
+  });
+  if result.is_ok() {
+    append_log(app_log_path, "baidu_sync_recover_ok");
+  }
+}
+
+pub fn retry_baidu_sync_task(db: &Db, task_id: i64) -> Result<(), String> {
+  let now = now_rfc3339();
+  db.with_conn(|conn| {
+    conn.execute(
+      "UPDATE baidu_sync_task SET status = 'PENDING', progress = 0.0, error = NULL, updated_at = ?1 WHERE id = ?2",
+      (&now, task_id),
+    )?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+pub fn cancel_baidu_sync_task(db: &Db, task_id: i64) -> Result<(), String> {
+  let now = now_rfc3339();
+  db.with_conn(|conn| {
+    conn.execute(
+      "UPDATE baidu_sync_task SET status = 'CANCELLED', updated_at = ?1 WHERE id = ?2",
+      (&now, task_id),
+    )?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+pub fn pause_baidu_sync_task(db: &Db, task_id: i64) -> Result<(), String> {
+  let now = now_rfc3339();
+  db.with_conn(|conn| {
+    conn.execute(
+      "UPDATE baidu_sync_task SET status = 'PAUSED', updated_at = ?1 WHERE id = ?2",
+      (&now, task_id),
+    )?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+pub fn delete_baidu_sync_task(db: &Db, task_id: i64) -> Result<(), String> {
+  db.with_conn(|conn| {
+    conn.execute("DELETE FROM baidu_sync_task WHERE id = ?1", [task_id])?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+pub fn check_baidu_login(db: &Db) -> Result<BaiduLoginInfo, String> {
+  check_baidu_login_internal(db, true)
+}
+
+fn check_baidu_login_internal(db: &Db, allow_auto_relogin: bool) -> Result<BaiduLoginInfo, String> {
+  let settings = load_baidu_sync_settings(db)?;
+  let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+  let now = now_rfc3339();
+  let previous = load_baidu_login_info(db)?.unwrap_or(BaiduLoginInfo {
+    status: "LOGGED_OUT".to_string(),
+    uid: None,
+    username: None,
+    login_type: None,
+    login_time: None,
+    last_check_time: None,
+  });
+  let who_output = match run_baidu_pcs_command(&exec_path, &["who".to_string()]) {
+    Ok(output) => output,
+    Err(err) => {
+      if is_baidu_busy_error(&err) && previous.login_type.is_some() {
+        let mut info = previous.clone();
+        info.last_check_time = Some(now);
+        let _ = upsert_baidu_login_info(db, &info);
+        return Ok(info);
+      }
+      return Err(err);
+    }
+  };
+  if is_baidu_busy_error(&who_output.stdout) && previous.login_type.is_some() {
+    let mut info = previous.clone();
+    info.last_check_time = Some(now);
+    let _ = upsert_baidu_login_info(db, &info);
+    return Ok(info);
+  }
+  let (logged_in, uid, username) = parse_who_output(&who_output.stdout);
+  if !logged_in && allow_auto_relogin {
+    if let Some(credential) = load_baidu_login_credential(db)? {
+      if should_attempt_relogin(&credential, &now) {
+        let attempt_result = relogin_with_credential(db, &exec_path, &credential);
+        let _ = update_baidu_login_credential_attempt(db, attempt_result.as_ref().err());
+        if let Ok(info) = attempt_result {
+          return Ok(info);
+        }
+      }
+    }
+  }
+  let info = BaiduLoginInfo {
+    status: if logged_in { "LOGGED_IN" } else { "LOGGED_OUT" }.to_string(),
+    uid,
+    username,
+    login_type: previous.login_type,
+    login_time: previous.login_time,
+    last_check_time: Some(now),
+  };
+  upsert_baidu_login_info(db, &info)?;
+  Ok(info)
+}
+
+fn is_baidu_busy_error(err: &str) -> bool {
+  err.contains("50052") || err.contains("系统繁忙")
+}
+
+pub fn login_baidu_with_cookie(db: &Db, cookie: &str) -> Result<BaiduLoginInfo, String> {
+  let settings = load_baidu_sync_settings(db)?;
+  let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+  let cookie = normalize_baidu_cookie(cookie)?;
+  run_baidu_pcs_command(
+    &exec_path,
+    &["login".to_string(), format!("-cookies={}", cookie)],
+  )?;
+  let info = check_baidu_login_internal(db, false)?;
+  let mut next = info.clone();
+  next.login_type = Some("cookie".to_string());
+  if next.login_time.is_none() {
+    next.login_time = Some(now_rfc3339());
+  }
+  upsert_baidu_login_info(db, &next)?;
+  let credential = BaiduLoginCredential {
+    login_type: "cookie".to_string(),
+    cookie: Some(cookie),
+    bduss: None,
+    stoken: None,
+    last_attempt_time: None,
+    last_attempt_error: None,
+  };
+  upsert_baidu_login_credential(db, &credential)?;
+  Ok(next)
+}
+
+fn normalize_baidu_cookie(input: &str) -> Result<String, String> {
+  let raw = input.trim();
+  if raw.is_empty() {
+    return Err("Cookie 不能为空".to_string());
+  }
+  let mut cleaned = raw.to_string();
+  if raw.to_ascii_lowercase().starts_with("cookie:") {
+    cleaned = raw[7..].trim().to_string();
+  }
+  cleaned = cleaned.replace('\r', ";").replace('\n', ";");
+  let mut items: Vec<String> = Vec::new();
+  let mut has_bduss = false;
+  let mut has_bduss_bfess = false;
+  for part in cleaned.split(';') {
+    let token = part.trim();
+    if token.is_empty() || !token.contains('=') {
+      continue;
+    }
+    let mut iter = token.splitn(2, '=');
+    let key = iter.next().unwrap_or("").trim();
+    let value = iter.next().unwrap_or("").trim();
+    if key.is_empty() || value.is_empty() {
+      continue;
+    }
+    let key_lower = key.to_ascii_lowercase();
+    if matches!(
+      key_lower.as_str(),
+      "path"
+        | "domain"
+        | "expires"
+        | "max-age"
+        | "secure"
+        | "httponly"
+        | "samesite"
+        | "priority"
+    ) {
+      continue;
+    }
+    if key_lower == "bduss" {
+      has_bduss = true;
+    }
+    if key_lower == "bduss_bfess" {
+      has_bduss_bfess = true;
+    }
+    items.push(format!("{}={}", key, value));
+  }
+  if items.is_empty() {
+    return Err("Cookie 无有效字段".to_string());
+  }
+  if !has_bduss {
+    if has_bduss_bfess {
+      return Err("Cookie 缺少 BDUSS，仅包含 BDUSS_BFESS".to_string());
+    }
+    return Err("Cookie 缺少 BDUSS".to_string());
+  }
+  Ok(items.join("; "))
+}
+
+pub fn login_baidu_with_bduss(
+  db: &Db,
+  bduss: &str,
+  stoken: Option<&str>,
+) -> Result<BaiduLoginInfo, String> {
+  let settings = load_baidu_sync_settings(db)?;
+  let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+  let bduss = normalize_baidu_token(bduss, "BDUSS")?;
+  let stoken = match stoken {
+    Some(value) => normalize_baidu_token_optional(value, "STOKEN")?,
+    None => None,
+  };
+  let mut args = vec!["login".to_string(), format!("-bduss={}", bduss)];
+  if let Some(stoken_value) = stoken.as_deref() {
+    args.push(format!("-stoken={}", stoken_value));
+  }
+  run_baidu_pcs_command(&exec_path, &args)?;
+  let info = check_baidu_login_internal(db, false)?;
+  let mut next = info.clone();
+  next.login_type = Some("bduss".to_string());
+  if next.login_time.is_none() {
+    next.login_time = Some(now_rfc3339());
+  }
+  upsert_baidu_login_info(db, &next)?;
+  let credential = BaiduLoginCredential {
+    login_type: "bduss".to_string(),
+    cookie: None,
+    bduss: Some(bduss),
+    stoken,
+    last_attempt_time: None,
+    last_attempt_error: None,
+  };
+  upsert_baidu_login_credential(db, &credential)?;
+  Ok(next)
+}
+
+fn normalize_baidu_token(input: &str, label: &str) -> Result<String, String> {
+  let raw = input.trim();
+  if raw.is_empty() {
+    return Err(format!("{} 不能为空", label));
+  }
+  let cleaned = raw.replace('\r', ";").replace('\n', ";");
+  let label_lower = label.to_ascii_lowercase();
+  if cleaned.contains(';') || cleaned.contains('=') {
+    for part in cleaned.split(';') {
+      let token = part.trim();
+      if token.is_empty() || !token.contains('=') {
+        continue;
+      }
+      let mut iter = token.splitn(2, '=');
+      let key = iter.next().unwrap_or("").trim();
+      let value = iter.next().unwrap_or("").trim();
+      if key.eq_ignore_ascii_case(label) && !value.is_empty() {
+        return Ok(value.to_string());
+      }
+    }
+  }
+  let lower = cleaned.to_ascii_lowercase();
+  let prefix = format!("{}=", label_lower);
+  if lower.starts_with(&prefix) {
+    let value = cleaned[label.len() + 1..].trim();
+    if value.is_empty() {
+      return Err(format!("{} 不能为空", label));
+    }
+    return Ok(value.to_string());
+  }
+  Ok(cleaned.trim().to_string())
+}
+
+fn normalize_baidu_token_optional(input: &str, label: &str) -> Result<Option<String>, String> {
+  let raw = input.trim();
+  if raw.is_empty() {
+    return Ok(None);
+  }
+  normalize_baidu_token(raw, label).map(Some)
+}
+
+pub fn logout_baidu(db: &Db) -> Result<(), String> {
+  let settings = load_baidu_sync_settings(db)?;
+  let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+  let _ = run_baidu_pcs_command(&exec_path, &["logout".to_string()]);
+  let info = BaiduLoginInfo {
+    status: "LOGGED_OUT".to_string(),
+    uid: None,
+    username: None,
+    login_type: None,
+    login_time: None,
+    last_check_time: Some(now_rfc3339()),
+  };
+  upsert_baidu_login_info(db, &info)?;
+  let _ = clear_baidu_login_credential(db);
+  Ok(())
+}
+
+fn load_baidu_login_credential(db: &Db) -> Result<Option<BaiduLoginCredential>, String> {
+  db.with_conn(|conn| {
+    let mut stmt = conn.prepare(
+      "SELECT login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error \
+       FROM baidu_login_credential WHERE id = 1",
+    )?;
+    let result = stmt.query_row([], |row| {
+      Ok(BaiduLoginCredential {
+        login_type: row.get(0)?,
+        cookie: row.get(1)?,
+        bduss: row.get(2)?,
+        stoken: row.get(3)?,
+        last_attempt_time: row.get(4)?,
+        last_attempt_error: row.get(5)?,
+      })
+    });
+    match result {
+      Ok(value) => Ok(Some(value)),
+      Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+      Err(err) => Err(err),
+    }
+  })
+  .map_err(|err| err.to_string())
+}
+
+fn upsert_baidu_login_credential(db: &Db, credential: &BaiduLoginCredential) -> Result<(), String> {
+  let now = now_rfc3339();
+  db.with_conn(|conn| {
+    conn.execute(
+      "INSERT OR REPLACE INTO baidu_login_credential \
+       (id, login_type, cookie, bduss, stoken, last_attempt_time, last_attempt_error, create_time, update_time) \
+       VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+      (
+        &credential.login_type,
+        &credential.cookie,
+        &credential.bduss,
+        &credential.stoken,
+        &credential.last_attempt_time,
+        &credential.last_attempt_error,
+        &now,
+        &now,
+      ),
+    )?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+fn clear_baidu_login_credential(db: &Db) -> Result<(), String> {
+  db.with_conn(|conn| {
+    conn.execute("DELETE FROM baidu_login_credential WHERE id = 1", [])?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+fn update_baidu_login_credential_attempt(
+  db: &Db,
+  err: Option<&String>,
+) -> Result<(), String> {
+  let mut credential = match load_baidu_login_credential(db)? {
+    Some(value) => value,
+    None => return Ok(()),
+  };
+  credential.last_attempt_time = Some(now_rfc3339());
+  credential.last_attempt_error = err.map(|value| value.to_string());
+  upsert_baidu_login_credential(db, &credential)
+}
+
+fn should_attempt_relogin(credential: &BaiduLoginCredential, now: &str) -> bool {
+  let Some(last_attempt) = credential.last_attempt_time.as_deref() else {
+    return true;
+  };
+  let Some(last) = parse_rfc3339(last_attempt) else {
+    return true;
+  };
+  let Some(current) = parse_rfc3339(now) else {
+    return true;
+  };
+  (current - last).num_seconds() >= 600
+}
+
+fn relogin_with_credential(
+  db: &Db,
+  exec_path: &Path,
+  credential: &BaiduLoginCredential,
+) -> Result<BaiduLoginInfo, String> {
+  match credential.login_type.as_str() {
+    "cookie" => {
+      let cookie = credential.cookie.as_deref().unwrap_or("");
+      let cookie = normalize_baidu_cookie(cookie)?;
+      run_baidu_pcs_command(
+        exec_path,
+        &["login".to_string(), format!("-cookies={}", cookie)],
+      )?;
+    }
+    "bduss" => {
+      let bduss = credential.bduss.as_deref().unwrap_or("");
+      let bduss = normalize_baidu_token(bduss, "BDUSS")?;
+      let stoken = credential.stoken.as_deref().unwrap_or("");
+      let stoken = normalize_baidu_token_optional(stoken, "STOKEN")?;
+      let mut args = vec!["login".to_string(), format!("-bduss={}", bduss)];
+      if let Some(stoken_value) = stoken.as_deref() {
+        args.push(format!("-stoken={}", stoken_value));
+      }
+      run_baidu_pcs_command(exec_path, &args)?;
+    }
+    _ => return Err("未知的登录类型".to_string()),
+  }
+  let info = check_baidu_login_internal(db, false)?;
+  if info.status != "LOGGED_IN" {
+    return Err("自动重登失败".to_string());
+  }
+  let mut next = info.clone();
+  next.login_type = Some(credential.login_type.clone());
+  if next.login_time.is_none() {
+    next.login_time = Some(now_rfc3339());
+  }
+  upsert_baidu_login_info(db, &next)?;
+  Ok(next)
+}
+
+fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
+  DateTime::parse_from_rfc3339(value)
+    .ok()
+    .map(|value| value.with_timezone(&Utc))
+}
+
+async fn run_baidu_sync_task(
+  context: BaiduSyncContext,
+  settings: BaiduSyncSettings,
+  task: BaiduSyncTask,
+) -> Result<(), String> {
+  update_baidu_sync_status(context.db.as_ref(), task.id, "UPLOADING", 0.0, None)?;
+  let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+  let policy = normalize_baidu_upload_policy(task.policy.as_deref().or(Some(&settings.policy)))
+    .unwrap_or_else(|| "overwrite".to_string());
+  append_log(
+    context.app_log_path.as_ref(),
+    &format!(
+      "baidu_sync_task_start id={} local={} remote_dir={} remote_name={} policy={}",
+      task.id, task.local_path, task.remote_dir, task.remote_name, policy
+    ),
+  );
+  let upload_result = run_baidu_pcs_upload(
+    &exec_path,
+    &[
+      "upload".to_string(),
+      format!("-policy={}", policy),
+      task.local_path.clone(),
+      task.remote_dir.clone(),
+    ],
+    |progress| {
+      let _ = update_baidu_sync_progress(context.db.as_ref(), task.id, progress);
+    },
+  );
+  match upload_result {
+    Ok(output) => {
+      let local_name = Path::new(&task.local_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_string();
+      let mut remote_path = join_baidu_path(&task.remote_dir, &local_name);
+      if task.remote_name != local_name {
+        let target_path = join_baidu_path(&task.remote_dir, &task.remote_name);
+        let _ = run_baidu_pcs_command(
+          &exec_path,
+          &["mv".to_string(), remote_path.clone(), target_path.clone()],
+        );
+        remote_path = target_path;
+      }
+      append_log(
+        context.app_log_path.as_ref(),
+        &format!("baidu_sync_task_uploaded id={} remote={}", task.id, remote_path),
+      );
+      let meta = run_baidu_pcs_command(&exec_path, &["meta".to_string(), remote_path.clone()]);
+      match meta {
+        Ok(meta_output) => {
+          let size = parse_meta_size(&meta_output.stdout).unwrap_or(0);
+          if size == 0 {
+            let err = "上传后文件大小为0";
+            append_log(
+              context.app_log_path.as_ref(),
+              &format!("baidu_sync_task_error id={} err={}", task.id, err),
+            );
+            return handle_baidu_sync_failure(context.db.as_ref(), task, settings.retry, err);
+          }
+        }
+        Err(err) => {
+          append_log(
+            context.app_log_path.as_ref(),
+            &format!("baidu_sync_task_error id={} err={}", task.id, err),
+          );
+          return handle_baidu_sync_failure(context.db.as_ref(), task, settings.retry, &err);
+        }
+      }
+      update_baidu_sync_status(context.db.as_ref(), task.id, "SUCCESS", 100.0, None)?;
+      append_log(
+        context.app_log_path.as_ref(),
+        &format!("baidu_sync_task_ok id={} output={}", task.id, output.stdout.len()),
+      );
+      Ok(())
+    }
+    Err(err) => {
+      append_log(
+        context.app_log_path.as_ref(),
+        &format!("baidu_sync_task_error id={} err={}", task.id, err),
+      );
+      handle_baidu_sync_failure(context.db.as_ref(), task, settings.retry, &err)
+    }
+  }
+}
+
+fn handle_baidu_sync_failure(
+  db: &Db,
+  task: BaiduSyncTask,
+  max_retry: i64,
+  err: &str,
+) -> Result<(), String> {
+  let next_retry = task.retry_count + 1;
+  if next_retry <= max_retry {
+    let now = now_rfc3339();
+    db.with_conn(|conn| {
+      conn.execute(
+        "UPDATE baidu_sync_task SET status = 'PENDING', progress = 0.0, retry_count = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
+        (next_retry, err, &now, task.id),
+      )?;
+      Ok(())
+    })
+    .map_err(|err| err.to_string())?;
+    Ok(())
+  } else {
+    update_baidu_sync_status(db, task.id, "FAILED", 0.0, Some(err.to_string()))
+  }
+}
+
+fn update_baidu_sync_status(
+  db: &Db,
+  task_id: i64,
+  status: &str,
+  progress: f64,
+  error: Option<String>,
+) -> Result<(), String> {
+  let now = now_rfc3339();
+  db.with_conn(|conn| {
+    conn.execute(
+      "UPDATE baidu_sync_task SET status = ?1, progress = ?2, error = ?3, updated_at = ?4 WHERE id = ?5",
+      (status, progress, error.as_deref(), &now, task_id),
+    )?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+fn update_baidu_sync_progress(db: &Db, task_id: i64, progress: f64) -> Result<(), String> {
+  let now = now_rfc3339();
+  db.with_conn(|conn| {
+    conn.execute(
+      "UPDATE baidu_sync_task SET progress = ?1, updated_at = ?2 WHERE id = ?3",
+      (progress, &now, task_id),
+    )?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+fn insert_baidu_sync_task(
+  db: &Db,
+  source_type: &str,
+  source_id: Option<String>,
+  source_title: Option<String>,
+  local_path: &str,
+  remote_dir: &str,
+  remote_name: &str,
+  policy: &str,
+) -> Result<(), String> {
+  let now = now_rfc3339();
+  db.with_conn(|conn| {
+    conn.execute(
+      "INSERT INTO baidu_sync_task (source_type, source_id, source_title, local_path, remote_dir, remote_name, status, progress, error, retry_count, policy, created_at, updated_at) \
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0.0, NULL, 0, ?7, ?8, ?9)",
+      (
+        source_type,
+        source_id.as_deref(),
+        source_title.as_deref(),
+        local_path,
+        remote_dir,
+        remote_name,
+        policy,
+        &now,
+        &now,
+      ),
+    )?;
+    Ok(())
+  })
+  .map_err(|err| err.to_string())
+}
+
+fn load_next_pending_task(db: &Db) -> Result<Option<BaiduSyncTask>, String> {
+  let now = now_rfc3339();
+  db.with_conn(|conn| {
+    let mut stmt = conn.prepare(
+      "SELECT id, local_path, remote_dir, remote_name, retry_count, policy FROM baidu_sync_task WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1",
+    )?;
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+      let task_id: i64 = row.get(0)?;
+      conn.execute(
+        "UPDATE baidu_sync_task SET status = 'UPLOADING', updated_at = ?1 WHERE id = ?2 AND status = 'PENDING'",
+        (&now, task_id),
+      )?;
+      let task = BaiduSyncTask {
+        id: task_id,
+        local_path: row.get(1)?,
+        remote_dir: row.get(2)?,
+        remote_name: row.get(3)?,
+        retry_count: row.get(4)?,
+        policy: row.get(5)?,
+      };
+      Ok(Some(task))
+    } else {
+      Ok(None)
+    }
+  })
+  .map_err(|err| err.to_string())
+}
+
+fn map_baidu_sync_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<BaiduSyncTaskRecord> {
+  Ok(BaiduSyncTaskRecord {
+    id: row.get(0)?,
+    source_type: row.get(1)?,
+    source_id: row.get(2)?,
+    source_title: row.get(3)?,
+    local_path: row.get(4)?,
+    remote_dir: row.get(5)?,
+    remote_name: row.get(6)?,
+    status: row.get(7)?,
+    progress: row.get(8)?,
+    error: row.get(9)?,
+    retry_count: row.get(10)?,
+    policy: row.get(11)?,
+    created_at: row.get(12)?,
+    updated_at: row.get(13)?,
+  })
+}
+
+fn read_setting(conn: &rusqlite::Connection, key: &str) -> Option<String> {
+  conn
+    .query_row("SELECT value FROM app_settings WHERE key = ?1", [key], |row| row.get(0))
+    .ok()
+}
+
+fn upsert_setting(
+  conn: &rusqlite::Connection,
+  key: &str,
+  value: &str,
+  now: &str,
+) -> rusqlite::Result<()> {
+  conn.execute(
+    "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    (key, value, now),
+  )?;
+  Ok(())
+}
+
+fn normalize_baidu_path(path: &str) -> String {
+  let trimmed = path.trim();
+  if trimmed.is_empty() {
+    return "/".to_string();
+  }
+  let mut output = trimmed.replace('\\', "/");
+  output = output.trim_end_matches('/').to_string();
+  if !output.starts_with('/') {
+    output = format!("/{}", output);
+  }
+  if output.is_empty() {
+    "/".to_string()
+  } else {
+    output
+  }
+}
+
+fn join_baidu_path(base: &str, segment: &str) -> String {
+  let base = normalize_baidu_path(base);
+  let segment = segment.trim().trim_matches('/');
+  if segment.is_empty() {
+    return base;
+  }
+  format!("{}/{}", base.trim_end_matches('/'), segment)
+}
+
+fn render_filename(
+  template: Option<&str>,
+  title: &str,
+  date: &str,
+  index: Option<i64>,
+  fallback: &str,
+) -> String {
+  let raw = template.unwrap_or("").trim();
+  if raw.is_empty() {
+    return sanitize_filename(fallback);
+  }
+  let mut output = raw.to_string();
+  output = output.replace("{{ title }}", title);
+  output = output.replace("{{ date }}", date);
+  if let Some(index) = index {
+    output = output.replace("{{ index }}", &index.to_string());
+    output = output.replace("{{ part }}", &index.to_string());
+  }
+  let trimmed = output.trim();
+  if trimmed.is_empty() {
+    sanitize_filename(fallback)
+  } else {
+    sanitize_filename(trimmed)
+  }
+}
+
+fn load_room_baidu_sync_config(
+  db: &Db,
+  room_id: &str,
+) -> Result<(bool, Option<String>), String> {
+  db.with_conn(|conn| {
+    let mut stmt = conn.prepare(
+      "SELECT IFNULL(baidu_sync_enabled, 0), baidu_sync_path \
+       FROM live_room_settings WHERE room_id = ?1",
+    )?;
+    let result = stmt.query_row([room_id], |row| {
+      let enabled: i64 = row.get(0)?;
+      let path: Option<String> = row.get(1)?;
+      Ok((enabled != 0, path))
+    });
+    match result {
+      Ok(value) => Ok(value),
+      Err(rusqlite::Error::QueryReturnedNoRows) => Ok((false, None)),
+      Err(err) => Err(err),
+    }
+  })
+  .map_err(|err| err.to_string())
+}
+
+fn parse_baidu_ls_dirs(output: &str, base_path: &str) -> Vec<BaiduRemoteDir> {
+  let mut dirs = Vec::new();
+  for line in output.lines() {
+    let trimmed = strip_ansi(line).trim().to_string();
+    let trimmed = trimmed.trim();
+    if trimmed.is_empty() {
+      continue;
+    }
+    if trimmed.starts_with("当前目录") || trimmed.starts_with("----") {
+      continue;
+    }
+    if trimmed.contains("文件总数") || trimmed.contains("目录总数") || trimmed.contains("总:") {
+      continue;
+    }
+    let name = if trimmed.contains('|') {
+      let columns: Vec<&str> = trimmed
+        .split('|')
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+      if columns.is_empty() {
+        continue;
+      }
+      let last = columns[columns.len() - 1];
+      if last.contains("文件(目录)") {
+        continue;
+      }
+      if !last.ends_with('/') {
+        continue;
+      }
+      last.trim_end_matches('/').trim().to_string()
+    } else {
+      if !trimmed.ends_with('/') {
+        continue;
+      }
+      let last = extract_last_column(trimmed).unwrap_or(trimmed);
+      last.trim_end_matches('/').trim().to_string()
+    };
+    if name.is_empty() {
+      continue;
+    }
+    let path = join_baidu_path(base_path, &name);
+    dirs.push(BaiduRemoteDir {
+      name,
+      path,
+    });
+  }
+  dirs
+}
+
+fn extract_last_column(line: &str) -> Option<&str> {
+  let bytes = line.as_bytes();
+  let mut last_boundary = None;
+  let mut i = 0;
+  while i + 1 < bytes.len() {
+    if bytes[i].is_ascii_whitespace() && bytes[i + 1].is_ascii_whitespace() {
+      let mut j = i + 2;
+      while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+      }
+      last_boundary = Some(j);
+      i = j;
+    } else {
+      i += 1;
+    }
+  }
+  match last_boundary {
+    Some(idx) if idx < line.len() => Some(line[idx..].trim()),
+    _ => None,
+  }
+}
+
+fn parse_date(input: &str) -> Option<String> {
+  if let Ok(value) = DateTime::parse_from_rfc3339(input) {
+    return Some(value.format("%Y%m%d").to_string());
+  }
+  None
+}
+
+fn resolve_baidu_exec_path(custom: &str) -> PathBuf {
+  if !custom.trim().is_empty() {
+    return PathBuf::from(custom.trim());
+  }
+  resolve_baidu_pcs_path()
+}
+
+#[derive(Default)]
+struct CommandOutput {
+  stdout: String,
+  stderr: String,
+}
+
+fn run_baidu_pcs_command(exec_path: &Path, args: &[String]) -> Result<CommandOutput, String> {
+  let output = Command::new(exec_path)
+    .args(args)
+    .output()
+    .map_err(|err| format!("BaiduPCS-Go 执行失败: {}", err))?;
+  let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+  let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+  if output.status.success() {
+    if stdout.contains("文件上传失败") {
+      return Err(format!("上传失败: {}", stdout.trim()));
+    }
+    return Ok(CommandOutput { stdout, stderr });
+  }
+  Err(format!("BaiduPCS-Go 执行失败: {}", stderr.trim()))
+}
+
+fn run_baidu_pcs_upload<F>(
+  exec_path: &Path,
+  args: &[String],
+  mut on_progress: F,
+) -> Result<CommandOutput, String>
+where
+  F: FnMut(f64),
+{
+  let mut child = Command::new(exec_path)
+    .args(args)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|err| format!("BaiduPCS-Go 执行失败: {}", err))?;
+
+  let mut stdout = child
+    .stdout
+    .take()
+    .ok_or_else(|| "无法获取 BaiduPCS-Go stdout".to_string())?;
+  let mut stderr = child
+    .stderr
+    .take()
+    .ok_or_else(|| "无法获取 BaiduPCS-Go stderr".to_string())?;
+
+  let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+  std::thread::spawn(move || {
+    let mut buffer = String::new();
+    let _ = stderr.read_to_string(&mut buffer);
+    let _ = stderr_tx.send(buffer);
+  });
+
+  let mut stdout_buf = String::new();
+  let mut pending: Vec<u8> = Vec::new();
+  let mut chunk = [0u8; 4096];
+  loop {
+    let read_size = stdout
+      .read(&mut chunk)
+      .map_err(|err| format!("BaiduPCS-Go 执行失败: {}", err))?;
+    if read_size == 0 {
+      break;
+    }
+    let slice = &chunk[..read_size];
+    stdout_buf.push_str(&String::from_utf8_lossy(slice));
+    pending.extend_from_slice(slice);
+
+    loop {
+      let split_pos = pending
+        .iter()
+        .position(|value| *value == b'\n' || *value == b'\r');
+      let Some(pos) = split_pos else { break; };
+      let mut line_bytes: Vec<u8> = pending.drain(..=pos).collect();
+      while matches!(line_bytes.last(), Some(b'\n' | b'\r')) {
+        line_bytes.pop();
+      }
+      if line_bytes.is_empty() {
+        continue;
+      }
+      let line = String::from_utf8_lossy(&line_bytes);
+      if let Some(progress) = parse_progress_line(&line) {
+        on_progress(progress);
+      }
+    }
+  }
+  if !pending.is_empty() {
+    let line = String::from_utf8_lossy(&pending);
+    if let Some(progress) = parse_progress_line(&line) {
+      on_progress(progress);
+    }
+  }
+
+  let status = child
+    .wait()
+    .map_err(|err| format!("BaiduPCS-Go 执行失败: {}", err))?;
+  let stderr_output = stderr_rx.recv().unwrap_or_default();
+
+  if status.success() {
+    if stdout_buf.contains("文件上传失败") {
+      return Err(format!("上传失败: {}", stdout_buf.trim()));
+    }
+    return Ok(CommandOutput {
+      stdout: stdout_buf,
+      stderr: stderr_output,
+    });
+  }
+  Err(format!("BaiduPCS-Go 执行失败: {}", stderr_output.trim()))
+}
+
+fn parse_progress_line(line: &str) -> Option<f64> {
+  let cleaned = strip_ansi(line).replace('\r', " ").replace('\n', " ");
+  let arrow_pos = cleaned.find('↑')?;
+  let after = cleaned[arrow_pos + '↑'.len_utf8()..].trim_start();
+  let size_part = after.split_whitespace().find(|value| value.contains('/'))?;
+  let sizes: Vec<&str> = size_part.split('/').collect();
+  if sizes.len() != 2 {
+    return None;
+  }
+  let uploaded = parse_size(sizes[0])?;
+  let total = parse_size(sizes[1])?;
+  if total == 0 {
+    return None;
+  }
+  let mut percent = (uploaded as f64 / total as f64) * 100.0;
+  if percent > 99.0 {
+    percent = 99.0;
+  }
+  Some(percent)
+}
+
+fn strip_ansi(input: &str) -> String {
+  let mut output = String::with_capacity(input.len());
+  let mut chars = input.chars().peekable();
+  while let Some(ch) = chars.next() {
+    if ch == '\u{1b}' {
+      if matches!(chars.peek(), Some('[')) {
+        chars.next();
+        while let Some(value) = chars.next() {
+          if value.is_ascii_alphabetic() {
+            break;
+          }
+        }
+      }
+      continue;
+    }
+    output.push(ch);
+  }
+  output
+}
+
+fn normalize_baidu_upload_policy(value: Option<&str>) -> Option<String> {
+  match value.map(|value| value.trim()).filter(|value| !value.is_empty())? {
+    "skip" => Some("skip".to_string()),
+    "overwrite" => Some("overwrite".to_string()),
+    "rsync" => Some("rsync".to_string()),
+    _ => None,
+  }
+}
+
+fn parse_size(value: &str) -> Option<u64> {
+  let value = value.trim();
+  if value.is_empty() {
+    return None;
+  }
+  let mut digits = String::new();
+  let mut unit = String::new();
+  for ch in value.chars() {
+    if ch.is_ascii_digit() || ch == '.' {
+      digits.push(ch);
+    } else {
+      unit.push(ch);
+    }
+  }
+  let number: f64 = digits.parse().ok()?;
+  let bytes = match unit.as_str() {
+    "KB" => number * 1024.0,
+    "MB" => number * 1024.0 * 1024.0,
+    "GB" => number * 1024.0 * 1024.0 * 1024.0,
+    "TB" => number * 1024.0 * 1024.0 * 1024.0 * 1024.0,
+    "PB" => number * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
+    "B" => number,
+    _ => return None,
+  };
+  Some(bytes.round() as u64)
+}
+
+fn parse_meta_size(output: &str) -> Option<u64> {
+  for line in output.lines() {
+    if line.contains("文件大小") {
+      let parts: Vec<&str> = line.split_whitespace().collect();
+      if parts.len() >= 2 {
+        if let Ok(value) = parts[1].trim().trim_end_matches(',').parse::<u64>() {
+          return Some(value);
+        }
+      }
+    }
+  }
+  None
+}
+
+fn parse_who_output(output: &str) -> (bool, Option<String>, Option<String>) {
+  if output.contains("请先登录") || output.contains("uid: 0") {
+    return (false, None, None);
+  }
+  let uid = extract_between(output, "uid:", ",");
+  let username = extract_between(output, "用户名:", ",");
+  (uid.is_some(), uid, username)
+}
+
+fn extract_between(content: &str, start: &str, end: &str) -> Option<String> {
+  let start_index = content.find(start)?;
+  let after_start = &content[start_index + start.len()..];
+  let end_index = after_start.find(end)?;
+  let value = after_start[..end_index].trim();
+  if value.is_empty() {
+    None
+  } else {
+    Some(value.to_string())
+  }
+}

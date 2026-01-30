@@ -5,17 +5,8 @@ const platformName = process.platform === "darwin" ? "macos" : process.platform 
 const BIN_DIR = path.resolve("src-tauri/resources/bin", platformName);
 const baseNames = ["ffmpeg", "ffprobe", "aria2c"];
 const targetNames = process.platform === "win32" ? baseNames.map((name) => `${name}.exe`) : baseNames;
-const defaultSourceDir = path.resolve(
-  process.cwd(),
-  "..",
-  "biliLive-tools-master",
-  "packages",
-  "app",
-  "resources",
-  "bin",
-  platformName,
-);
-const sourceDir = process.env.BILILIVE_TOOLS_BIN_DIR || defaultSourceDir;
+const defaultSourceDir = path.resolve(process.cwd(), "bin", platformName);
+const sourceDir = process.env.BIN_SOURCE_DIR || defaultSourceDir;
 
 function ensureDir(pathname) {
   if (!fs.existsSync(pathname)) {

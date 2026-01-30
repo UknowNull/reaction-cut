@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import AnchorSection from "./sections/AnchorSection";
 import DownloadSection from "./sections/DownloadSection";
 import SubmissionSection from "./sections/SubmissionSection";
+import SubmissionSyncSection from "./sections/SubmissionSyncSection";
 import SettingsSection from "./sections/SettingsSection";
-import BiliToolsLoginSection from "./sections/BiliToolsLoginSection";
+import LoginSection from "./sections/LoginSection";
 import ToolboxSection from "./sections/ToolboxSection";
 import AboutSection from "./sections/AboutSection";
 import { invokeCommand } from "./lib/tauri";
@@ -12,6 +13,7 @@ const sections = [
   { id: "anchor", label: "主播订阅", short: "订" },
   { id: "download", label: "视频下载", short: "下" },
   { id: "submission", label: "视频投稿", short: "投" },
+  { id: "submission_sync", label: "视频同步", short: "同" },
   {
     id: "toolbox",
     label: "工具箱",
@@ -27,6 +29,7 @@ const sectionLabels = {
   anchor: "主播订阅",
   download: "视频下载",
   submission: "视频投稿",
+  submission_sync: "视频同步",
   toolbox: "工具箱",
   "toolbox.remux": "格式转码",
   settings: "设置",
@@ -38,6 +41,7 @@ function App() {
   const [expandedMenus, setExpandedMenus] = useState({ toolbox: false });
   const [authStatus, setAuthStatus] = useState({ loggedIn: false });
   const [avatarPreview, setAvatarPreview] = useState("");
+  const [baiduStatus, setBaiduStatus] = useState({ status: "LOGGED_OUT" });
 
   const activeSection = useMemo(() => active.split(".")[0], [active]);
 
@@ -64,18 +68,28 @@ function App() {
     );
   }, [authStatus]);
 
-  const refreshAuthStatus = async () => {
+  const refreshAuthStatus = useCallback(async () => {
     try {
       const data = await invokeCommand("auth_status");
       setAuthStatus(data || { loggedIn: false });
     } catch (error) {
       setAuthStatus((prev) => prev || { loggedIn: false });
     }
-  };
+  }, []);
+
+  const refreshBaiduStatus = useCallback(async () => {
+    try {
+      const data = await invokeCommand("baidu_sync_status");
+      setBaiduStatus(data || { status: "LOGGED_OUT" });
+    } catch (error) {
+      setBaiduStatus((prev) => prev || { status: "LOGGED_OUT" });
+    }
+  }, []);
 
   useEffect(() => {
     refreshAuthStatus();
-  }, []);
+    refreshBaiduStatus();
+  }, [refreshAuthStatus, refreshBaiduStatus]);
 
   useEffect(() => {
     const parent = active.split(".")[0];
@@ -116,13 +130,23 @@ function App() {
   const renderSection = () => {
     switch (activeSection) {
       case "auth":
-        return <BiliToolsLoginSection onStatusChange={setAuthStatus} initialStatus={authStatus} />;
+        return (
+          <LoginSection
+            authStatus={authStatus}
+            onAuthChange={setAuthStatus}
+            baiduStatus={baiduStatus}
+            onBaiduChange={setBaiduStatus}
+            onRefreshBaidu={refreshBaiduStatus}
+          />
+        );
       case "anchor":
         return <AnchorSection />;
       case "download":
         return <DownloadSection />;
       case "submission":
         return <SubmissionSection />;
+      case "submission_sync":
+        return <SubmissionSyncSection />;
       case "toolbox":
         return <ToolboxSection />;
       case "settings":
@@ -205,11 +229,20 @@ function App() {
               <img
                 src={avatarPreview}
                 alt="用户头像"
-                onError={() => setAvatarPreview("")}
+                onError={() => {
+                  if (!String(avatarPreview).startsWith("data:")) {
+                    setAvatarPreview("");
+                  }
+                }}
               />
             ) : (
               <span className="avatar-fallback" />
             )}
+            {baiduStatus?.status === "LOGGED_IN" ? (
+              <span className="avatar-badge" title="百度网盘已登录">
+                盘
+              </span>
+            ) : null}
           </button>
         </div>
         <div className="content-wrap">

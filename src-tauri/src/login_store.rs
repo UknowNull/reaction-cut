@@ -360,7 +360,28 @@ fn extract_expire_time(data: &Value) -> Option<DateTime<Utc>> {
     }
   }
 
+  if let Some(cookie) = extract_cookie(data) {
+    if let Some(expire) = extract_sessdata_expire(&cookie) {
+      return Some(expire);
+    }
+  }
+
   None
+}
+
+fn extract_sessdata_expire(cookie: &str) -> Option<DateTime<Utc>> {
+  let sessdata = cookie
+    .split(';')
+    .find_map(|item| item.trim().strip_prefix("SESSDATA="))?;
+  if sessdata.is_empty() {
+    return None;
+  }
+  let normalized = sessdata.replace("%2C", ",").replace("%2c", ",");
+  let mut parts = normalized.split(',');
+  let _ = parts.next()?;
+  let expires = parts.next()?;
+  let timestamp = expires.parse::<i64>().ok()?;
+  Utc.timestamp_opt(timestamp, 0).single()
 }
 
 fn extract_url_param(data: &Value, key: &str) -> Option<String> {

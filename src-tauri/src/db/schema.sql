@@ -46,7 +46,10 @@ CREATE TABLE IF NOT EXISTS submission_task (
   reject_reason TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  segment_prefix TEXT
+  segment_prefix TEXT,
+  baidu_sync_enabled INTEGER DEFAULT 0,
+  baidu_sync_path TEXT,
+  baidu_sync_filename TEXT
 );
 
 CREATE TABLE IF NOT EXISTS merged_video (
@@ -338,6 +341,7 @@ CREATE TABLE IF NOT EXISTS live_settings (
   cutting_mode INTEGER NOT NULL,
   cutting_number INTEGER NOT NULL,
   cutting_by_title INTEGER NOT NULL,
+  title_split_min_seconds INTEGER NOT NULL DEFAULT 1800,
   danmaku_transport INTEGER NOT NULL,
   record_danmaku INTEGER NOT NULL,
   record_danmaku_raw INTEGER NOT NULL,
@@ -350,6 +354,8 @@ CREATE TABLE IF NOT EXISTS live_settings (
   check_interval_sec INTEGER NOT NULL,
   flv_fix_split_on_missing INTEGER NOT NULL,
   flv_fix_disable_on_annexb INTEGER NOT NULL,
+  baidu_sync_enabled INTEGER NOT NULL DEFAULT 0,
+  baidu_sync_path TEXT,
   create_time TEXT NOT NULL,
   update_time TEXT NOT NULL
 );
@@ -357,6 +363,8 @@ CREATE TABLE IF NOT EXISTS live_settings (
 CREATE TABLE IF NOT EXISTS live_room_settings (
   room_id TEXT PRIMARY KEY,
   auto_record INTEGER NOT NULL DEFAULT 1,
+  baidu_sync_enabled INTEGER NOT NULL DEFAULT 0,
+  baidu_sync_path TEXT,
   update_time TEXT NOT NULL
 );
 
@@ -386,7 +394,54 @@ CREATE TABLE IF NOT EXISTS app_settings (
 INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES
   ('download_threads', '3', datetime('now')),
   ('download_queue_size', '10', datetime('now')),
-  ('submission_upload_concurrency', '3', datetime('now'));
+  ('submission_upload_concurrency', '3', datetime('now')),
+  ('baidu_sync_enabled', '1', datetime('now')),
+  ('baidu_sync_exec_path', '', datetime('now')),
+  ('baidu_sync_target_path', '/录播', datetime('now')),
+  ('baidu_sync_policy', 'overwrite', datetime('now')),
+  ('baidu_sync_retry', '2', datetime('now')),
+  ('baidu_sync_concurrency', '3', datetime('now'));
+
+CREATE TABLE IF NOT EXISTS baidu_login_info (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  status TEXT NOT NULL,
+  uid TEXT,
+  username TEXT,
+  login_type TEXT,
+  login_time TEXT,
+  last_check_time TEXT,
+  create_time TEXT NOT NULL,
+  update_time TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS baidu_login_credential (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  login_type TEXT NOT NULL,
+  cookie TEXT,
+  bduss TEXT,
+  stoken TEXT,
+  last_attempt_time TEXT,
+  last_attempt_error TEXT,
+  create_time TEXT NOT NULL,
+  update_time TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS baidu_sync_task (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_type TEXT NOT NULL,
+  source_id TEXT,
+  source_title TEXT,
+  local_path TEXT NOT NULL,
+  remote_dir TEXT NOT NULL,
+  remote_name TEXT NOT NULL,
+  status TEXT NOT NULL,
+  progress REAL DEFAULT 0.0,
+  error TEXT,
+  retry_count INTEGER DEFAULT 0,
+  policy TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 
 INSERT OR IGNORE INTO workflow_configurations (
   config_id,

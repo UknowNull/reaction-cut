@@ -198,6 +198,7 @@ img {
     @apply flex items-center justify-center w-10 h-10 rounded-full;
     @apply border border-[var(--split-color)];
     @apply bg-[var(--solid-button-color)] overflow-hidden;
+    @apply relative;
   }
   .avatar-btn.active {
     @apply border-[var(--primary-color)];
@@ -208,6 +209,12 @@ img {
   .avatar-fallback {
     @apply w-full h-full rounded-full;
     background-color: #cfcfcf;
+  }
+  .avatar-badge {
+    @apply absolute -right-1 -bottom-1 flex items-center justify-center;
+    @apply h-5 w-5 rounded-full text-[10px] font-semibold text-white;
+    @apply bg-[var(--primary-color)];
+    box-shadow: 0 0 0 2px var(--solid-button-color);
   }
   .content-wrap {
     @apply flex-1 min-h-0 overflow-hidden;
@@ -221,6 +228,13 @@ img {
   .panel {
     @apply rounded-lg border border-[var(--split-color)];
     @apply bg-[var(--block-color)];
+  }
+  .tab-btn {
+    @apply rounded-full px-4 py-2 text-sm font-semibold text-[var(--desc-color)];
+    @apply border border-transparent bg-transparent;
+  }
+  .tab-btn.active {
+    @apply text-[var(--primary-color)] bg-white/70 border-[var(--split-color)];
   }
   .tab {
     @apply flex flex-col items-start gap-1;

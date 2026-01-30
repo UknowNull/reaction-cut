@@ -14,6 +14,7 @@ use url::Url;
 
 use crate::api::ApiResponse;
 use crate::bilibili::client::BilibiliClient;
+use crate::login_refresh;
 use crate::login_store::AuthInfo;
 use crate::AppState;
 
@@ -229,31 +230,34 @@ pub async fn auth_status(
     Some(state.log_path.as_path()),
     &format!("cmd=auth_status ts={}", now_millis()),
   );
-  let auth_info = match state.login_store.load_auth_info(&state.db) {
-    Ok(info) => info,
-    Err(err) => {
-      return Ok(ApiResponse::error(format!("Failed to load login info: {}", err)));
-    }
-  };
-
-  let mut data = HashMap::new();
-  if let Some(info) = auth_info {
-    let mut user_info = info.data.clone();
-    if !has_basic_profile(&user_info) || needs_profile_refresh(&user_info) {
-      if let Ok(profile) = fetch_profile(&state.bilibili, &info.cookie).await {
-        let refresh_token = extract_refresh_token(&info.data);
-        let login_data = build_login_payload(&info.cookie, Some(profile), refresh_token);
-        let _ = state.login_store.save_login_info(&state.db, &login_data);
-        user_info = login_data;
-      }
-    }
-    data.insert("loggedIn".to_string(), Value::Bool(true));
-    data.insert("userInfo".to_string(), user_info);
-  } else {
-    data.insert("loggedIn".to_string(), Value::Bool(false));
+  match build_auth_status(&state).await {
+    Ok(data) => Ok(ApiResponse::success(data)),
+    Err(err) => Ok(ApiResponse::error(err)),
   }
+}
 
-  Ok(ApiResponse::success(data))
+#[tauri::command]
+pub async fn auth_refresh(
+  state: State<'_, AppState>,
+) -> Result<ApiResponse<HashMap<String, Value>>, String> {
+  append_auth_log(
+    Some(state.log_path.as_path()),
+    &format!("cmd=auth_refresh ts={}", now_millis()),
+  );
+  let refresh_result = login_refresh::refresh_cookie(
+    &state.bilibili,
+    &state.login_store,
+    &state.db,
+    &state.app_log_path,
+  )
+  .await;
+  if let Err(err) = refresh_result {
+    return Ok(ApiResponse::error(format!("刷新登录失败: {}", err)));
+  }
+  match build_auth_status(&state).await {
+    Ok(data) => Ok(ApiResponse::success(data)),
+    Err(err) => Ok(ApiResponse::error(err)),
+  }
 }
 
 #[tauri::command]
@@ -501,6 +505,37 @@ fn build_login_payload(
   Value::Object(map)
 }
 
+async fn build_auth_status(state: &AppState) -> Result<HashMap<String, Value>, String> {
+  let auth_info = match state.login_store.load_auth_info(&state.db) {
+    Ok(info) => info,
+    Err(err) => {
+      return Err(format!("Failed to load login info: {}", err));
+    }
+  };
+  let mut data = HashMap::new();
+  if let Some(info) = auth_info {
+    let mut user_info = info.data.clone();
+    if !has_basic_profile(&user_info) || needs_profile_refresh(&user_info) {
+      if let Ok(profile) = fetch_profile(&state.bilibili, &info.cookie).await {
+        let refresh_token = extract_refresh_token(&info.data);
+        let login_data = build_login_payload(&info.cookie, Some(profile), refresh_token);
+        let _ = state.login_store.save_login_info(&state.db, &login_data);
+        user_info = login_data;
+      }
+    }
+    data.insert("loggedIn".to_string(), Value::Bool(true));
+    data.insert("userInfo".to_string(), user_info);
+    if let Ok(meta) = load_login_meta(&state.db) {
+      if let Some(meta) = meta {
+        data.insert("loginMeta".to_string(), meta);
+      }
+    }
+  } else {
+    data.insert("loggedIn".to_string(), Value::Bool(false));
+  }
+  Ok(data)
+}
+
 fn parse_code(value: Option<&Value>) -> Option<i64> {
   match value {
     Some(Value::Number(number)) => number.as_i64(),
@@ -619,6 +654,26 @@ async fn fetch_profile(bilibili: &BilibiliClient, cookie: &str) -> Result<Value,
       "coins": coins,
     },
   }))
+}
+
+fn load_login_meta(db: &crate::db::Db) -> Result<Option<Value>, String> {
+  db.with_conn(|conn| {
+    let mut stmt = conn.prepare(
+      "SELECT login_time, expire_time FROM login_info ORDER BY login_time DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+      let login_time: Option<String> = row.get(0)?;
+      let expire_time: Option<String> = row.get(1)?;
+      Ok(Some(json!({
+        "loginTime": login_time,
+        "expireTime": expire_time,
+      })))
+    } else {
+      Ok(None)
+    }
+  })
+  .map_err(|err| err.to_string())
 }
 
 fn build_cookie_from_headers(headers: &HeaderMap) -> Option<String> {
