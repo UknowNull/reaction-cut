@@ -2920,12 +2920,15 @@ export default function SubmissionSection() {
                     <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
                       {(() => {
                         const reason = resolveRejectReason(task);
+                        const showTooltip = reason !== "-" && reason.trim() !== "";
                         return (
-                          <div
-                            className="max-w-[240px] truncate"
-                            title={reason !== "-" ? reason : ""}
-                          >
-                            {reason}
+                          <div className="group relative max-w-[240px]">
+                            <div className="truncate">{reason}</div>
+                            {showTooltip ? (
+                              <div className="pointer-events-none absolute left-0 top-full z-50 mt-1 w-[320px] max-w-[360px] rounded-lg border border-black/10 bg-white px-3 py-2 text-xs text-[var(--ink)] shadow-lg opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+                                <div className="whitespace-normal break-words">{reason}</div>
+                              </div>
+                            ) : null}
                           </div>
                         );
                       })()}
