@@ -779,18 +779,20 @@ fn create_retry_download_records(
   if records.is_empty() {
     return Ok(Vec::new());
   }
+  for record in records {
+    if record.download_url.trim().is_empty() {
+      return Err("下载记录缺少下载地址，无法重新下载".to_string());
+    }
+    if record.local_path.trim().is_empty() {
+      return Err("下载记录缺少本地路径，无法重新下载".to_string());
+    }
+  }
   let now = now_rfc3339();
   context
     .db
     .with_conn(|conn| {
       let mut new_ids = Vec::with_capacity(records.len());
       for record in records {
-        if record.download_url.trim().is_empty() {
-          return Err("下载记录缺少下载地址，无法重新下载".to_string());
-        }
-        if record.local_path.trim().is_empty() {
-          return Err("下载记录缺少本地路径，无法重新下载".to_string());
-        }
         conn.execute(
           "INSERT INTO video_download (bvid, aid, title, part_title, part_count, current_part, download_url, local_path, status, progress, progress_total, progress_done, create_time, update_time, resolution, codec, format, cid, content) \
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
@@ -2156,23 +2158,57 @@ fn load_tasks(
         conn.query_row("SELECT COUNT(*) FROM submission_task", [], |row| row.get(0))?
       };
       let offset = (page - 1).saturating_mul(page_size);
+      let order_by = "ORDER BY \
+        CASE \
+          WHEN st.status <> 'COMPLETED' THEN 0 \
+          WHEN st.status = 'COMPLETED' AND (wi.status IS NULL OR wi.status <> 'COMPLETED') THEN 1 \
+          WHEN st.status = 'COMPLETED' AND wi.status = 'COMPLETED' \
+               AND (st.remote_state IS NULL OR st.remote_state = -30 OR st.remote_state IN (-2, -4)) THEN 2 \
+          ELSE 3 \
+        END, \
+        CASE \
+          WHEN st.status = 'COMPLETED' AND (wi.status IS NULL OR wi.status <> 'COMPLETED') THEN \
+            CASE wi.current_step \
+              WHEN 'CLIPPING' THEN 0 \
+              WHEN 'MERGING' THEN 1 \
+              WHEN 'SEGMENTING' THEN 2 \
+              ELSE 9 \
+            END \
+          ELSE 9 \
+        END, \
+        CASE \
+          WHEN st.status = 'COMPLETED' AND wi.status = 'COMPLETED' THEN \
+            CASE \
+              WHEN st.remote_state IS NULL OR st.remote_state = -30 THEN 0 \
+              WHEN st.remote_state IN (-2, -4) THEN 1 \
+              ELSE 2 \
+            END \
+          ELSE 9 \
+        END, \
+        st.created_at DESC";
       let sql = if status.is_some() {
-        "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
-                CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                wi.status, wi.current_step, wi.progress \
-         FROM submission_task st \
-         LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
-         WHERE st.status = ?1 ORDER BY st.created_at DESC LIMIT ?2 OFFSET ?3"
+        format!(
+          "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
+                  wi.status, wi.current_step, wi.progress \
+           FROM submission_task st \
+           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           WHERE st.status = ?1 {} LIMIT ?2 OFFSET ?3",
+          order_by
+        )
       } else {
-        "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
-                CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                wi.status, wi.current_step, wi.progress \
-         FROM submission_task st \
-         LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
-         ORDER BY st.created_at DESC LIMIT ?1 OFFSET ?2"
+        format!(
+          "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+                  CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
+                  wi.status, wi.current_step, wi.progress \
+           FROM submission_task st \
+           LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
+           {} LIMIT ?1 OFFSET ?2",
+          order_by
+        )
       };
 
-      let mut stmt = conn.prepare(sql)?;
+      let mut stmt = conn.prepare(&sql)?;
       let rows = if let Some(status) = status {
         stmt.query_map((status, page_size, offset), map_submission_task)?
       } else {

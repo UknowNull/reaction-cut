@@ -2918,7 +2918,17 @@ export default function SubmissionSection() {
                       </span>
                     </td>
                     <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
-                      {resolveRejectReason(task)}
+                      {(() => {
+                        const reason = resolveRejectReason(task);
+                        return (
+                          <div
+                            className="max-w-[240px] truncate"
+                            title={reason !== "-" ? reason : ""}
+                          >
+                            {reason}
+                          </div>
+                        );
+                      })()}
                     </td>
                     <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
                       {formatDateTime(task.createdAt)}

@@ -172,6 +172,14 @@ struct PendingDownloadRecord {
   progress: i64,
 }
 
+#[derive(Clone)]
+struct DownloadTaskCreateResult {
+  id: i64,
+  cid: i64,
+  expected_path: String,
+  actual_path: String,
+}
+
 #[tauri::command]
 pub async fn download_video(
   state: State<'_, AppState>,
@@ -734,18 +742,40 @@ async fn handle_integration_download(
     return ApiResponse::error("Missing download requests".to_string());
   }
 
-  let mut download_ids = Vec::new();
+  let mut download_results = Vec::new();
   for download_request in download_requests {
     match create_download_tasks(context.clone(), download_request).await {
-      Ok(task_ids) => download_ids.extend(task_ids),
+      Ok(task_results) => download_results.extend(task_results),
       Err(err) => return ApiResponse::error(err),
     }
   }
 
+  let download_ids: Vec<i64> = download_results.iter().map(|record| record.id).collect();
   let submission_id = uuid::Uuid::new_v4().to_string();
   let now = now_rfc3339();
-  let submission = request.submission_request;
+  let mut submission = request.submission_request;
   let workflow_config = request.workflow_config.clone();
+  if !download_results.is_empty() {
+    let mut path_by_cid: HashMap<i64, String> = HashMap::new();
+    let mut path_by_expected: HashMap<String, String> = HashMap::new();
+    for record in &download_results {
+      path_by_cid.insert(record.cid, record.actual_path.clone());
+      if record.expected_path != record.actual_path {
+        path_by_expected.insert(record.expected_path.clone(), record.actual_path.clone());
+      }
+    }
+    for part in submission.video_parts.iter_mut() {
+      if let Some(cid) = part.cid {
+        if let Some(actual_path) = path_by_cid.get(&cid) {
+          part.file_path = actual_path.clone();
+          continue;
+        }
+      }
+      if let Some(actual_path) = path_by_expected.get(&part.file_path) {
+        part.file_path = actual_path.clone();
+      }
+    }
+  }
 
   let insert_result = context.db.with_conn(|conn| {
     conn.execute(
@@ -840,17 +870,17 @@ async fn create_download_task(
   context: DownloadContext,
   request: DownloadRequest,
 ) -> Result<i64, String> {
-  let record_ids = create_download_tasks(context, request).await?;
-  record_ids
+  let records = create_download_tasks(context, request).await?;
+  records
     .first()
-    .cloned()
+    .map(|record| record.id)
     .ok_or_else(|| "No download task created".to_string())
 }
 
 async fn create_download_tasks(
   context: DownloadContext,
   request: DownloadRequest,
-) -> Result<Vec<i64>, String> {
+) -> Result<Vec<DownloadTaskCreateResult>, String> {
   let (bvid, aid) = parse_video_id(&request.video_url);
   let video_title = fetch_video_title(&context, bvid.as_deref(), aid.as_deref()).await;
 
@@ -883,6 +913,9 @@ async fn create_download_tasks(
   for (index, part) in parts.iter().enumerate() {
     let file_name = format!("{}.mp4", sanitize_filename(&part.title));
     let output_path = build_output_path(&base_dir, &sanitized_folder, &file_name);
+    let expected_path = output_path.to_string_lossy().to_string();
+    let output_path = resolve_unique_output_path(&context, output_path)?;
+    let actual_path = output_path.to_string_lossy().to_string();
 
     let record_id = context
       .db
@@ -898,7 +931,7 @@ async fn create_download_tasks(
             part_count,
             (index + 1) as i64,
             request.video_url.as_str(),
-            output_path.to_string_lossy().to_string(),
+            actual_path.as_str(),
             &now,
             &now,
             request.config.resolution.as_deref(),
@@ -912,7 +945,12 @@ async fn create_download_tasks(
       })
       .map_err(|err| format!("Failed to save download record: {}", err))?;
 
-    record_ids.push(record_id);
+    record_ids.push(DownloadTaskCreateResult {
+      id: record_id,
+      cid: part.cid,
+      expected_path,
+      actual_path,
+    });
 
   }
 
@@ -921,6 +959,64 @@ async fn create_download_tasks(
   }
   schedule_pending_downloads(context.clone()).await;
   Ok(record_ids)
+}
+
+fn resolve_unique_output_path(
+  context: &DownloadContext,
+  output_path: PathBuf,
+) -> Result<PathBuf, String> {
+  if !download_path_conflict(context, &output_path)? {
+    return Ok(output_path);
+  }
+  let parent = output_path
+    .parent()
+    .ok_or_else(|| "Missing output directory".to_string())?;
+  let stem = output_path
+    .file_stem()
+    .and_then(|value| value.to_str())
+    .ok_or_else(|| "Missing output file name".to_string())?;
+  let ext = output_path.extension().and_then(|value| value.to_str());
+  for index in 1..=999 {
+    let file_name = match ext {
+      Some(ext) if !ext.is_empty() => format!("{} ({}).{}", stem, index, ext),
+      _ => format!("{} ({})", stem, index),
+    };
+    let candidate = parent.join(file_name);
+    if !download_path_conflict(context, &candidate)? {
+      return Ok(candidate);
+    }
+  }
+  Err("下载路径冲突过多，无法生成新的文件名".to_string())
+}
+
+fn download_path_conflict(
+  context: &DownloadContext,
+  output_path: &Path,
+) -> Result<bool, String> {
+  let path_value = output_path.to_string_lossy().to_string();
+  let exists_in_db = context
+    .db
+    .with_conn(|conn| {
+      let mut stmt =
+        conn.prepare("SELECT 1 FROM video_download WHERE local_path = ?1 LIMIT 1")?;
+      let mut rows = stmt.query([&path_value])?;
+      Ok(rows.next()?.is_some())
+    })
+    .map_err(|err| format!("Failed to check download record: {}", err))?;
+  if exists_in_db {
+    return Ok(true);
+  }
+  if output_path.exists() {
+    return Ok(true);
+  }
+  if output_path.with_extension("video").exists() {
+    return Ok(true);
+  }
+  if output_path.with_extension("audio").exists() {
+    return Ok(true);
+  }
+  let aria2_path = PathBuf::from(format!("{}.aria2", output_path.to_string_lossy()));
+  Ok(aria2_path.exists())
 }
 
 async fn schedule_pending_downloads(context: DownloadContext) {
