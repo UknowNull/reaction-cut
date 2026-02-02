@@ -6,6 +6,7 @@ export default function SettingsSection() {
   const [threads, setThreads] = useState(3);
   const [queueSize, setQueueSize] = useState(10);
   const [downloadPath, setDownloadPath] = useState("");
+  const [logDir, setLogDir] = useState("");
   const [uploadConcurrency, setUploadConcurrency] = useState(3);
   const [submissionRemoteRefreshMinutes, setSubmissionRemoteRefreshMinutes] = useState(10);
   const [blockPcdn, setBlockPcdn] = useState(true);
@@ -59,6 +60,7 @@ export default function SettingsSection() {
         setThreads(data.threads);
         setQueueSize(data.queueSize);
         setDownloadPath(data.downloadPath || "");
+        setLogDir(data.logDir || "");
         const concurrency = Math.min(
           5,
           Math.max(1, Number(data.uploadConcurrency || 3)),
@@ -167,6 +169,21 @@ export default function SettingsSection() {
     }
   };
 
+  const handlePickLogDir = async () => {
+    setMessage("");
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+      });
+      if (typeof selected === "string") {
+        setLogDir(selected);
+      }
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
   const handleSave = async () => {
     setMessage("");
     try {
@@ -184,13 +201,14 @@ export default function SettingsSection() {
       );
       const normalizedAria2cSplit = Math.min(32, Math.max(1, Number(aria2cSplit) || 1));
       await logClient(
-        `settings_save:start path=${downloadPath} threads=${String(threads)} queue=${String(queueSize)} uploadConcurrency=${String(normalizedUploadConcurrency)} remoteRefreshMinutes=${String(normalizedRefreshMinutes)} blockPcdn=${String(blockPcdn)} aria2cConnections=${String(normalizedAria2cConnections)} aria2cSplit=${String(normalizedAria2cSplit)}`,
+        `settings_save:start path=${downloadPath} logDir=${logDir} threads=${String(threads)} queue=${String(queueSize)} uploadConcurrency=${String(normalizedUploadConcurrency)} remoteRefreshMinutes=${String(normalizedRefreshMinutes)} blockPcdn=${String(blockPcdn)} aria2cConnections=${String(normalizedAria2cConnections)} aria2cSplit=${String(normalizedAria2cSplit)}`,
       );
       await logClient("settings_save:invoke_start");
       const data = await invokeCommand("update_download_settings", {
         threads: Number(threads),
         queueSize: Number(queueSize),
         downloadPath: downloadPath,
+        logDir: logDir,
         uploadConcurrency: normalizedUploadConcurrency,
         submissionRemoteRefreshMinutes: normalizedRefreshMinutes,
         blockPcdn: Boolean(blockPcdn),
@@ -203,6 +221,7 @@ export default function SettingsSection() {
         setThreads(data.threads);
         setQueueSize(data.queueSize);
         setDownloadPath(data.downloadPath || "");
+        setLogDir(data.logDir || "");
         setUploadConcurrency(Number(data.uploadConcurrency || 3));
         setSubmissionRemoteRefreshMinutes(
           Math.max(1, Number(data.submissionRemoteRefreshMinutes || 10)),
@@ -214,7 +233,7 @@ export default function SettingsSection() {
         setAria2cSplit(Math.min(32, Math.max(1, Number(data.aria2cSplit || 4))));
         await logClient(`settings_save:ok:${data.downloadPath || ""}`);
       }
-      setMessage("设置已保存");
+      setMessage("设置已保存，日志目录需重启生效");
     } catch (error) {
       await logClient(`settings_save:error:${error?.message || "unknown"}`);
       setMessage(error.message);
@@ -363,6 +382,28 @@ export default function SettingsSection() {
             <button
               className="mt-2 rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20"
               onClick={handlePickDownloadPath}
+              type="button"
+            >
+              选择路径
+            </button>
+          </div>
+          <div className="lg:col-span-2">
+            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              日志目录
+            </div>
+            <input
+              type="text"
+              value={logDir}
+              onChange={(event) => setLogDir(event.target.value)}
+              className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+              placeholder="默认 下载路径/log"
+            />
+            <div className="mt-2 text-xs text-[var(--muted)]">
+              修改后需重启生效
+            </div>
+            <button
+              className="mt-2 rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20"
+              onClick={handlePickLogDir}
               type="button"
             >
               选择路径

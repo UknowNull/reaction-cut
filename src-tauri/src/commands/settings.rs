@@ -17,6 +17,7 @@ pub const DEFAULT_BLOCK_PCDN: bool = true;
 pub const DEFAULT_ENABLE_ARIA2C: bool = true;
 pub const DEFAULT_ARIA2C_CONNECTIONS: i64 = 4;
 pub const DEFAULT_ARIA2C_SPLIT: i64 = 4;
+pub const LOG_DIR_SETTING_KEY: &str = "log_dir";
 pub const LEGACY_LIVE_FILE_TEMPLATE: &str =
   "live/{{ roomId }}/录制-{{ roomId }}-{{ now }}-{{ title }}.flv";
 pub const LEGACY_LIVE_FILE_TEMPLATE_DATE: &str =
@@ -30,6 +31,7 @@ pub struct DownloadSettings {
   pub threads: i64,
   pub queue_size: i64,
   pub download_path: String,
+  pub log_dir: String,
   pub upload_concurrency: i64,
   pub submission_remote_refresh_minutes: i64,
   pub block_pcdn: bool,
@@ -89,6 +91,7 @@ pub fn update_download_settings(
   threads: i64,
   queue_size: i64,
   download_path: String,
+  log_dir: String,
   upload_concurrency: i64,
   submission_remote_refresh_minutes: i64,
   block_pcdn: bool,
@@ -113,6 +116,14 @@ pub fn update_download_settings(
   } else {
     download_path.trim().to_string()
   };
+  let normalized_log_dir = if log_dir.trim().is_empty() {
+    std::path::PathBuf::from(&normalized_path)
+      .join("log")
+      .to_string_lossy()
+      .to_string()
+  } else {
+    log_dir.trim().to_string()
+  };
   let normalized_aria2c_connections = aria2c_connections.clamp(1, 32);
   let normalized_aria2c_split = aria2c_split.clamp(1, 32);
 
@@ -133,6 +144,11 @@ pub fn update_download_settings(
       "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
       ("download_path", &normalized_path, &now),
+    )?;
+    conn.execute(
+      "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+      (LOG_DIR_SETTING_KEY, &normalized_log_dir, &now),
     )?;
     conn.execute(
       "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
@@ -187,6 +203,7 @@ pub fn update_download_settings(
     threads,
     queue_size,
     download_path: normalized_path,
+    log_dir: normalized_log_dir,
     upload_concurrency,
     submission_remote_refresh_minutes,
     block_pcdn,
@@ -336,7 +353,23 @@ pub fn load_download_settings_from_db(db: &Db) -> Result<DownloadSettings, crate
         |row| row.get(0),
       )
       .ok();
+    let log_dir: Option<String> = conn
+      .query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        [LOG_DIR_SETTING_KEY],
+        |row| row.get(0),
+      )
+      .ok();
     let enable_aria2c = true;
+
+    let resolved_download_path = download_path
+      .unwrap_or_else(|| default_download_dir().to_string_lossy().to_string());
+    let resolved_log_dir = log_dir.unwrap_or_else(|| {
+      std::path::PathBuf::from(&resolved_download_path)
+        .join("log")
+        .to_string_lossy()
+        .to_string()
+    });
 
     Ok(DownloadSettings {
       threads: threads
@@ -345,8 +378,8 @@ pub fn load_download_settings_from_db(db: &Db) -> Result<DownloadSettings, crate
       queue_size: queue_size
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(DEFAULT_QUEUE_SIZE),
-      download_path: download_path
-        .unwrap_or_else(|| default_download_dir().to_string_lossy().to_string()),
+      download_path: resolved_download_path,
+      log_dir: resolved_log_dir,
       upload_concurrency: upload_concurrency
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(DEFAULT_UPLOAD_CONCURRENCY)
@@ -369,6 +402,38 @@ pub fn load_download_settings_from_db(db: &Db) -> Result<DownloadSettings, crate
         .clamp(1, 32),
     })
   })
+}
+
+pub fn ensure_log_dir(db: &Db, download_dir: &std::path::Path) -> String {
+  let fallback_value = download_dir.join("log").to_string_lossy().to_string();
+  let (current, needs_update) = db
+    .with_conn(|conn| {
+      let value: Option<String> = conn
+        .query_row(
+          "SELECT value FROM app_settings WHERE key = ?1",
+          [LOG_DIR_SETTING_KEY],
+          |row| row.get(0),
+        )
+        .ok();
+      let value = value.filter(|item| !item.trim().is_empty());
+      let needs_update = value.is_none();
+      Ok((value, needs_update))
+    })
+    .unwrap_or((None, true));
+  let resolved = current.unwrap_or_else(|| fallback_value.clone());
+  if needs_update {
+    let now = Utc::now().to_rfc3339();
+    let _ = db.with_conn(|conn| {
+      conn.execute(
+        "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (LOG_DIR_SETTING_KEY, &resolved, &now),
+      )?;
+      Ok(())
+    });
+  }
+  let _ = std::fs::create_dir_all(&resolved);
+  resolved
 }
 
 pub fn load_live_settings_from_db(db: &Db) -> Result<LiveSettings, crate::db::DbError> {

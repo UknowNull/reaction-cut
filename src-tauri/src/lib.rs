@@ -82,9 +82,14 @@ pub fn run() {
             let db_path = app_dir.join("reaction-cut-rust.sqlite3");
             let db = Arc::new(db::Db::new(db_path)?);
             let login_path = app_dir.join("bilibili_login_info.json");
-            let log_path = app_dir.join("auth_debug.log");
-            let app_log_path = app_dir.join("app_debug.log");
-            let panic_log_path = app_dir.join("panic_debug.log");
+            let download_dir = commands::settings::load_download_settings_from_db(&db)
+                .map(|settings| settings.download_path)
+                .unwrap_or_else(|_| config::default_download_dir().to_string_lossy().to_string());
+            let log_dir = commands::settings::ensure_log_dir(&db, std::path::Path::new(&download_dir));
+            let log_dir = std::path::PathBuf::from(log_dir);
+            let log_path = log_dir.join("auth_debug.log");
+            let app_log_path = log_dir.join("app_debug.log");
+            let panic_log_path = log_dir.join("panic_debug.log");
             utils::append_log(&app_log_path, "app_start");
             if let Some(resource_dir) = config::resolve_resource_bin_dir(&app.handle()) {
                 utils::append_log(
