@@ -1570,6 +1570,7 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
       source.clone(),
       "-c".to_string(),
       "copy".to_string(),
+      "-shortest".to_string(),
       target.clone(),
     ];
     let result = tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&args))

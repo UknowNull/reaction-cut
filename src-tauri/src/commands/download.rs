@@ -857,11 +857,16 @@ async fn handle_integration_download(
   });
 
   match relation_result {
-    Ok(()) => ApiResponse::success(json!({
-      "downloadTaskIds": download_ids,
-      "submissionTaskId": submission_id,
-      "workflowInstanceId": workflow_instance_id,
-    })),
+    Ok(()) => {
+      for record_id in &download_ids {
+        let _ = refresh_integration_status(&context, *record_id).await;
+      }
+      ApiResponse::success(json!({
+        "downloadTaskIds": download_ids,
+        "submissionTaskId": submission_id,
+        "workflowInstanceId": workflow_instance_id,
+      }))
+    }
     Err(err) => ApiResponse::error(format!("Failed to create submission task: {}", err)),
   }
 }
@@ -914,6 +919,27 @@ async fn create_download_tasks(
     let file_name = format!("{}.mp4", sanitize_filename(&part.title));
     let output_path = build_output_path(&base_dir, &sanitized_folder, &file_name);
     let expected_path = output_path.to_string_lossy().to_string();
+
+    if let Some((record_id, actual_path, status)) = find_reusable_download_record(
+      &context,
+      Some(part.cid),
+      request.video_url.as_str(),
+      part.title.as_str(),
+    )? {
+      let actual_path_buf = PathBuf::from(&actual_path);
+      let has_file = actual_path_buf.is_file();
+      let can_reuse = status == 0 || status == 1 || status == 3 || status == 4;
+      if can_reuse || (status == 2 && has_file) {
+        record_ids.push(DownloadTaskCreateResult {
+          id: record_id,
+          cid: part.cid,
+          expected_path,
+          actual_path,
+        });
+        continue;
+      }
+    }
+
     let output_path = resolve_unique_output_path(&context, output_path)?;
     let actual_path = output_path.to_string_lossy().to_string();
 
@@ -959,6 +985,48 @@ async fn create_download_tasks(
   }
   schedule_pending_downloads(context.clone()).await;
   Ok(record_ids)
+}
+
+fn find_reusable_download_record(
+  context: &DownloadContext,
+  cid: Option<i64>,
+  download_url: &str,
+  part_title: &str,
+) -> Result<Option<(i64, String, i64)>, String> {
+  context
+    .db
+    .with_conn(|conn| {
+      let mut candidates: Vec<(i64, String, i64)> = Vec::new();
+      if let Some(cid) = cid {
+        let mut stmt = conn.prepare(
+          "SELECT id, local_path, status FROM video_download WHERE cid = ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([cid], |row| {
+          Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        for row in rows {
+          candidates.push(row?);
+        }
+      } else {
+        let mut stmt = conn.prepare(
+          "SELECT id, local_path, status FROM video_download WHERE download_url = ?1 AND part_title = ?2 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([download_url, part_title], |row| {
+          Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        for row in rows {
+          candidates.push(row?);
+        }
+      }
+
+      for (id, local_path, status) in candidates {
+        if Path::new(&local_path).is_file() {
+          return Ok(Some((id, local_path, status)));
+        }
+      }
+      Ok(None)
+    })
+    .map_err(|err| format!("Failed to check reusable download record: {}", err))
 }
 
 fn resolve_unique_output_path(
@@ -3625,10 +3693,10 @@ async fn refresh_integration_status(
 
   if failed > 0 {
     let current_status = load_submission_status(context, &submission_task_id).unwrap_or_default();
-    if current_status != "FAILED" && current_status != "COMPLETED" {
-      let _ = update_submission_status(context, &submission_task_id, "FAILED");
+    if current_status != "COMPLETED" {
+      let _ = update_submission_status(context, &submission_task_id, "PENDING");
     }
-    let _ = update_relation_workflow_status(context, &submission_task_id, "DOWNLOAD_FAILED");
+    let _ = update_relation_workflow_status(context, &submission_task_id, "PENDING_DOWNLOAD");
     return Ok(());
   }
 
