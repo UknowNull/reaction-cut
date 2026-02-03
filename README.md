@@ -92,19 +92,19 @@ pnpm tauri build --bundles dmg
 
 ### 主播订阅
 
-![image-20260203150555830](/Users/tbw/Library/Application Support/typora-user-images/image-20260203150555830.png)
+![image-20260203150555830](.github/live.png)
 
 ### 视频下载
 
-![image-20260203150717083](/Users/tbw/Library/Application Support/typora-user-images/image-20260203150717083.png)
+![image-20260203150717083](.github/download.png)
 
 ### 视频投稿
 
-![image-20260203150730791](/Users/tbw/Library/Application Support/typora-user-images/image-20260203150730791.png)
+![image-20260203150730791](.github/publish.png)
 
 ### 百度网盘登录
 
-![image-20260203150804766](/Users/tbw/Library/Application Support/typora-user-images/image-20260203150804766.png)
+![image-20260203150804766](.github/pan_login.png)
 
 ## 贡献
 
