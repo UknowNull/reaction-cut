@@ -9,6 +9,7 @@ use chrono::Utc;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 use reqwest::{Client, StatusCode};
+use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
@@ -128,6 +129,9 @@ pub struct SubmissionTaskInput {
   pub partition_id: i64,
   pub collection_id: Option<i64>,
   pub tags: Option<String>,
+  pub topic_id: Option<i64>,
+  pub mission_id: Option<i64>,
+  pub activity_title: Option<String>,
   pub video_type: String,
   pub segment_prefix: Option<String>,
   pub baidu_sync_enabled: Option<bool>,
@@ -168,6 +172,8 @@ pub struct SubmissionUpdateRequest {
 pub struct SubmissionResegmentRequest {
   pub task_id: String,
   pub segment_duration_seconds: i64,
+  pub mode: Option<String>,
+  pub merged_video_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -175,9 +181,29 @@ pub struct SubmissionResegmentRequest {
 pub struct SubmissionRepostRequest {
   pub task_id: String,
   pub integrate_current_bvid: bool,
+  pub mode: Option<String>,
+  pub merged_video_id: Option<i64>,
   pub baidu_sync_enabled: Option<bool>,
   pub baidu_sync_path: Option<String>,
   pub baidu_sync_filename: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ReprocessMode {
+  Legacy,
+  Specified,
+  MergeAll,
+  FullReprocess,
+}
+
+fn parse_reprocess_mode(mode: Option<&str>) -> ReprocessMode {
+  let normalized = mode.unwrap_or("").trim().to_ascii_uppercase();
+  match normalized.as_str() {
+    "SPECIFIED" => ReprocessMode::Specified,
+    "MERGE_ALL" => ReprocessMode::MergeAll,
+    "FULL_REPROCESS" => ReprocessMode::FullReprocess,
+    _ => ReprocessMode::Legacy,
+  }
 }
 
 #[derive(Deserialize)]
@@ -188,6 +214,9 @@ pub struct SubmissionEditTaskInput {
   pub partition_id: i64,
   pub collection_id: Option<i64>,
   pub tags: Option<String>,
+  pub topic_id: Option<i64>,
+  pub mission_id: Option<i64>,
+  pub activity_title: Option<String>,
   pub video_type: String,
   pub segment_prefix: Option<String>,
 }
@@ -267,6 +296,9 @@ pub struct SubmissionTaskRecord {
   pub cover_url: Option<String>,
   pub partition_id: i64,
   pub tags: Option<String>,
+  pub topic_id: Option<i64>,
+  pub mission_id: Option<i64>,
+  pub activity_title: Option<String>,
   pub video_type: String,
   pub collection_id: Option<i64>,
   pub bvid: Option<String>,
@@ -308,6 +340,7 @@ pub struct TaskSourceVideoRecord {
 pub struct TaskOutputSegmentRecord {
   pub segment_id: String,
   pub task_id: String,
+  pub merged_id: Option<i64>,
   pub part_name: String,
   pub segment_file_path: String,
   pub part_order: i64,
@@ -452,15 +485,18 @@ pub async fn submission_create(
 
   let result = context.db.with_conn(|conn| {
     conn.execute(
-      "INSERT INTO submission_task (task_id, status, title, description, cover_url, partition_id, tags, video_type, collection_id, bvid, aid, created_at, updated_at, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
-       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11, ?12, ?13, ?14)",
-      (
+      "INSERT INTO submission_task (task_id, status, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
+       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?13, ?14, ?15, ?16, ?17)",
+      params![
         &task_id,
         &request.task.title,
         request.task.description.as_deref(),
         request.task.cover_url.as_deref(),
         request.task.partition_id,
         request.task.tags.as_deref(),
+        request.task.topic_id,
+        request.task.mission_id,
+        request.task.activity_title.as_deref(),
         &request.task.video_type,
         request.task.collection_id,
         &now,
@@ -473,7 +509,7 @@ pub async fn submission_create(
         },
         request.task.baidu_sync_path.as_deref(),
         request.task.baidu_sync_filename.as_deref(),
-      ),
+      ],
     )?;
 
     for source in &request.source_videos {
@@ -607,8 +643,564 @@ pub async fn submission_repost(
     Ok(detail) => detail,
     Err(err) => return Ok(ApiResponse::error(err)),
   };
-  if detail.task.status == "UPLOADING" {
-    return Ok(ApiResponse::error("任务正在投稿中，请稍后再试"));
+  let mode = parse_reprocess_mode(request.mode.as_deref());
+  if mode == ReprocessMode::FullReprocess {
+    let workflow_config = match detail.workflow_config {
+      Some(config) => config,
+      None => return Ok(ApiResponse::error("未找到工作流配置")),
+    };
+    let workflow_config = strip_update_sources(&workflow_config);
+    let integrate_current_bvid = request.integrate_current_bvid;
+    if integrate_current_bvid {
+      let has_bvid = detail
+        .task
+        .bvid
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+      if !has_bvid {
+        return Ok(ApiResponse::error("当前任务没有BV号，无法集成投稿"));
+      }
+    }
+    if let Err(err) = update_baidu_sync_config(
+      &context,
+      &task_id,
+      request.baidu_sync_enabled,
+      normalize_optional_text(request.baidu_sync_path),
+      normalize_optional_text(request.baidu_sync_filename),
+    ) {
+      return Ok(ApiResponse::error(format!("更新百度同步配置失败: {}", err)));
+    }
+    append_log(
+      &state.app_log_path,
+      &format!(
+        "submission_repost_start task_id={} mode=FULL_REPROCESS type={}",
+        task_id,
+        if integrate_current_bvid { "UPDATE" } else { "NEW" }
+      ),
+    );
+    let missing_sources = collect_missing_source_files(&detail.source_videos);
+    if !missing_sources.is_empty() {
+      append_log(
+        &state.app_log_path,
+        &format!(
+          "submission_repost_missing_sources task_id={} count={}",
+          task_id,
+          missing_sources.len()
+        ),
+      );
+      for path in &missing_sources {
+        append_log(
+          &state.app_log_path,
+          &format!("submission_repost_missing_source task_id={} path={}", task_id, path),
+        );
+      }
+      let integrated_records = load_integrated_download_records(&context, &task_id)?;
+      if integrated_records.is_empty() {
+        return Ok(ApiResponse::error("源视频不存在，请先下载"));
+      }
+      let mut records_by_path: HashMap<String, IntegratedDownloadRecord> = HashMap::new();
+      for record in integrated_records {
+        if !record.local_path.trim().is_empty() {
+          records_by_path.insert(record.local_path.clone(), record);
+        }
+      }
+      let mut missing_records = Vec::new();
+      let mut missing_without_download = Vec::new();
+      for path in &missing_sources {
+        if let Some(record) = records_by_path.get(path) {
+          missing_records.push(record.clone());
+        } else {
+          missing_without_download.push(path.clone());
+        }
+      }
+      if !missing_without_download.is_empty() {
+        append_log(
+          &state.app_log_path,
+          &format!(
+            "submission_repost_missing_unbound task_id={} count={}",
+            task_id,
+            missing_without_download.len()
+          ),
+        );
+        return Ok(ApiResponse::error("源视频不存在，请先下载"));
+      }
+      let workflow_instance_id = reset_submission_for_repost(
+        &context,
+        &state.app_log_path,
+        &task_id,
+        &workflow_config,
+        if integrate_current_bvid { "VIDEO_UPDATE" } else { "VIDEO_SUBMISSION" },
+        !integrate_current_bvid,
+        true,
+      )?;
+      let new_download_ids =
+        create_retry_download_records(&context, &task_id, &workflow_instance_id, &missing_records)?;
+      crate::commands::download::requeue_integrated_downloads(&state, &new_download_ids).await?;
+      return Ok(ApiResponse::success(
+        "源视频缺失，已创建下载任务，下载完成后自动重新投稿".to_string(),
+      ));
+    }
+    let _ = reset_submission_for_repost(
+      &context,
+      &state.app_log_path,
+      &task_id,
+      &workflow_config,
+      if integrate_current_bvid { "VIDEO_UPDATE" } else { "VIDEO_SUBMISSION" },
+      !integrate_current_bvid,
+      true,
+    )?;
+    start_submission_workflow(
+      context.db.clone(),
+      context.app_log_path.clone(),
+      context.edit_upload_state.clone(),
+      task_id,
+    );
+    return Ok(ApiResponse::success("全部重新投稿已启动".to_string()));
+  }
+  if mode != ReprocessMode::Legacy {
+    let workflow_config = match detail.workflow_config {
+      Some(config) => config,
+      None => return Ok(ApiResponse::error("未找到工作流配置")),
+    };
+    let integrate_current_bvid = request.integrate_current_bvid;
+    if integrate_current_bvid {
+      let has_bvid = detail
+        .task
+        .bvid
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+      if !has_bvid {
+        return Ok(ApiResponse::error("当前任务没有BV号，无法集成投稿"));
+      }
+    }
+    if let Err(err) = update_baidu_sync_config(
+      &context,
+      &task_id,
+      request.baidu_sync_enabled,
+      normalize_optional_text(request.baidu_sync_path),
+      normalize_optional_text(request.baidu_sync_filename),
+    ) {
+      return Ok(ApiResponse::error(format!("更新百度同步配置失败: {}", err)));
+    }
+    append_log(
+      &state.app_log_path,
+      &format!(
+        "submission_repost_start task_id={} mode={} type={}",
+        task_id,
+        if mode == ReprocessMode::MergeAll { "MERGE_ALL" } else { "SPECIFIED" },
+        if integrate_current_bvid { "UPDATE" } else { "NEW" }
+      ),
+    );
+    if let Err(err) = clear_edit_upload_segments_by_task(&context, &task_id) {
+      append_log(
+        &state.app_log_path,
+        &format!(
+          "submission_repost_clear_cache_fail task_id={} err={}",
+          task_id, err
+        ),
+      );
+    }
+    if let Err(err) = reset_workflow_instances(&context, &task_id) {
+      return Ok(ApiResponse::error(format!("重置工作流失败: {}", err)));
+    }
+    let workflow_type = if integrate_current_bvid { "VIDEO_UPDATE" } else { "VIDEO_SUBMISSION" };
+    let (instance_id, _) =
+      match create_workflow_instance_for_task_with_type(
+        context.db.as_ref(),
+        &task_id,
+        &workflow_config,
+        workflow_type,
+      ) {
+        Ok(value) => value,
+        Err(err) => return Ok(ApiResponse::error(format!("创建工作流失败: {}", err))),
+      };
+    let now = now_rfc3339();
+    let update_result = context.db.with_conn(|conn| {
+      if integrate_current_bvid {
+        conn.execute(
+          "UPDATE submission_task SET status = 'SEGMENTING', remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+          (&now, &task_id),
+        )?;
+      } else {
+        conn.execute(
+          "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+          (&now, &task_id),
+        )?;
+      }
+      Ok(())
+    });
+    if let Err(err) = update_result {
+      return Ok(ApiResponse::error(format!("重置任务状态失败: {}", err)));
+    }
+    let _ = context.db.with_conn(|conn| {
+      conn.execute(
+        "UPDATE task_relations SET workflow_instance_id = ?1, updated_at = ?2 WHERE submission_task_id = ?3 AND relation_type = 'INTEGRATED'",
+        (&instance_id, &now, &task_id),
+      )?;
+      Ok(())
+    });
+    let workflow_settings = load_workflow_settings(&context, &task_id);
+    let enable_segmentation = workflow_settings.enable_segmentation;
+    let segment_seconds = workflow_settings.segment_duration_seconds.max(1);
+    let should_segment = integrate_current_bvid || enable_segmentation;
+    let base_dir = resolve_submission_base_dir(&context, &task_id);
+    let output_dir = base_dir
+      .join("repost")
+      .join(sanitize_filename(&format!("repost_{}", now_rfc3339())))
+      .join("output");
+    if mode == ReprocessMode::Specified {
+      let merged = match resolve_target_merged_video(
+        &context,
+        &task_id,
+        request.merged_video_id,
+        &state.app_log_path,
+      ) {
+        Ok(merged) => merged,
+        Err(err) => return Ok(ApiResponse::error(err)),
+      };
+      let merged_path = merged.video_path.clone().unwrap_or_default();
+      if merged_path.trim().is_empty() {
+        return Ok(ApiResponse::error("未找到合并视频"));
+      }
+      let merged_path_buf = PathBuf::from(merged_path.clone());
+      if !merged_path_buf.exists() {
+        return Ok(ApiResponse::error("合并视频文件不存在"));
+      }
+      let segment_prefix = detail.task.segment_prefix.clone();
+      let context_clone = context.clone();
+      let task_id_clone = task_id.clone();
+      let merged_path_clone = merged_path_buf.clone();
+      let output_dir_clone = output_dir.clone();
+      let app_log_path = state.app_log_path.clone();
+      let merged_id = merged.id;
+      tauri::async_runtime::spawn(async move {
+        let _ = update_workflow_status(
+          &context_clone,
+          &task_id_clone,
+          "RUNNING",
+          Some("SEGMENTING"),
+          70.0,
+        );
+        let segment_outputs = if should_segment {
+          if enable_segmentation {
+            let merged_path_for_segment = merged_path_clone.clone();
+            match tauri::async_runtime::spawn_blocking(move || {
+              segment_file(&merged_path_for_segment, &output_dir_clone, segment_seconds)
+            })
+            .await
+            {
+              Ok(result) => result,
+              Err(_) => Err("Failed to segment video".to_string()),
+            }
+          } else {
+            Ok(vec![merged_path_clone.clone()])
+          }
+        } else {
+          Ok(Vec::new())
+        };
+        match segment_outputs {
+          Ok(outputs) => {
+            if !should_segment {
+              let latest_id = load_latest_merged_video(&context_clone, &task_id_clone)
+                .ok()
+                .flatten()
+                .map(|value| value.id);
+              if latest_id != Some(merged_id) {
+                if let Err(err) =
+                  save_merged_video(&context_clone, &task_id_clone, merged_path_clone.as_path())
+                {
+                  let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                  let _ = update_workflow_status(
+                    &context_clone,
+                    &task_id_clone,
+                    "FAILED",
+                    Some("SEGMENTING"),
+                    0.0,
+                  );
+                  append_log(
+                    app_log_path.as_ref(),
+                    &format!(
+                      "submission_repost_save_fail task_id={} err={}",
+                      task_id_clone, err
+                    ),
+                  );
+                  return;
+                }
+              }
+              let _ = update_submission_status(&context_clone, &task_id_clone, "WAITING_UPLOAD");
+              let _ =
+                update_workflow_status(&context_clone, &task_id_clone, "COMPLETED", None, 100.0);
+              append_log(
+                app_log_path.as_ref(),
+                &format!("submission_repost_ok task_id={}", task_id_clone),
+              );
+              return;
+            }
+            if should_segment {
+              if outputs.is_empty() {
+                let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                let _ = update_workflow_status(
+                  &context_clone,
+                  &task_id_clone,
+                  "FAILED",
+                  Some("SEGMENTING"),
+                  0.0,
+                );
+                append_log(
+                  app_log_path.as_ref(),
+                  &format!(
+                    "submission_repost_empty_outputs task_id={}",
+                    task_id_clone
+                  ),
+                );
+                return;
+              }
+              if let Err(err) = replace_segments_for_merged(
+                &context_clone,
+                &task_id_clone,
+                merged_id,
+                &outputs,
+                segment_prefix.as_deref(),
+              )
+              {
+                let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+                let _ = update_workflow_status(
+                  &context_clone,
+                  &task_id_clone,
+                  "FAILED",
+                  Some("SEGMENTING"),
+                  0.0,
+                );
+                append_log(
+                  app_log_path.as_ref(),
+                  &format!(
+                    "submission_repost_save_fail task_id={} err={}",
+                    task_id_clone, err
+                  ),
+                );
+                return;
+              }
+            }
+            let _ = update_submission_status(&context_clone, &task_id_clone, "WAITING_UPLOAD");
+            let _ =
+              update_workflow_status(&context_clone, &task_id_clone, "COMPLETED", None, 100.0);
+            append_log(
+              app_log_path.as_ref(),
+              &format!("submission_repost_ok task_id={}", task_id_clone),
+            );
+          }
+          Err(err) => {
+            let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+            let _ = update_workflow_status(
+              &context_clone,
+              &task_id_clone,
+              "FAILED",
+              Some("SEGMENTING"),
+              0.0,
+            );
+            append_log(
+              app_log_path.as_ref(),
+              &format!(
+                "submission_repost_segment_fail task_id={} err={}",
+                task_id_clone, err
+              ),
+            );
+          }
+        }
+      });
+      return Ok(ApiResponse::success("重新投稿已启动".to_string()));
+    }
+    let merged_videos = match load_merged_videos_by_task(&context, &task_id) {
+      Ok(list) => list,
+      Err(err) => return Ok(ApiResponse::error(err)),
+    };
+    if merged_videos.is_empty() {
+      return Ok(ApiResponse::error("未找到合并视频"));
+    }
+    let mut merge_inputs = Vec::with_capacity(merged_videos.len());
+    for merged in merged_videos {
+      let path = merged.video_path.unwrap_or_default();
+      if path.trim().is_empty() {
+        return Ok(ApiResponse::error("合并视频路径为空"));
+      }
+      let path_buf = PathBuf::from(path);
+      if !path_buf.exists() {
+        return Ok(ApiResponse::error("合并视频文件不存在"));
+      }
+      merge_inputs.push(path_buf);
+    }
+    let merge_output = build_merge_output_path(&base_dir, &task_id);
+    let context_clone = context.clone();
+    let task_id_clone = task_id.clone();
+    let output_dir_clone = output_dir.clone();
+    let merge_output_for_merge = merge_output.clone();
+    let merge_output_for_segment = merge_output.clone();
+    let merge_output_for_save = merge_output.clone();
+    let app_log_path = state.app_log_path.clone();
+    tauri::async_runtime::spawn(async move {
+      let _ = update_workflow_status(
+        &context_clone,
+        &task_id_clone,
+        "RUNNING",
+        Some("SEGMENTING"),
+        70.0,
+      );
+      let merge_inputs_clone = merge_inputs.clone();
+      let merge_result = tauri::async_runtime::spawn_blocking(move || {
+        merge_files(&merge_inputs_clone, &merge_output_for_merge)
+      })
+      .await;
+      if let Err(err) = merge_result {
+        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+        let _ = update_workflow_status(
+          &context_clone,
+          &task_id_clone,
+          "FAILED",
+          Some("SEGMENTING"),
+          0.0,
+        );
+        append_log(
+          app_log_path.as_ref(),
+          &format!("submission_repost_merge_fail task_id={} err={}", task_id_clone, err),
+        );
+        return;
+      }
+      let segment_outputs = if should_segment {
+        if enable_segmentation {
+          let merge_output_for_segment_clone = merge_output_for_segment.clone();
+          match tauri::async_runtime::spawn_blocking(move || {
+            segment_file(&merge_output_for_segment_clone, &output_dir_clone, segment_seconds)
+          })
+          .await
+          {
+            Ok(result) => result,
+            Err(_) => Err("Failed to segment video".to_string()),
+          }
+        } else {
+          Ok(vec![merge_output_for_segment.clone()])
+        }
+      } else {
+        Ok(Vec::new())
+      };
+      match segment_outputs {
+        Ok(outputs) => {
+          if should_segment && outputs.is_empty() {
+            let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+            let _ = update_workflow_status(
+              &context_clone,
+              &task_id_clone,
+              "FAILED",
+              Some("SEGMENTING"),
+              0.0,
+            );
+            append_log(
+              app_log_path.as_ref(),
+              &format!(
+                "submission_repost_empty_outputs task_id={}",
+                task_id_clone
+              ),
+            );
+            return;
+          }
+          if let Err(err) = context_clone.db.with_conn(|conn| {
+            conn.execute("DELETE FROM merged_video WHERE task_id = ?1", [&task_id_clone])?;
+            conn.execute("DELETE FROM task_output_segment WHERE task_id = ?1", [&task_id_clone])?;
+            Ok(())
+          }) {
+            let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+            let _ = update_workflow_status(
+              &context_clone,
+              &task_id_clone,
+              "FAILED",
+              Some("SEGMENTING"),
+              0.0,
+            );
+            append_log(
+              app_log_path.as_ref(),
+              &format!(
+                "submission_repost_cleanup_fail task_id={} err={}",
+                task_id_clone, err
+              ),
+            );
+            return;
+          }
+          let merged_id = match save_merged_video(
+            &context_clone,
+            &task_id_clone,
+            &merge_output_for_save,
+          ) {
+            Ok(merged_id) => merged_id,
+            Err(err) => {
+              let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+              let _ = update_workflow_status(
+                &context_clone,
+                &task_id_clone,
+                "FAILED",
+                Some("SEGMENTING"),
+                0.0,
+              );
+              append_log(
+                app_log_path.as_ref(),
+                &format!(
+                  "submission_repost_save_fail task_id={} err={}",
+                  task_id_clone, err
+                ),
+              );
+              return;
+            }
+          };
+          if should_segment {
+            if let Err(err) =
+              save_output_segments(&context_clone, &task_id_clone, &outputs, Some(merged_id))
+            {
+              let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+              let _ = update_workflow_status(
+                &context_clone,
+                &task_id_clone,
+                "FAILED",
+                Some("SEGMENTING"),
+                0.0,
+              );
+              append_log(
+                app_log_path.as_ref(),
+                &format!(
+                  "submission_repost_save_fail task_id={} err={}",
+                  task_id_clone, err
+                ),
+              );
+              return;
+            }
+          }
+          let _ = update_submission_status(&context_clone, &task_id_clone, "WAITING_UPLOAD");
+          let _ =
+            update_workflow_status(&context_clone, &task_id_clone, "COMPLETED", None, 100.0);
+          append_log(
+            app_log_path.as_ref(),
+            &format!("submission_repost_ok task_id={}", task_id_clone),
+          );
+        }
+        Err(err) => {
+          let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+          let _ = update_workflow_status(
+            &context_clone,
+            &task_id_clone,
+            "FAILED",
+            Some("SEGMENTING"),
+            0.0,
+          );
+          append_log(
+            app_log_path.as_ref(),
+            &format!(
+              "submission_repost_segment_fail task_id={} err={}",
+              task_id_clone, err
+            ),
+          );
+        }
+      }
+    });
+    return Ok(ApiResponse::success("重新投稿已启动".to_string()));
   }
   if detail.source_videos.is_empty() {
     return Ok(ApiResponse::error("请至少添加一个源视频"));
@@ -692,6 +1284,7 @@ pub async fn submission_repost(
       &workflow_config,
       if integrate_current_bvid { "VIDEO_UPDATE" } else { "VIDEO_SUBMISSION" },
       !integrate_current_bvid,
+      false,
     )?;
     let new_download_ids =
       create_retry_download_records(&context, &task_id, &workflow_instance_id, &missing_records)?;
@@ -708,6 +1301,7 @@ pub async fn submission_repost(
     &workflow_config,
     if integrate_current_bvid { "VIDEO_UPDATE" } else { "VIDEO_SUBMISSION" },
     !integrate_current_bvid,
+    false,
   )?;
   start_submission_workflow(
     context.db.clone(),
@@ -730,6 +1324,14 @@ fn collect_missing_source_files(sources: &[TaskSourceVideoRecord]) -> Vec<String
     }
   }
   missing
+}
+
+fn strip_update_sources(config: &Value) -> Value {
+  let mut next = config.clone();
+  if let Value::Object(map) = &mut next {
+    map.remove("updateSources");
+  }
+  next
 }
 
 fn load_integrated_download_records(
@@ -838,6 +1440,7 @@ fn reset_submission_for_repost(
   workflow_config: &Value,
   workflow_type: &str,
   clear_bvid: bool,
+  clean_updates: bool,
 ) -> Result<String, String> {
   append_log(
     app_log_path,
@@ -872,6 +1475,18 @@ fn reset_submission_for_repost(
         task_id, err
       ),
     );
+  }
+  if clean_updates {
+    let updates_dir = base_dir.join("updates");
+    if let Err(err) = remove_path_if_exists(app_log_path, "updates", &updates_dir) {
+      append_log(
+        app_log_path,
+        &format!(
+          "submission_repost_cleanup_updates_fail task_id={} err={}",
+          task_id, err
+        ),
+      );
+    }
   }
   let now = now_rfc3339();
   let update_result = context.db.with_conn(|conn| {
@@ -921,8 +1536,355 @@ pub async fn submission_resegment(
     Ok(detail) => detail,
     Err(err) => return Ok(ApiResponse::error(err)),
   };
-  if detail.task.status == "UPLOADING" {
-    return Ok(ApiResponse::error("任务正在投稿中，请稍后再试"));
+  let mode = parse_reprocess_mode(request.mode.as_deref());
+  if mode != ReprocessMode::Legacy {
+    append_log(
+      &state.app_log_path,
+      &format!(
+        "submission_resegment_start task_id={} mode={}",
+        task_id,
+        if mode == ReprocessMode::MergeAll { "MERGE_ALL" } else { "SPECIFIED" }
+      ),
+    );
+    let updated_config = build_resegment_workflow_config(
+      detail.workflow_config,
+      request.segment_duration_seconds,
+    );
+    if let Err(err) = clear_edit_upload_segments_by_task(&context, &task_id) {
+      append_log(
+        &state.app_log_path,
+        &format!(
+          "submission_resegment_clear_cache_fail task_id={} err={}",
+          task_id, err
+        ),
+      );
+    }
+    if let Err(err) = reset_workflow_instances(&context, &task_id) {
+      return Ok(ApiResponse::error(format!("重置工作流失败: {}", err)));
+    }
+    if let Err(err) = create_workflow_instance_for_task_with_type(
+      context.db.as_ref(),
+      &task_id,
+      &updated_config,
+      "VIDEO_RESEGMENT",
+    ) {
+      return Ok(ApiResponse::error(format!("创建工作流失败: {}", err)));
+    }
+    let now = now_rfc3339();
+    let update_result = context.db.with_conn(|conn| {
+      conn.execute(
+        "UPDATE submission_task SET status = 'SEGMENTING', bvid = NULL, aid = NULL, remote_state = NULL, reject_reason = NULL, updated_at = ?1 WHERE task_id = ?2",
+        (&now, &task_id),
+      )?;
+      Ok(())
+    });
+    if let Err(err) = update_result {
+      return Ok(ApiResponse::error(format!("重置任务数据失败: {}", err)));
+    }
+    let base_dir = resolve_submission_base_dir(&context, &task_id);
+    let output_dir = base_dir
+      .join("resegment")
+      .join(sanitize_filename(&format!("resegment_{}", now_rfc3339())))
+      .join("output");
+    let segment_seconds = request.segment_duration_seconds;
+    if mode == ReprocessMode::Specified {
+      let merged = match resolve_target_merged_video(
+        &context,
+        &task_id,
+        request.merged_video_id,
+        &state.app_log_path,
+      ) {
+        Ok(merged) => merged,
+        Err(err) => return Ok(ApiResponse::error(err)),
+      };
+      let merged_path = merged.video_path.clone().unwrap_or_default();
+      if merged_path.trim().is_empty() {
+        return Ok(ApiResponse::error("未找到合并视频"));
+      }
+      let merged_path_buf = PathBuf::from(merged_path.clone());
+      if !merged_path_buf.exists() {
+        return Ok(ApiResponse::error("合并视频文件不存在"));
+      }
+      let segment_prefix = detail.task.segment_prefix.clone();
+      let context_clone = context.clone();
+      let task_id_clone = task_id.clone();
+      let merged_path_clone = merged_path_buf.clone();
+      let output_dir_clone = output_dir.clone();
+      let app_log_path = state.app_log_path.clone();
+      let merged_id = merged.id;
+      tauri::async_runtime::spawn(async move {
+        let _ = update_workflow_status(
+          &context_clone,
+          &task_id_clone,
+          "RUNNING",
+          Some("SEGMENTING"),
+          70.0,
+        );
+        let merged_path_for_segment = merged_path_clone.clone();
+        let segment_outputs = match tauri::async_runtime::spawn_blocking(move || {
+          segment_file(&merged_path_for_segment, &output_dir_clone, segment_seconds)
+        })
+        .await
+        {
+          Ok(result) => result,
+          Err(_) => Err("Failed to segment video".to_string()),
+        };
+        match segment_outputs {
+          Ok(outputs) => {
+            if outputs.is_empty() {
+              let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+              let _ = update_workflow_status(
+                &context_clone,
+                &task_id_clone,
+                "FAILED",
+                Some("SEGMENTING"),
+                0.0,
+              );
+              append_log(
+                app_log_path.as_ref(),
+                &format!(
+                  "submission_resegment_empty_outputs task_id={}",
+                  task_id_clone
+                ),
+              );
+              return;
+            }
+            if let Err(err) = replace_segments_for_merged(
+              &context_clone,
+              &task_id_clone,
+              merged_id,
+              &outputs,
+              segment_prefix.as_deref(),
+            )
+            {
+              let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+              let _ = update_workflow_status(
+                &context_clone,
+                &task_id_clone,
+                "FAILED",
+                Some("SEGMENTING"),
+                0.0,
+              );
+              append_log(
+                app_log_path.as_ref(),
+                &format!(
+                  "submission_resegment_save_fail task_id={} err={}",
+                  task_id_clone, err
+                ),
+              );
+              return;
+            }
+            let _ = update_submission_status(&context_clone, &task_id_clone, "WAITING_UPLOAD");
+            let _ =
+              update_workflow_status(&context_clone, &task_id_clone, "COMPLETED", None, 100.0);
+            append_log(
+              app_log_path.as_ref(),
+              &format!("submission_resegment_ok task_id={}", task_id_clone),
+            );
+          }
+          Err(err) => {
+            let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+            let _ = update_workflow_status(
+              &context_clone,
+              &task_id_clone,
+              "FAILED",
+              Some("SEGMENTING"),
+              0.0,
+            );
+            append_log(
+              app_log_path.as_ref(),
+              &format!(
+                "submission_resegment_segment_fail task_id={} err={}",
+                task_id_clone, err
+              ),
+            );
+          }
+        }
+      });
+      return Ok(ApiResponse::success("重新分段已启动".to_string()));
+    }
+    let merged_videos = match load_merged_videos_by_task(&context, &task_id) {
+      Ok(list) => list,
+      Err(err) => return Ok(ApiResponse::error(err)),
+    };
+    if merged_videos.is_empty() {
+      return Ok(ApiResponse::error("未找到合并视频"));
+    }
+    let mut merge_inputs = Vec::with_capacity(merged_videos.len());
+    for merged in merged_videos {
+      let path = merged.video_path.unwrap_or_default();
+      if path.trim().is_empty() {
+        return Ok(ApiResponse::error("合并视频路径为空"));
+      }
+      let path_buf = PathBuf::from(path);
+      if !path_buf.exists() {
+        return Ok(ApiResponse::error("合并视频文件不存在"));
+      }
+      merge_inputs.push(path_buf);
+    }
+    let merge_output = build_merge_output_path(&base_dir, &task_id);
+    let context_clone = context.clone();
+    let task_id_clone = task_id.clone();
+    let output_dir_clone = output_dir.clone();
+    let merge_output_for_merge = merge_output.clone();
+    let merge_output_for_segment = merge_output.clone();
+    let merge_output_for_save = merge_output.clone();
+    let app_log_path = state.app_log_path.clone();
+    tauri::async_runtime::spawn(async move {
+      let _ = update_workflow_status(
+        &context_clone,
+        &task_id_clone,
+        "RUNNING",
+        Some("SEGMENTING"),
+        70.0,
+      );
+      let merge_inputs_clone = merge_inputs.clone();
+      let merge_result = tauri::async_runtime::spawn_blocking(move || {
+        merge_files(&merge_inputs_clone, &merge_output_for_merge)
+      })
+      .await;
+      if let Err(err) = merge_result {
+        let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+        let _ = update_workflow_status(
+          &context_clone,
+          &task_id_clone,
+          "FAILED",
+          Some("SEGMENTING"),
+          0.0,
+        );
+        append_log(
+          app_log_path.as_ref(),
+          &format!(
+            "submission_resegment_merge_fail task_id={} err={}",
+            task_id_clone, err
+          ),
+        );
+        return;
+      }
+      let merge_output_for_segment_clone = merge_output_for_segment.clone();
+      let segment_outputs = match tauri::async_runtime::spawn_blocking(move || {
+        segment_file(&merge_output_for_segment_clone, &output_dir_clone, segment_seconds)
+      })
+      .await
+      {
+        Ok(result) => result,
+        Err(_) => Err("Failed to segment video".to_string()),
+      };
+      match segment_outputs {
+        Ok(outputs) => {
+          if outputs.is_empty() {
+            let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+            let _ = update_workflow_status(
+              &context_clone,
+              &task_id_clone,
+              "FAILED",
+              Some("SEGMENTING"),
+              0.0,
+            );
+            append_log(
+              app_log_path.as_ref(),
+              &format!(
+                "submission_resegment_empty_outputs task_id={}",
+                task_id_clone
+              ),
+            );
+            return;
+          }
+          if let Err(err) = context_clone.db.with_conn(|conn| {
+            conn.execute("DELETE FROM merged_video WHERE task_id = ?1", [&task_id_clone])?;
+            conn.execute("DELETE FROM task_output_segment WHERE task_id = ?1", [&task_id_clone])?;
+            Ok(())
+          }) {
+            let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+            let _ = update_workflow_status(
+              &context_clone,
+              &task_id_clone,
+              "FAILED",
+              Some("SEGMENTING"),
+              0.0,
+            );
+            append_log(
+              app_log_path.as_ref(),
+              &format!(
+                "submission_resegment_cleanup_fail task_id={} err={}",
+                task_id_clone, err
+              ),
+            );
+            return;
+          }
+          let merged_id = match save_merged_video(
+            &context_clone,
+            &task_id_clone,
+            &merge_output_for_save,
+          ) {
+            Ok(merged_id) => merged_id,
+            Err(err) => {
+              let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+              let _ = update_workflow_status(
+                &context_clone,
+                &task_id_clone,
+                "FAILED",
+                Some("SEGMENTING"),
+                0.0,
+              );
+              append_log(
+                app_log_path.as_ref(),
+                &format!(
+                  "submission_resegment_save_fail task_id={} err={}",
+                  task_id_clone, err
+                ),
+              );
+              return;
+            }
+          };
+          if let Err(err) =
+            save_output_segments(&context_clone, &task_id_clone, &outputs, Some(merged_id))
+          {
+            let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+            let _ = update_workflow_status(
+              &context_clone,
+              &task_id_clone,
+              "FAILED",
+              Some("SEGMENTING"),
+              0.0,
+            );
+            append_log(
+              app_log_path.as_ref(),
+              &format!(
+                "submission_resegment_save_fail task_id={} err={}",
+                task_id_clone, err
+              ),
+            );
+            return;
+          }
+          let _ = update_submission_status(&context_clone, &task_id_clone, "WAITING_UPLOAD");
+          let _ =
+            update_workflow_status(&context_clone, &task_id_clone, "COMPLETED", None, 100.0);
+          append_log(
+            app_log_path.as_ref(),
+            &format!("submission_resegment_ok task_id={}", task_id_clone),
+          );
+        }
+        Err(err) => {
+          let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
+          let _ = update_workflow_status(
+            &context_clone,
+            &task_id_clone,
+            "FAILED",
+            Some("SEGMENTING"),
+            0.0,
+          );
+          append_log(
+            app_log_path.as_ref(),
+            &format!(
+              "submission_resegment_segment_fail task_id={} err={}",
+              task_id_clone, err
+            ),
+          );
+        }
+      }
+    });
+    return Ok(ApiResponse::success("重新分段已启动".to_string()));
   }
   let merged = match load_latest_merged_video(&context, &task_id) {
     Ok(Some(merged)) => merged,
@@ -934,6 +1896,7 @@ pub async fn submission_resegment(
     return Ok(ApiResponse::error("未找到合并视频"));
   }
   let merged_path_buf = PathBuf::from(merged_path.clone());
+  let merged_id = merged.id;
   if !merged_path_buf.exists() {
     return Ok(ApiResponse::error("合并视频文件不存在"));
   }
@@ -1030,7 +1993,9 @@ pub async fn submission_resegment(
           );
           return;
         }
-        if let Err(err) = save_output_segments(&context_clone, &task_id_clone, &outputs) {
+        if let Err(err) =
+          save_output_segments(&context_clone, &task_id_clone, &outputs, Some(merged_id))
+        {
           let _ = update_submission_status(&context_clone, &task_id_clone, "FAILED");
           let _ = update_workflow_status(
             &context_clone,
@@ -1242,6 +2207,7 @@ pub fn submission_edit_prepare(
   detail.output_segments.push(TaskOutputSegmentRecord {
     segment_id,
     task_id: task_id.to_string(),
+    merged_id: Some(merged.id),
     part_name,
     segment_file_path: merged_path,
     part_order: 1,
@@ -1316,6 +2282,7 @@ pub async fn submission_edit_add_segment(
   let segment = TaskOutputSegmentRecord {
     segment_id: segment_id.clone(),
     task_id: task_id.clone(),
+    merged_id: None,
     part_name,
     segment_file_path: file_path,
     part_order: 0,
@@ -1464,6 +2431,7 @@ pub async fn submission_edit_reupload_segment(
   let mut segment = existing.unwrap_or(TaskOutputSegmentRecord {
     segment_id: segment_id.clone(),
     task_id: task_id.clone(),
+    merged_id: None,
     part_name: part_name.clone(),
     segment_file_path: file_path.clone(),
     part_order: 0,
@@ -1701,6 +2669,16 @@ pub async fn submission_edit_submit(
   task.tags = Some(tags.clone());
   task.video_type = request.task.video_type.clone();
   task.segment_prefix = request.task.segment_prefix.clone();
+  if let Some(topic_id) = request.task.topic_id {
+    task.topic_id = if topic_id > 0 { Some(topic_id) } else { None };
+  }
+  if let Some(mission_id) = request.task.mission_id {
+    task.mission_id = if mission_id > 0 { Some(mission_id) } else { None };
+  }
+  if let Some(activity_title) = request.task.activity_title.clone() {
+    let trimmed = activity_title.trim().to_string();
+    task.activity_title = if trimmed.is_empty() { None } else { Some(trimmed) };
+  }
   task.aid = Some(aid);
   if let Err(err) =
     submit_video_edit_with_refresh(&upload_context, &auth, &task, &parts, aid, &csrf).await
@@ -1727,14 +2705,24 @@ pub async fn submission_edit_submit(
       )
       .await
       {
-        append_log(
-          &upload_context.app_log_path,
-          &format!(
-            "submission_edit_collection_switch_fail task_id={} collection_id={} err={}",
-            task_id, next_collection_id, err
-          ),
-        );
-        return Ok(ApiResponse::error(err));
+        if is_collection_not_found_error(&err) {
+          append_log(
+            &upload_context.app_log_path,
+            &format!(
+              "submission_edit_collection_switch_skip task_id={} collection_id={} err={}",
+              task_id, next_collection_id, err
+            ),
+          );
+        } else {
+          append_log(
+            &upload_context.app_log_path,
+            &format!(
+              "submission_edit_collection_switch_fail task_id={} collection_id={} err={}",
+              task_id, next_collection_id, err
+            ),
+          );
+          return Ok(ApiResponse::error(err));
+        }
       }
     } else {
       append_log(
@@ -2188,7 +3176,7 @@ fn load_tasks(
         st.created_at DESC";
       let sql = if status.is_some() {
         format!(
-          "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress \
            FROM submission_task st \
@@ -2198,7 +3186,7 @@ fn load_tasks(
         )
       } else {
         format!(
-          "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress \
            FROM submission_task st \
@@ -2227,10 +3215,10 @@ fn load_tasks(
 }
 
 fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTaskRecord> {
-  let has_integrated_downloads: i64 = row.get(19)?;
-  let workflow_status = row.get::<_, Option<String>>(20)?;
-  let workflow_step = row.get::<_, Option<String>>(21)?;
-  let workflow_progress: Option<f64> = row.get(22)?;
+  let has_integrated_downloads: i64 = row.get(22)?;
+  let workflow_status = row.get::<_, Option<String>>(23)?;
+  let workflow_step = row.get::<_, Option<String>>(24)?;
+  let workflow_progress: Option<f64> = row.get(25)?;
   let workflow_status = workflow_status.map(|status| WorkflowStatusRecord {
     status,
     current_step: workflow_step,
@@ -2245,18 +3233,21 @@ fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTa
     cover_url: row.get(4)?,
     partition_id: row.get(5)?,
     tags: row.get(6)?,
-    video_type: row.get(7)?,
-    collection_id: row.get(8)?,
-    bvid: row.get(9)?,
-    aid: row.get(10)?,
-    remote_state: row.get(11)?,
-    reject_reason: row.get(12)?,
-    created_at: row.get(13)?,
-    updated_at: row.get(14)?,
-    segment_prefix: row.get(15)?,
-    baidu_sync_enabled: row.get::<_, i64>(16)? != 0,
-    baidu_sync_path: row.get(17)?,
-    baidu_sync_filename: row.get(18)?,
+    topic_id: row.get(7)?,
+    mission_id: row.get(8)?,
+    activity_title: row.get(9)?,
+    video_type: row.get(10)?,
+    collection_id: row.get(11)?,
+    bvid: row.get(12)?,
+    aid: row.get(13)?,
+    remote_state: row.get(14)?,
+    reject_reason: row.get(15)?,
+    created_at: row.get(16)?,
+    updated_at: row.get(17)?,
+    segment_prefix: row.get(18)?,
+    baidu_sync_enabled: row.get::<_, i64>(19)? != 0,
+    baidu_sync_path: row.get(20)?,
+    baidu_sync_filename: row.get(21)?,
     has_integrated_downloads: has_integrated_downloads != 0,
     workflow_status,
   })
@@ -2266,11 +3257,20 @@ fn load_task_detail(
   context: &SubmissionContext,
   task_id: &str,
 ) -> Result<SubmissionTaskDetail, String> {
+  if let Err(err) = ensure_merged_video_records(context, task_id) {
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "submission_merge_history_sync_fail task_id={} err={}",
+        task_id, err
+      ),
+    );
+  }
   context
     .db
     .with_conn(|conn| {
       let task = conn.query_row(
-        "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+        "SELECT st.task_id, st.status, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                 CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                 wi.status, wi.current_step, wi.progress \
          FROM submission_task st \
@@ -2297,7 +3297,7 @@ fn load_task_detail(
         .collect::<Result<Vec<_>, _>>()?;
 
       let mut segment_stmt = conn.prepare(
-        "SELECT segment_id, task_id, part_name, segment_file_path, part_order, upload_status, cid, file_name, \
+        "SELECT segment_id, task_id, merged_id, part_name, segment_file_path, part_order, upload_status, cid, file_name, \
                 upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_session_id, upload_biz_id, \
                 upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index \
          FROM task_output_segment WHERE task_id = ?1 ORDER BY part_order ASC",
@@ -2307,22 +3307,23 @@ fn load_task_detail(
           Ok(TaskOutputSegmentRecord {
             segment_id: row.get(0)?,
             task_id: row.get(1)?,
-            part_name: row.get(2)?,
-            segment_file_path: row.get(3)?,
-            part_order: row.get(4)?,
-            upload_status: row.get(5)?,
-            cid: row.get(6)?,
-            file_name: row.get(7)?,
-            upload_progress: row.get(8)?,
-            upload_uploaded_bytes: row.get(9)?,
-            upload_total_bytes: row.get(10)?,
-            upload_session_id: row.get(11)?,
-            upload_biz_id: row.get(12)?,
-            upload_endpoint: row.get(13)?,
-            upload_auth: row.get(14)?,
-            upload_uri: row.get(15)?,
-            upload_chunk_size: row.get(16)?,
-            upload_last_part_index: row.get(17)?,
+            merged_id: row.get(2)?,
+            part_name: row.get(3)?,
+            segment_file_path: row.get(4)?,
+            part_order: row.get(5)?,
+            upload_status: row.get(6)?,
+            cid: row.get(7)?,
+            file_name: row.get(8)?,
+            upload_progress: row.get(9)?,
+            upload_uploaded_bytes: row.get(10)?,
+            upload_total_bytes: row.get(11)?,
+            upload_session_id: row.get(12)?,
+            upload_biz_id: row.get(13)?,
+            upload_endpoint: row.get(14)?,
+            upload_auth: row.get(15)?,
+            upload_uri: row.get(16)?,
+            upload_chunk_size: row.get(17)?,
+            upload_last_part_index: row.get(18)?,
           })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -2332,7 +3333,7 @@ fn load_task_detail(
                 upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_cid, upload_file_name, \
                 upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, \
                 upload_last_part_index, create_time, update_time \
-         FROM merged_video WHERE task_id = ?1 ORDER BY id DESC",
+         FROM merged_video WHERE task_id = ?1 ORDER BY create_time DESC, id DESC",
       )?;
       let merged_videos = merged_stmt
         .query_map([task_id], |row| {
@@ -2731,9 +3732,7 @@ async fn run_submission_workflow(
 
   update_submission_status(&context, &task_id, "MERGING")?;
   let _ = update_workflow_status(&context, &task_id, "RUNNING", Some("MERGING"), 40.0);
-  let merge_output = workflow_dir
-    .join("merge")
-    .join(format!("{}_merged.mp4", sanitize_filename(&task_id)));
+  let merge_output = build_merge_output_path(&workflow_dir, &task_id);
   let merge_list_path = merge_output.with_extension("txt");
   append_log(
     &context.app_log_path,
@@ -2769,7 +3768,7 @@ async fn run_submission_workflow(
   );
 
   let _ = wait_for_workflow_ready(&context, &task_id).await?;
-  save_merged_video(&context, &task_id, &merge_output)?;
+  let merged_id = save_merged_video(&context, &task_id, &merge_output)?;
   if let Err(err) = baidu_sync::enqueue_submission_sync(
     context.db.as_ref(),
     context.app_log_path.as_ref(),
@@ -2830,12 +3829,13 @@ async fn run_submission_workflow(
         &context,
         &task_id,
         &segment_outputs,
+        Some(merged_id),
         workflow_settings.segment_prefix.as_deref(),
         max_order + 1,
         name_start_index,
       )?;
     } else {
-      save_output_segments(&context, &task_id, &segment_outputs)?;
+      save_output_segments(&context, &task_id, &segment_outputs, Some(merged_id))?;
     }
   }
   if is_update_workflow && !workflow_settings.enable_segmentation {
@@ -2850,6 +3850,7 @@ async fn run_submission_workflow(
       &context,
       &task_id,
       &[merge_output.clone()],
+      Some(merged_id),
       workflow_settings.segment_prefix.as_deref(),
       max_order + 1,
       name_start_index,
@@ -2989,6 +3990,11 @@ struct IntegratedDownloadRecord {
 }
 
 const MAX_PARTS_PER_SUBMISSION: usize = 100;
+const MAX_PARTS_PER_BVID: usize = 200;
+const SUBMISSION_EDIT_BATCH_WAIT_SECS: u64 = 10;
+const SUBMISSION_EDIT_RATE_LIMIT_BASE_WAIT_SECS: u64 = 10;
+const SUBMISSION_EDIT_RATE_LIMIT_MAX_WAIT_SECS: u64 = 120;
+const SUBMISSION_EDIT_RATE_LIMIT_RETRY_LIMIT: u32 = 3;
 const RATE_LIMIT_BASE_WAIT_SECS: u64 = 60;
 const RATE_LIMIT_MAX_WAIT_SECS: u64 = 30 * 60;
 const UPLOAD_SEGMENT_RETRY_LIMIT: u32 = 3;
@@ -3025,6 +4031,10 @@ impl UploadRateLimiter {
     let wait = RATE_LIMIT_BASE_WAIT_SECS.saturating_mul(multiplier);
     wait.min(RATE_LIMIT_MAX_WAIT_SECS)
   }
+}
+
+fn is_rate_limit_error(err: &str) -> bool {
+  err.contains("21540") || err.contains("请求过于频繁")
 }
 
 fn upload_retry_delay_secs(attempt: u32) -> u64 {
@@ -3326,6 +4336,19 @@ async fn run_submission_upload(
     return Err("投稿文件为空".to_string());
   }
 
+  if !is_update_workflow && parts.len() > MAX_PARTS_PER_BVID {
+    update_submission_status(&submission_context, &task_id, "FAILED")?;
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "submission_upload_part_limit_exceeded task_id={} parts={}",
+        task_id,
+        parts.len()
+      ),
+    );
+    return Err("Bilibili 不支持单 BV 超过 200 分P，请调整分段或拆分投稿".to_string());
+  }
+
   if is_update_workflow {
     let mut aid = detail.task.aid.unwrap_or(0);
     if aid <= 0 {
@@ -3385,15 +4408,25 @@ async fn run_submission_upload(
             )
             .await;
             if let Err(err) = add_result {
-              update_submission_status(&submission_context, &task_id, "FAILED")?;
-              append_log(
-                &context.app_log_path,
-                &format!(
-                  "submission_collection_fail task_id={} collection_id={} err={}",
-                  task_id, collection_id, err
-                ),
-              );
-              return Err(err);
+              if is_collection_not_found_error(&err) {
+                append_log(
+                  &context.app_log_path,
+                  &format!(
+                    "submission_collection_skip task_id={} collection_id={} err={}",
+                    task_id, collection_id, err
+                  ),
+                );
+              } else {
+                update_submission_status(&submission_context, &task_id, "FAILED")?;
+                append_log(
+                  &context.app_log_path,
+                  &format!(
+                    "submission_collection_fail task_id={} collection_id={} err={}",
+                    task_id, collection_id, err
+                  ),
+                );
+                return Err(err);
+              }
             }
           }
         }
@@ -3764,6 +4797,25 @@ fn resolve_existing_part_title(
     return build_part_title(task.segment_prefix.as_deref(), index);
   }
   trimmed.to_string()
+}
+
+fn is_default_part_name(
+  part_name: &str,
+  order: i64,
+  segment_prefix: Option<&str>,
+) -> bool {
+  let trimmed = part_name.trim();
+  if trimmed.is_empty() {
+    return true;
+  }
+  if trimmed == format!("Part {}", order) {
+    return true;
+  }
+  if order > 0 {
+    let expected = build_part_title(segment_prefix, order as usize);
+    return trimmed == expected;
+  }
+  false
 }
 
 fn build_progress_snapshot(
@@ -4582,6 +5634,42 @@ async fn submit_video_edit_with_refresh(
   }
 }
 
+async fn submit_video_edit_with_rate_limit_retry(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  task: &SubmissionTaskRecord,
+  parts: &[UploadedVideoPart],
+  aid: i64,
+  csrf: &str,
+) -> Result<(), String> {
+  let mut attempt: u32 = 0;
+  let mut wait_secs = SUBMISSION_EDIT_RATE_LIMIT_BASE_WAIT_SECS;
+  loop {
+    match submit_video_edit_with_refresh(context, auth, task, parts, aid, csrf).await {
+      Ok(()) => return Ok(()),
+      Err(err) => {
+        if !is_rate_limit_error(&err) {
+          return Err(err);
+        }
+        attempt = attempt.saturating_add(1);
+        if attempt > SUBMISSION_EDIT_RATE_LIMIT_RETRY_LIMIT {
+          return Err(err);
+        }
+        let current_wait = wait_secs.min(SUBMISSION_EDIT_RATE_LIMIT_MAX_WAIT_SECS);
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "submission_edit_rate_limited aid={} attempt={} wait_secs={} err={}",
+            aid, attempt, current_wait, err
+          ),
+        );
+        sleep(Duration::from_secs(current_wait)).await;
+        wait_secs = wait_secs.saturating_mul(2);
+      }
+    }
+  }
+}
+
 async fn submit_video_in_batches(
   context: &UploadContext,
   auth: &AuthInfo,
@@ -4618,8 +5706,23 @@ async fn submit_video_in_batches(
         result.aid, batch_index, total_batches, next_end
       ),
     );
-    submit_video_edit_with_refresh(context, auth, task, &parts[..next_end], result.aid, csrf)
-      .await?;
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "submission_edit_batch_wait aid={} batch={}/{} wait_secs={}",
+        result.aid, batch_index, total_batches, SUBMISSION_EDIT_BATCH_WAIT_SECS
+      ),
+    );
+    sleep(Duration::from_secs(SUBMISSION_EDIT_BATCH_WAIT_SECS)).await;
+    submit_video_edit_with_rate_limit_retry(
+      context,
+      auth,
+      task,
+      &parts[..next_end],
+      result.aid,
+      csrf,
+    )
+    .await?;
     append_log(
       &context.app_log_path,
       &format!(
@@ -4669,7 +5772,18 @@ async fn submit_video_update_in_batches(
         aid, batch_index, total_batches, next_end
       ),
     );
-    submit_video_edit_with_refresh(context, auth, task, &parts[..next_end], aid, csrf).await?;
+    if batch_index > 1 {
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "submission_update_batch_wait aid={} batch={}/{} wait_secs={}",
+          aid, batch_index, total_batches, SUBMISSION_EDIT_BATCH_WAIT_SECS
+        ),
+      );
+      sleep(Duration::from_secs(SUBMISSION_EDIT_BATCH_WAIT_SECS)).await;
+    }
+    submit_video_edit_with_rate_limit_retry(context, auth, task, &parts[..next_end], aid, csrf)
+      .await?;
     append_log(
       &context.app_log_path,
       &format!(
@@ -4809,6 +5923,16 @@ fn build_add_payload(task: &SubmissionTaskRecord, parts: &[UploadedVideoPart]) -
       payload["season_id"] = serde_json::json!(collection_id);
     }
   }
+  if let Some(topic_id) = task.topic_id {
+    if topic_id > 0 {
+      payload["topic_id"] = serde_json::json!(topic_id);
+    }
+  }
+  if let Some(mission_id) = task.mission_id {
+    if mission_id > 0 {
+      payload["mission_id"] = serde_json::json!(mission_id);
+    }
+  }
 
   payload
 }
@@ -4849,6 +5973,16 @@ fn build_edit_payload(task: &SubmissionTaskRecord, parts: &[UploadedVideoPart], 
   if let Some(collection_id) = task.collection_id {
     if collection_id > 0 {
       payload["season_id"] = serde_json::json!(collection_id);
+    }
+  }
+  if let Some(topic_id) = task.topic_id {
+    if topic_id > 0 {
+      payload["topic_id"] = serde_json::json!(topic_id);
+    }
+  }
+  if let Some(mission_id) = task.mission_id {
+    if mission_id > 0 {
+      payload["mission_id"] = serde_json::json!(mission_id);
     }
   }
 
@@ -4954,6 +6088,10 @@ async fn add_video_to_collection(
     ),
   );
   Ok(())
+}
+
+fn is_collection_not_found_error(err: &str) -> bool {
+  err.contains("code: -404") || err.contains("啥都木有")
 }
 
 async fn switch_video_collection(
@@ -5153,6 +6291,7 @@ fn load_update_sources(
   Ok(Some(sources))
 }
 
+#[allow(dead_code)]
 fn replace_source_videos(
   context: &SubmissionContext,
   task_id: &str,
@@ -5302,7 +6441,7 @@ fn save_merged_video(
   context: &SubmissionContext,
   task_id: &str,
   merged_path: &Path,
-) -> Result<(), String> {
+) -> Result<i64, String> {
   let now = now_rfc3339();
   let file_name = merged_path
     .file_name()
@@ -5325,7 +6464,7 @@ fn save_merged_video(
           &now,
         ),
       )?;
-      Ok(())
+      Ok(conn.last_insert_rowid())
     })
     .map_err(|err| err.to_string())
 }
@@ -5384,6 +6523,7 @@ fn append_output_segments(
   context: &SubmissionContext,
   task_id: &str,
   segments: &[PathBuf],
+  merged_id: Option<i64>,
   prefix: Option<&str>,
   part_order_start: i64,
   name_start_index: usize,
@@ -5398,11 +6538,12 @@ fn append_output_segments(
         let part_order = part_order_start + index as i64;
         let part_name = build_part_title(prefix, name_start_index + index);
         conn.execute(
-          "INSERT INTO task_output_segment (segment_id, task_id, part_name, segment_file_path, part_order, upload_status, cid, file_name, upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index) \
-           VALUES (?1, ?2, ?3, ?4, ?5, 'PENDING', NULL, ?6, 0, 0, ?7, NULL, 0, NULL, NULL, NULL, 0, 0)",
+          "INSERT INTO task_output_segment (segment_id, task_id, merged_id, part_name, segment_file_path, part_order, upload_status, cid, file_name, upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', NULL, ?7, 0, 0, ?8, NULL, 0, NULL, NULL, NULL, 0, 0)",
           (
             segment_id,
             task_id,
+            merged_id,
             part_name,
             segment.to_string_lossy().to_string(),
             part_order,
@@ -5420,6 +6561,7 @@ fn save_output_segments(
   context: &SubmissionContext,
   task_id: &str,
   segments: &[PathBuf],
+  merged_id: Option<i64>,
 ) -> Result<(), String> {
   context
     .db
@@ -5430,11 +6572,12 @@ fn save_output_segments(
         let file_name = segment.file_name().and_then(|name| name.to_str()).unwrap_or("segment.mp4");
         let total_bytes = fs::metadata(segment).map(|meta| meta.len()).unwrap_or(0);
         conn.execute(
-          "INSERT INTO task_output_segment (segment_id, task_id, part_name, segment_file_path, part_order, upload_status, cid, file_name, upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index) \
-           VALUES (?1, ?2, ?3, ?4, ?5, 'PENDING', NULL, ?6, 0, 0, ?7, NULL, 0, NULL, NULL, NULL, 0, 0)",
+          "INSERT INTO task_output_segment (segment_id, task_id, merged_id, part_name, segment_file_path, part_order, upload_status, cid, file_name, upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', NULL, ?7, 0, 0, ?8, NULL, 0, NULL, NULL, NULL, 0, 0)",
           (
             segment_id,
             task_id,
+            merged_id,
             format!("Part {}", index + 1),
             segment.to_string_lossy().to_string(),
             (index + 1) as i64,
@@ -5740,7 +6883,7 @@ fn load_output_segment_by_id(
     .db
     .with_conn(|conn| {
       let mut stmt = conn.prepare(
-        "SELECT segment_id, task_id, part_name, segment_file_path, part_order, upload_status, cid, file_name, \
+        "SELECT segment_id, task_id, merged_id, part_name, segment_file_path, part_order, upload_status, cid, file_name, \
                 upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_session_id, upload_biz_id, \
                 upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index \
          FROM task_output_segment WHERE segment_id = ?1",
@@ -5750,22 +6893,23 @@ fn load_output_segment_by_id(
           Ok(TaskOutputSegmentRecord {
             segment_id: row.get(0)?,
             task_id: row.get(1)?,
-            part_name: row.get(2)?,
-            segment_file_path: row.get(3)?,
-            part_order: row.get(4)?,
-            upload_status: row.get(5)?,
-            cid: row.get(6)?,
-            file_name: row.get(7)?,
-            upload_progress: row.get(8)?,
-            upload_uploaded_bytes: row.get(9)?,
-            upload_total_bytes: row.get(10)?,
-            upload_session_id: row.get(11)?,
-            upload_biz_id: row.get(12)?,
-            upload_endpoint: row.get(13)?,
-            upload_auth: row.get(14)?,
-            upload_uri: row.get(15)?,
-            upload_chunk_size: row.get(16)?,
-            upload_last_part_index: row.get(17)?,
+            merged_id: row.get(2)?,
+            part_name: row.get(3)?,
+            segment_file_path: row.get(4)?,
+            part_order: row.get(5)?,
+            upload_status: row.get(6)?,
+            cid: row.get(7)?,
+            file_name: row.get(8)?,
+            upload_progress: row.get(9)?,
+            upload_uploaded_bytes: row.get(10)?,
+            upload_total_bytes: row.get(11)?,
+            upload_session_id: row.get(12)?,
+            upload_biz_id: row.get(13)?,
+            upload_endpoint: row.get(14)?,
+            upload_auth: row.get(15)?,
+            upload_uri: row.get(16)?,
+            upload_chunk_size: row.get(17)?,
+            upload_last_part_index: row.get(18)?,
           })
         })
         .ok();
@@ -5808,12 +6952,15 @@ fn update_submission_task_for_edit(
     .db
     .with_conn(|conn| {
       conn.execute(
-        "UPDATE submission_task SET title = ?1, description = ?2, partition_id = ?3, tags = ?4, video_type = ?5, collection_id = ?6, segment_prefix = ?7, updated_at = ?8 WHERE task_id = ?9",
+        "UPDATE submission_task SET title = ?1, description = ?2, partition_id = ?3, tags = ?4, topic_id = ?5, mission_id = ?6, activity_title = ?7, video_type = ?8, collection_id = ?9, segment_prefix = ?10, updated_at = ?11 WHERE task_id = ?12",
         (
           &task.title,
           task.description.as_deref(),
           task.partition_id,
           task.tags.as_deref(),
+          task.topic_id,
+          task.mission_id,
+          task.activity_title.as_deref(),
           &task.video_type,
           task.collection_id,
           task.segment_prefix.as_deref(),
@@ -5921,8 +7068,8 @@ fn update_output_segments_for_edit(
           )?;
         } else {
           tx.execute(
-            "INSERT INTO task_output_segment (segment_id, task_id, part_name, segment_file_path, part_order, upload_status, cid, file_name, upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'SUCCESS', ?6, ?7, 100, ?8, ?9, NULL, 0, NULL, NULL, NULL, 0, 0)",
+            "INSERT INTO task_output_segment (segment_id, task_id, merged_id, part_name, segment_file_path, part_order, upload_status, cid, file_name, upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index) \
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, 'SUCCESS', ?6, ?7, 100, ?8, ?9, NULL, 0, NULL, NULL, NULL, 0, 0)",
             (
               segment_id,
               task_id,
@@ -6205,6 +7352,393 @@ fn load_latest_merged_video(
       Ok(result)
     })
     .map_err(|err| err.to_string())
+}
+
+fn load_merged_video_by_id(
+  context: &SubmissionContext,
+  task_id: &str,
+  merged_id: i64,
+) -> Result<Option<MergedVideoRecord>, String> {
+  context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT id, task_id, file_name, video_path, duration, status, \
+                upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_cid, upload_file_name, \
+                upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, \
+                upload_last_part_index, create_time, update_time \
+         FROM merged_video WHERE task_id = ?1 AND id = ?2",
+      )?;
+      let result = stmt
+        .query_row((task_id, merged_id), |row| {
+          Ok(MergedVideoRecord {
+            id: row.get(0)?,
+            task_id: row.get(1)?,
+            file_name: row.get(2)?,
+            video_path: row.get(3)?,
+            duration: row.get(4)?,
+            status: row.get(5)?,
+            upload_progress: row.get(6)?,
+            upload_uploaded_bytes: row.get(7)?,
+            upload_total_bytes: row.get(8)?,
+            upload_cid: row.get(9)?,
+            upload_file_name: row.get(10)?,
+            upload_session_id: row.get(11)?,
+            upload_biz_id: row.get(12)?,
+            upload_endpoint: row.get(13)?,
+            upload_auth: row.get(14)?,
+            upload_uri: row.get(15)?,
+            upload_chunk_size: row.get(16)?,
+            upload_last_part_index: row.get(17)?,
+            create_time: row.get(18)?,
+            update_time: row.get(19)?,
+          })
+        })
+        .ok();
+      Ok(result)
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn collect_merge_video_paths(base_dir: &Path) -> Vec<PathBuf> {
+  let mut result = Vec::new();
+  collect_merge_files_from_dir(&base_dir.join("merge"), &mut result);
+  let updates_dir = base_dir.join("updates");
+  if let Ok(entries) = fs::read_dir(&updates_dir) {
+    for entry in entries.flatten() {
+      let update_dir = entry.path();
+      if update_dir.is_dir() {
+        collect_merge_files_from_dir(&update_dir.join("merge"), &mut result);
+      }
+    }
+  }
+  result
+}
+
+fn collect_merge_files_from_dir(dir: &Path, output: &mut Vec<PathBuf>) {
+  let entries = match fs::read_dir(dir) {
+    Ok(entries) => entries,
+    Err(_) => return,
+  };
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path
+      .extension()
+      .and_then(|ext| ext.to_str())
+      .map(|ext| ext.eq_ignore_ascii_case("mp4"))
+      .unwrap_or(false)
+    {
+      output.push(path);
+    }
+  }
+}
+
+fn insert_merged_video_record(
+  context: &SubmissionContext,
+  task_id: &str,
+  merged_path: &Path,
+  timestamp: &str,
+) -> Result<i64, String> {
+  let file_name = merged_path
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or("merged.mp4");
+  let total_bytes = fs::metadata(merged_path).map(|meta| meta.len()).unwrap_or(0);
+  context
+    .db
+    .with_conn(|conn| {
+      conn.execute(
+        "INSERT INTO merged_video (task_id, file_name, video_path, duration, status, upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_cid, upload_file_name, upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index, create_time, update_time) \
+         VALUES (?1, ?2, ?3, NULL, 2, 0, 0, ?4, NULL, NULL, NULL, 0, NULL, NULL, NULL, 0, 0, ?5, ?6)",
+        (
+          task_id,
+          file_name,
+          merged_path.to_string_lossy().to_string(),
+          total_bytes as i64,
+          timestamp,
+          timestamp,
+        ),
+      )?;
+      Ok(conn.last_insert_rowid())
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn ensure_merged_video_records(
+  context: &SubmissionContext,
+  task_id: &str,
+) -> Result<(), String> {
+  let base_dir = resolve_submission_base_dir(context, task_id);
+  let candidates = collect_merge_video_paths(&base_dir);
+  if candidates.is_empty() {
+    return Ok(());
+  }
+  let existing: HashSet<String> = context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT video_path FROM merged_video WHERE task_id = ?1 AND video_path IS NOT NULL",
+      )?;
+      let rows = stmt.query_map([task_id], |row| row.get::<_, String>(0))?;
+      Ok(rows.collect::<Result<HashSet<_>, _>>()?)
+    })
+    .map_err(|err| err.to_string())?;
+  let mut known = existing;
+  for path in candidates {
+    let path_str = path.to_string_lossy().to_string();
+    if known.contains(&path_str) {
+      continue;
+    }
+    if !path.exists() {
+      continue;
+    }
+    let timestamp = fs::metadata(&path)
+      .and_then(|meta| meta.modified())
+      .map(|time| chrono::DateTime::<Utc>::from(time).to_rfc3339())
+      .unwrap_or_else(|_| now_rfc3339());
+    let _ = insert_merged_video_record(context, task_id, &path, &timestamp)?;
+    known.insert(path_str);
+  }
+  Ok(())
+}
+
+fn load_merged_videos_by_task(
+  context: &SubmissionContext,
+  task_id: &str,
+) -> Result<Vec<MergedVideoRecord>, String> {
+  context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT id, task_id, file_name, video_path, duration, status, \
+                upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_cid, upload_file_name, \
+                upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, \
+                upload_last_part_index, create_time, update_time \
+         FROM merged_video WHERE task_id = ?1 ORDER BY create_time ASC, id ASC",
+      )?;
+      let rows = stmt.query_map([task_id], |row| {
+        Ok(MergedVideoRecord {
+          id: row.get(0)?,
+          task_id: row.get(1)?,
+          file_name: row.get(2)?,
+          video_path: row.get(3)?,
+          duration: row.get(4)?,
+          status: row.get(5)?,
+          upload_progress: row.get(6)?,
+          upload_uploaded_bytes: row.get(7)?,
+          upload_total_bytes: row.get(8)?,
+          upload_cid: row.get(9)?,
+          upload_file_name: row.get(10)?,
+          upload_session_id: row.get(11)?,
+          upload_biz_id: row.get(12)?,
+          upload_endpoint: row.get(13)?,
+          upload_auth: row.get(14)?,
+          upload_uri: row.get(15)?,
+          upload_chunk_size: row.get(16)?,
+          upload_last_part_index: row.get(17)?,
+          create_time: row.get(18)?,
+          update_time: row.get(19)?,
+        })
+      })?;
+      Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn load_output_segment_range_by_merged_id(
+  context: &SubmissionContext,
+  task_id: &str,
+  merged_id: i64,
+) -> Result<Option<(i64, i64, i64)>, String> {
+  context
+    .db
+    .with_conn(|conn| {
+      let (min_order, max_order, count): (Option<i64>, Option<i64>, i64) = conn.query_row(
+        "SELECT MIN(part_order), MAX(part_order), COUNT(*) FROM task_output_segment WHERE task_id = ?1 AND merged_id = ?2",
+        (task_id, merged_id),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+      )?;
+      if count <= 0 {
+        return Ok(None);
+      }
+      let min_order = min_order.unwrap_or(1);
+      let max_order = max_order.unwrap_or(min_order);
+      Ok(Some((min_order, max_order, count)))
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn ensure_segments_bound_to_merged(
+  context: &SubmissionContext,
+  task_id: &str,
+  merged_id: i64,
+) -> Result<(), String> {
+  let (total_segments, bound_segments, null_segments, merged_count) = context
+    .db
+    .with_conn(|conn| {
+      let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM task_output_segment WHERE task_id = ?1",
+        [task_id],
+        |row| row.get(0),
+      )?;
+      let bound: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM task_output_segment WHERE task_id = ?1 AND merged_id = ?2",
+        (task_id, merged_id),
+        |row| row.get(0),
+      )?;
+      let null_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM task_output_segment WHERE task_id = ?1 AND (merged_id IS NULL OR merged_id = 0)",
+        [task_id],
+        |row| row.get(0),
+      )?;
+      let merged_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM merged_video WHERE task_id = ?1",
+        [task_id],
+        |row| row.get(0),
+      )?;
+      Ok((total, bound, null_count, merged_count))
+    })
+    .map_err(|err| err.to_string())?;
+  if total_segments == 0 || bound_segments > 0 {
+    return Ok(());
+  }
+  if merged_count == 1 || null_segments == total_segments {
+    context
+      .db
+      .with_conn(|conn| {
+        conn.execute(
+          "UPDATE task_output_segment SET merged_id = ?1 WHERE task_id = ?2 AND (merged_id IS NULL OR merged_id = 0)",
+          (merged_id, task_id),
+        )?;
+        Ok(())
+      })
+      .map_err(|err| err.to_string())?;
+  }
+  Ok(())
+}
+
+fn replace_segments_for_merged(
+  context: &SubmissionContext,
+  task_id: &str,
+  merged_id: i64,
+  outputs: &[PathBuf],
+  segment_prefix: Option<&str>,
+) -> Result<(), String> {
+  if outputs.is_empty() {
+    return Err("重新分段输出为空".to_string());
+  }
+  let range = load_output_segment_range_by_merged_id(context, task_id, merged_id)?;
+  let (start_order, old_count, end_order) = match range {
+    Some((min_order, max_order, count)) => (min_order, count, max_order),
+    None => {
+      let (existing_count, _max_order) = load_output_segment_stats(context, task_id)?;
+      if existing_count == 0 {
+        return save_output_segments(context, task_id, outputs, Some(merged_id));
+      }
+      return Err("未找到合并视频对应的分段范围".to_string());
+    }
+  };
+  let delta = outputs.len() as i64 - old_count;
+  context
+    .db
+    .with_conn_mut(|conn| {
+      let tx = conn.transaction()?;
+      tx.execute(
+        "DELETE FROM task_output_segment WHERE task_id = ?1 AND merged_id = ?2 AND part_order >= ?3 AND part_order <= ?4",
+        (task_id, merged_id, start_order, end_order),
+      )?;
+      let mut rename_targets: Vec<(String, i64)> = Vec::new();
+      if delta != 0 {
+        let mut stmt = tx.prepare(
+          "SELECT segment_id, part_name, part_order FROM task_output_segment WHERE task_id = ?1 AND part_order > ?2",
+        )?;
+        let rows = stmt.query_map((task_id, end_order), |row| {
+          Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+          ))
+        })?;
+        for row in rows {
+          let (segment_id, part_name, part_order) = row?;
+          if is_default_part_name(&part_name, part_order, segment_prefix) {
+            rename_targets.push((segment_id, part_order));
+          }
+        }
+        tx.execute(
+          "UPDATE task_output_segment SET part_order = part_order + ?1 WHERE task_id = ?2 AND part_order > ?3",
+          (delta, task_id, end_order),
+        )?;
+      }
+      for (index, segment) in outputs.iter().enumerate() {
+        let segment_id = uuid::Uuid::new_v4().to_string();
+        let file_name = segment.file_name().and_then(|name| name.to_str()).unwrap_or("segment.mp4");
+        let total_bytes = fs::metadata(segment).map(|meta| meta.len()).unwrap_or(0);
+        let part_order = start_order + index as i64;
+        let part_index = if part_order > 0 { part_order as usize } else { 1 };
+        let part_name = build_part_title(segment_prefix, part_index);
+        tx.execute(
+          "INSERT INTO task_output_segment (segment_id, task_id, merged_id, part_name, segment_file_path, part_order, upload_status, cid, file_name, upload_progress, upload_uploaded_bytes, upload_total_bytes, upload_session_id, upload_biz_id, upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', NULL, ?7, 0, 0, ?8, NULL, 0, NULL, NULL, NULL, 0, 0)",
+          (
+            segment_id,
+            task_id,
+            merged_id,
+            part_name,
+            segment.to_string_lossy().to_string(),
+            part_order,
+            file_name,
+            total_bytes as i64,
+          ),
+        )?;
+      }
+      for (segment_id, part_order) in rename_targets {
+        let new_order = part_order + delta;
+        if new_order > 0 {
+          let new_name = build_part_title(segment_prefix, new_order as usize);
+          tx.execute(
+            "UPDATE task_output_segment SET part_name = ?1 WHERE segment_id = ?2",
+            (new_name, segment_id),
+          )?;
+        }
+      }
+      tx.commit()?;
+      Ok(())
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn build_merge_output_path(workflow_dir: &Path, task_id: &str) -> PathBuf {
+  let stamp = sanitize_filename(&now_rfc3339());
+  let task = sanitize_filename(task_id);
+  workflow_dir
+    .join("merge")
+    .join(format!("{}_merged_{}.mp4", task, stamp))
+}
+
+fn resolve_target_merged_video(
+  context: &SubmissionContext,
+  task_id: &str,
+  requested_id: Option<i64>,
+  app_log_path: &PathBuf,
+) -> Result<MergedVideoRecord, String> {
+  if let Some(merged_id) = requested_id {
+    if let Ok(Some(merged)) = load_merged_video_by_id(context, task_id, merged_id) {
+      ensure_segments_bound_to_merged(context, task_id, merged.id)?;
+      return Ok(merged);
+    }
+    append_log(
+      app_log_path,
+      &format!(
+        "submission_reprocess_merge_fallback task_id={} merged_id={} reason=missing",
+        task_id, merged_id
+      ),
+    );
+  }
+  let latest = load_latest_merged_video(context, task_id)?
+    .ok_or_else(|| "未找到合并视频".to_string())?;
+  ensure_segments_bound_to_merged(context, task_id, latest.id)?;
+  Ok(latest)
 }
 
 fn update_submission_status(

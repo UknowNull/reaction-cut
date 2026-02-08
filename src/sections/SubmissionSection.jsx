@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { invokeCommand } from "../lib/tauri";
 import { formatDateTime } from "../lib/format";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
@@ -41,6 +40,9 @@ export default function SubmissionSection() {
     description: "",
     partitionId: "",
     collectionId: "",
+    activityTopicId: "",
+    activityMissionId: "",
+    activityTitle: "",
     videoType: "ORIGINAL",
     segmentPrefix: "",
     baiduSyncEnabled: false,
@@ -54,6 +56,9 @@ export default function SubmissionSection() {
   const [workflowConfig, setWorkflowConfig] = useState(defaultWorkflowConfig);
   const [partitions, setPartitions] = useState([]);
   const [collections, setCollections] = useState([]);
+  const [activityOptions, setActivityOptions] = useState([]);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityMessage, setActivityMessage] = useState("");
   const [tasks, setTasks] = useState([]);
   const [totalTasks, setTotalTasks] = useState(0);
   const [selectedTask, setSelectedTask] = useState(null);
@@ -77,11 +82,17 @@ export default function SubmissionSection() {
   const [resegmentSeconds, setResegmentSeconds] = useState("");
   const [resegmentSubmitting, setResegmentSubmitting] = useState(false);
   const [resegmentVideoSeconds, setResegmentVideoSeconds] = useState(0);
+  const [resegmentMode, setResegmentMode] = useState("SPECIFIED");
+  const [resegmentMergedVideos, setResegmentMergedVideos] = useState([]);
+  const [resegmentMergedId, setResegmentMergedId] = useState("");
   const [repostOpen, setRepostOpen] = useState(false);
   const [repostTaskId, setRepostTaskId] = useState("");
   const [repostHasBvid, setRepostHasBvid] = useState(false);
   const [repostUseCurrentBvid, setRepostUseCurrentBvid] = useState(false);
   const [repostSubmitting, setRepostSubmitting] = useState(false);
+  const [repostMode, setRepostMode] = useState("SPECIFIED");
+  const [repostMergedVideos, setRepostMergedVideos] = useState([]);
+  const [repostMergedId, setRepostMergedId] = useState("");
   const [repostBaiduSync, setRepostBaiduSync] = useState({
     enabled: false,
     path: "",
@@ -116,6 +127,27 @@ export default function SubmissionSection() {
   const isEditView = submissionView === "edit";
   const isReadOnly = isDetailView;
   const quickFillPageSize = 10;
+  const activitySelectOptions = (() => {
+    const currentId = Number(taskForm.activityTopicId || 0);
+    if (!currentId) {
+      return activityOptions;
+    }
+    const exists = activityOptions.some((item) => item.topicId === currentId);
+    if (exists || !taskForm.activityTitle) {
+      return activityOptions;
+    }
+    return [
+      {
+        topicId: currentId,
+        missionId: Number(taskForm.activityMissionId || 0),
+        name: taskForm.activityTitle,
+        description: "",
+        activityText: "",
+        activityDescription: "",
+      },
+      ...activityOptions,
+    ];
+  })();
 
   useEffect(() => {
     editSegmentsRef.current = editSegments;
@@ -179,6 +211,9 @@ export default function SubmissionSection() {
       description: "",
       partitionId: "",
       collectionId: "",
+      activityTopicId: "",
+      activityMissionId: "",
+      activityTitle: "",
       videoType: "ORIGINAL",
       segmentPrefix: "",
       baiduSyncEnabled: false,
@@ -207,6 +242,8 @@ export default function SubmissionSection() {
     setSelectedTask(null);
     setMessage("");
     setQuickFillOpen(false);
+    setActivityOptions([]);
+    setActivityMessage("");
     resetFormState();
     await loadPartitions();
     await loadCollections();
@@ -234,6 +271,24 @@ export default function SubmissionSection() {
     setMessage("");
   };
 
+  const updateResegmentVideoSecondsByMerged = async (mergedList, mergedId) => {
+    const target = mergedList.find(
+      (item) => String(item?.id) === String(mergedId),
+    );
+    const mergedPath = target?.videoPath || "";
+    if (!mergedPath) {
+      setResegmentVideoSeconds(0);
+      return;
+    }
+    try {
+      const duration = await invokeCommand("video_duration", { path: mergedPath });
+      const durationSeconds = Number(duration);
+      setResegmentVideoSeconds(Number.isFinite(durationSeconds) ? durationSeconds : 0);
+    } catch (error) {
+      setResegmentVideoSeconds(0);
+    }
+  };
+
   const openResegmentModal = async (taskId) => {
     const targetId = String(taskId || "").trim();
     if (!targetId) {
@@ -246,6 +301,9 @@ export default function SubmissionSection() {
     setResegmentSeconds("");
     setResegmentSubmitting(false);
     setResegmentVideoSeconds(0);
+    setResegmentMode("SPECIFIED");
+    setResegmentMergedVideos([]);
+    setResegmentMergedId("");
     try {
       const detail = await invokeCommand("submission_detail", { taskId: targetId });
       const seconds = Number(
@@ -254,11 +312,14 @@ export default function SubmissionSection() {
       const resolvedSeconds = Number.isFinite(seconds) ? seconds : 0;
       setResegmentDefaultSeconds(resolvedSeconds);
       setResegmentSeconds(resolvedSeconds ? String(resolvedSeconds) : "");
-      const mergedPath = detail?.mergedVideos?.[0]?.videoPath || "";
-      if (mergedPath) {
-        const duration = await invokeCommand("video_duration", { path: mergedPath });
-        const durationSeconds = Number(duration);
-        setResegmentVideoSeconds(Number.isFinite(durationSeconds) ? durationSeconds : 0);
+      const mergedVideos = Array.isArray(detail?.mergedVideos)
+        ? detail.mergedVideos
+        : [];
+      setResegmentMergedVideos(mergedVideos);
+      const defaultMergedId = mergedVideos[0]?.id ? String(mergedVideos[0].id) : "";
+      setResegmentMergedId(defaultMergedId);
+      if (defaultMergedId) {
+        await updateResegmentVideoSecondsByMerged(mergedVideos, defaultMergedId);
       }
     } catch (error) {
       setMessage(error.message);
@@ -272,10 +333,13 @@ export default function SubmissionSection() {
     setResegmentSeconds("");
     setResegmentSubmitting(false);
     setResegmentVideoSeconds(0);
+    setResegmentMode("SPECIFIED");
+    setResegmentMergedVideos([]);
+    setResegmentMergedId("");
     setMessage("");
   };
 
-  const openRepostModal = (task) => {
+  const openRepostModal = async (task) => {
     const targetId = String(task?.taskId || "").trim();
     if (!targetId) {
       return;
@@ -287,11 +351,26 @@ export default function SubmissionSection() {
     setRepostHasBvid(hasBvid);
     setRepostUseCurrentBvid(hasBvid);
     setRepostSubmitting(false);
+    setRepostMode("SPECIFIED");
+    setRepostMergedVideos([]);
+    setRepostMergedId("");
     setRepostBaiduSync({
       enabled: Boolean(task?.baiduSyncEnabled),
       path: task?.baiduSyncPath || "",
       filename: task?.baiduSyncFilename || "",
     });
+    try {
+      const detail = await invokeCommand("submission_detail", { taskId: targetId });
+      const mergedVideos = Array.isArray(detail?.mergedVideos)
+        ? detail.mergedVideos
+        : [];
+      setRepostMergedVideos(mergedVideos);
+      const defaultMergedId = mergedVideos[0]?.id ? String(mergedVideos[0].id) : "";
+      setRepostMergedId(defaultMergedId);
+      setRepostMode(mergedVideos.length ? "SPECIFIED" : "FULL_REPROCESS");
+    } catch (error) {
+      setMessage(error.message);
+    }
   };
 
   const closeRepostModal = () => {
@@ -300,6 +379,9 @@ export default function SubmissionSection() {
     setRepostHasBvid(false);
     setRepostUseCurrentBvid(false);
     setRepostSubmitting(false);
+    setRepostMode("SPECIFIED");
+    setRepostMergedVideos([]);
+    setRepostMergedId("");
     setRepostBaiduSync({ enabled: false, path: "", filename: "" });
     setMessage("");
   };
@@ -392,6 +474,98 @@ export default function SubmissionSection() {
       setMessage(error.message);
     }
   };
+
+  const normalizeActivityOptions = (items) => {
+    return (items || [])
+      .map((item) => ({
+        topicId: Number(item?.topicId ?? item?.topic_id ?? 0),
+        missionId: Number(item?.missionId ?? item?.mission_id ?? 0),
+        name: item?.name || item?.topicName || item?.topic_name || "",
+        description: item?.description || "",
+        activityText: item?.activityText || item?.activity_text || "",
+        activityDescription: item?.activityDescription || item?.activity_description || "",
+      }))
+      .filter((item) => item.topicId > 0 && item.name);
+  };
+
+  const applyActivitySelection = (activity) => {
+    const previousTitle = taskForm.activityTitle || "";
+    const nextTitle = activity?.name || "";
+    setTaskForm((prev) => ({
+      ...prev,
+      activityTopicId: activity ? String(activity.topicId) : "",
+      activityMissionId: activity ? String(activity.missionId || "") : "",
+      activityTitle: nextTitle,
+    }));
+    setTags((prev) => {
+      let next = prev.filter((tag) => tag !== previousTitle);
+      if (nextTitle && !next.includes(nextTitle)) {
+        next = [...next, nextTitle];
+      }
+      return next;
+    });
+  };
+
+  const clearActivitySelection = () => {
+    const previousTitle = taskForm.activityTitle || "";
+    setTaskForm((prev) => ({
+      ...prev,
+      activityTopicId: "",
+      activityMissionId: "",
+      activityTitle: "",
+    }));
+    if (previousTitle) {
+      setTags((prev) => prev.filter((tag) => tag !== previousTitle));
+    }
+  };
+
+  const loadActivities = async (partitionId) => {
+    setActivityLoading(true);
+    setActivityMessage("");
+    try {
+      const data = await invokeCommand("bilibili_topics", {
+        partitionId: partitionId ? Number(partitionId) : null,
+      });
+      const mapped = normalizeActivityOptions(data);
+      setActivityOptions(mapped);
+      const currentId = Number(taskForm.activityTopicId || 0);
+      if (currentId > 0 && mapped.length > 0 && !mapped.some((item) => item.topicId === currentId)) {
+        clearActivitySelection();
+      }
+    } catch (error) {
+      setActivityOptions([]);
+      setActivityMessage(error.message);
+    } finally {
+      setActivityLoading(false);
+    }
+  };
+
+  const handleActivityChange = (event) => {
+    const value = event.target.value;
+    if (!value) {
+      applyActivitySelection(null);
+      return;
+    }
+    const target = activityOptions.find((item) => String(item.topicId) === value);
+    if (!target) {
+      applyActivitySelection(null);
+      return;
+    }
+    applyActivitySelection(target);
+  };
+
+  useEffect(() => {
+    if (!isCreateView && !isEditView) {
+      return;
+    }
+    const partitionId = Number(taskForm.partitionId || 0);
+    if (!partitionId) {
+      setActivityOptions([]);
+      clearActivitySelection();
+      return;
+    }
+    loadActivities(partitionId);
+  }, [isCreateView, isEditView, taskForm.partitionId]);
 
   const loadTasks = async (
     filter = statusFilter,
@@ -758,6 +932,14 @@ export default function SubmissionSection() {
 
   const removeTag = (target) => {
     setTags((prev) => prev.filter((tag) => tag !== target));
+    if (target === taskForm.activityTitle) {
+      setTaskForm((prev) => ({
+        ...prev,
+        activityTopicId: "",
+        activityMissionId: "",
+        activityTitle: "",
+      }));
+    }
   };
 
   const handleTagKeyDown = (event) => {
@@ -847,6 +1029,9 @@ export default function SubmissionSection() {
             partitionId: Number(taskForm.partitionId),
             collectionId: taskForm.collectionId ? Number(taskForm.collectionId) : null,
             tags: uniqueTags.join(","),
+            topicId: taskForm.activityTopicId ? Number(taskForm.activityTopicId) : null,
+            missionId: taskForm.activityMissionId ? Number(taskForm.activityMissionId) : null,
+            activityTitle: taskForm.activityTitle || null,
             videoType: taskForm.videoType,
             segmentPrefix: taskForm.segmentPrefix || null,
             baiduSyncEnabled: Boolean(taskForm.baiduSyncEnabled),
@@ -1032,6 +1217,7 @@ export default function SubmissionSection() {
       return;
     }
     try {
+      const { openUrl } = await import("@tauri-apps/plugin-opener");
       await openUrl(`https://www.bilibili.com/video/${bvid}`);
     } catch (error) {
       setMessage(error?.message || "打开视频链接失败");
@@ -1066,6 +1252,9 @@ export default function SubmissionSection() {
       description: task.description || "",
       partitionId: task.partitionId ? String(task.partitionId) : "",
       collectionId: task.collectionId ? String(task.collectionId) : "",
+      activityTopicId: task.topicId ? String(task.topicId) : "",
+      activityMissionId: task.missionId ? String(task.missionId) : "",
+      activityTitle: task.activityTitle || "",
       videoType: task.videoType || "ORIGINAL",
       baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
       baiduSyncPath: task.baiduSyncPath || "",
@@ -1106,6 +1295,9 @@ export default function SubmissionSection() {
       description: task.description || "",
       partitionId: task.partitionId ? String(task.partitionId) : "",
       collectionId: task.collectionId ? String(task.collectionId) : "",
+      activityTopicId: task.topicId ? String(task.topicId) : "",
+      activityMissionId: task.missionId ? String(task.missionId) : "",
+      activityTitle: task.activityTitle || "",
       videoType: task.videoType || "ORIGINAL",
       segmentPrefix: task.segmentPrefix || "",
       baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
@@ -1316,6 +1508,16 @@ export default function SubmissionSection() {
     }
   };
 
+  const handleResegmentMergedChange = async (event) => {
+    const nextId = event.target.value;
+    setResegmentMergedId(nextId);
+    if (nextId) {
+      await updateResegmentVideoSecondsByMerged(resegmentMergedVideos, nextId);
+    } else {
+      setResegmentVideoSeconds(0);
+    }
+  };
+
   const handleResegmentSubmit = async () => {
     if (!resegmentTaskId || resegmentSubmitting) {
       return;
@@ -1325,6 +1527,10 @@ export default function SubmissionSection() {
       setMessage("分段时长必须大于0");
       return;
     }
+    if (resegmentMode === "SPECIFIED" && !resegmentMergedId) {
+      setMessage("请选择合并视频");
+      return;
+    }
     setMessage("");
     setResegmentSubmitting(true);
     try {
@@ -1332,6 +1538,11 @@ export default function SubmissionSection() {
         request: {
           taskId: resegmentTaskId,
           segmentDurationSeconds: Math.floor(nextSeconds),
+          mode: resegmentMode,
+          mergedVideoId:
+            resegmentMode === "SPECIFIED" && resegmentMergedId
+              ? Number(resegmentMergedId)
+              : null,
         },
       });
       closeResegmentModal();
@@ -1346,6 +1557,14 @@ export default function SubmissionSection() {
     if (!repostTaskId || repostSubmitting) {
       return;
     }
+    if (repostMode === "SPECIFIED" && !repostMergedId) {
+      setMessage("请选择合并视频");
+      return;
+    }
+    if (repostMode === "FULL_REPROCESS" && !repostUseCurrentBvid && !repostHasBvid) {
+      setMessage("当前任务没有BV号，只能选择重新生成投稿");
+      return;
+    }
     setMessage("");
     setRepostSubmitting(true);
     try {
@@ -1353,6 +1572,11 @@ export default function SubmissionSection() {
         request: {
           taskId: repostTaskId,
           integrateCurrentBvid: repostUseCurrentBvid,
+          mode: repostMode,
+          mergedVideoId:
+            repostMode === "SPECIFIED" && repostMergedId
+              ? Number(repostMergedId)
+              : null,
           baiduSyncEnabled: Boolean(repostBaiduSync.enabled),
           baiduSyncPath: repostBaiduSync.path || null,
           baiduSyncFilename: repostBaiduSync.filename || null,
@@ -1466,6 +1690,9 @@ export default function SubmissionSection() {
             partitionId: Number(taskForm.partitionId),
             collectionId: taskForm.collectionId ? Number(taskForm.collectionId) : null,
             tags: uniqueTags.join(","),
+            topicId: taskForm.activityTopicId ? Number(taskForm.activityTopicId) : null,
+            missionId: taskForm.activityMissionId ? Number(taskForm.activityMissionId) : null,
+            activityTitle: taskForm.activityTitle || null,
             videoType: taskForm.videoType,
             segmentPrefix: taskForm.segmentPrefix || null,
           },
@@ -2013,6 +2240,17 @@ export default function SubmissionSection() {
     return "未知";
   };
 
+  const resolveMergedVideoLabel = (merged) => {
+    if (!merged) {
+      return "未命名合并视频";
+    }
+    const fileName = merged.fileName || "";
+    const pathName = merged.videoPath ? merged.videoPath.split("/").pop() : "";
+    const displayName = fileName || pathName || `合并视频 ${merged.id ?? ""}`.trim();
+    const createdAt = merged.createTime ? ` ${merged.createTime}` : "";
+    return `${displayName}${createdAt}`.trim();
+  };
+
   const resolveResegmentCount = (durationSeconds, segmentSecondsValue) => {
     const duration = Number(durationSeconds);
     const segmentSeconds = Math.floor(Number(segmentSecondsValue));
@@ -2220,6 +2458,41 @@ export default function SubmissionSection() {
                     />
                   )}
                 </div>
+              </div>
+              <div className="mt-2 space-y-1">
+                <div className="text-xs text-[var(--muted)]">活动话题（可选）</div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={taskForm.activityTopicId}
+                    onChange={handleActivityChange}
+                    disabled={isReadOnly || activityLoading || !taskForm.partitionId}
+                    className="min-w-[200px] flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                  >
+                    <option value="">不参与活动</option>
+                    {activitySelectOptions.map((activity) => (
+                      <option key={activity.topicId} value={activity.topicId}>
+                        {activity.name}
+                        {activity.activityText ? ` · ${activity.activityText}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                  {isReadOnly ? null : (
+                    <button
+                      type="button"
+                      onClick={() => loadActivities(taskForm.partitionId)}
+                      disabled={activityLoading || !taskForm.partitionId}
+                      className="rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-xs text-[var(--muted)] hover:text-[var(--accent)] disabled:opacity-60"
+                    >
+                      刷新活动
+                    </button>
+                  )}
+                </div>
+                {activityLoading ? (
+                  <div className="text-xs text-[var(--muted)]">活动加载中...</div>
+                ) : null}
+                {activityMessage ? (
+                  <div className="text-xs text-rose-500">{activityMessage}</div>
+                ) : null}
               </div>
             </div>
             <div className="space-y-1">
@@ -3084,6 +3357,45 @@ export default function SubmissionSection() {
                   </div>
                 ) : null}
                 <div className="mt-4 space-y-3 text-sm text-[var(--ink)]">
+                  <div className="space-y-2">
+                    <div className="text-xs text-[var(--muted)]">重新分段模式</div>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        checked={resegmentMode === "SPECIFIED"}
+                        onChange={() => setResegmentMode("SPECIFIED")}
+                      />
+                      <span>指定合并视频</span>
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        checked={resegmentMode === "MERGE_ALL"}
+                        onChange={() => setResegmentMode("MERGE_ALL")}
+                      />
+                      <span>合并全部合并视频</span>
+                    </label>
+                    {resegmentMode === "SPECIFIED" ? (
+                      <div className="space-y-1">
+                        <div className="text-xs text-[var(--muted)]">选择合并视频</div>
+                        <select
+                          value={resegmentMergedId}
+                          onChange={handleResegmentMergedChange}
+                          className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                        >
+                          <option value="">请选择合并视频</option>
+                          {resegmentMergedVideos.map((merged) => (
+                            <option key={merged.id} value={String(merged.id)}>
+                              {resolveMergedVideoLabel(merged)}
+                            </option>
+                          ))}
+                        </select>
+                        {resegmentMergedVideos.length === 0 ? (
+                          <div className="text-xs text-amber-700">未找到合并视频</div>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
                   <div className="space-y-1">
                     <div className="text-xs text-[var(--muted)]">
                       当前分段时长（秒）
@@ -3151,29 +3463,106 @@ export default function SubmissionSection() {
                   </div>
                 ) : null}
                 <div className="mt-4 space-y-3 text-sm text-[var(--ink)]">
-                  <div className="text-xs text-[var(--muted)]">是否集成当前BV视频</div>
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="radio"
-                      checked={repostUseCurrentBvid}
-                      onChange={() => setRepostUseCurrentBvid(true)}
-                      disabled={!repostHasBvid}
-                    />
-                    <span>集成当前BV视频（编辑投稿，沿用BV号）</span>
-                  </label>
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="radio"
-                      checked={!repostUseCurrentBvid}
-                      onChange={() => setRepostUseCurrentBvid(false)}
-                    />
-                    <span>重新生成投稿（创建新的BV号）</span>
-                  </label>
-                  {!repostHasBvid ? (
-                    <div className="text-xs text-amber-700">
-                      当前任务没有BV号，将创建新投稿。
+                  <div className="space-y-2">
+                    <div className="text-xs text-[var(--muted)]">重新投稿模式</div>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        checked={repostMode === "SPECIFIED"}
+                        onChange={() => setRepostMode("SPECIFIED")}
+                      />
+                      <span>指定合并视频</span>
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        checked={repostMode === "MERGE_ALL"}
+                        onChange={() => setRepostMode("MERGE_ALL")}
+                      />
+                      <span>合并全部合并视频</span>
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        checked={repostMode === "FULL_REPROCESS"}
+                        onChange={() => setRepostMode("FULL_REPROCESS")}
+                      />
+                      <span>全部重新投稿（重新剪辑+合并+分段）</span>
+                    </label>
+                    {repostMode === "SPECIFIED" ? (
+                      <div className="space-y-1">
+                        <div className="text-xs text-[var(--muted)]">选择合并视频</div>
+                        <select
+                          value={repostMergedId}
+                          onChange={(event) => setRepostMergedId(event.target.value)}
+                          className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                        >
+                          <option value="">请选择合并视频</option>
+                          {repostMergedVideos.map((merged) => (
+                            <option key={merged.id} value={String(merged.id)}>
+                              {resolveMergedVideoLabel(merged)}
+                            </option>
+                          ))}
+                        </select>
+                        {repostMergedVideos.length === 0 ? (
+                          <div className="text-xs text-amber-700">未找到合并视频</div>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                  {repostMode === "FULL_REPROCESS" ? (
+                    <div className="space-y-2">
+                      <div className="text-xs text-[var(--muted)]">投稿类型</div>
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="radio"
+                          checked={repostUseCurrentBvid}
+                          onChange={() => setRepostUseCurrentBvid(true)}
+                          disabled={!repostHasBvid}
+                        />
+                        <span>集成当前BV视频（编辑投稿，沿用BV号）</span>
+                      </label>
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="radio"
+                          checked={!repostUseCurrentBvid}
+                          onChange={() => setRepostUseCurrentBvid(false)}
+                        />
+                        <span>重新生成投稿（创建新的BV号）</span>
+                      </label>
+                      {!repostHasBvid ? (
+                        <div className="text-xs text-amber-700">
+                          当前任务没有BV号，将创建新投稿。
+                        </div>
+                      ) : null}
                     </div>
-                  ) : null}
+                  ) : (
+                    <div className="space-y-2">
+                      <div className="text-xs text-[var(--muted)]">是否集成当前BV视频</div>
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="radio"
+                          checked={repostUseCurrentBvid}
+                          onChange={() => setRepostUseCurrentBvid(true)}
+                          disabled={!repostHasBvid}
+                        />
+                        <span>集成当前BV视频（编辑投稿，沿用BV号）</span>
+                      </label>
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="radio"
+                          checked={!repostUseCurrentBvid}
+                          onChange={() => setRepostUseCurrentBvid(false)}
+                        />
+                        <span>重新生成投稿（创建新的BV号）</span>
+                      </label>
+                      {!repostHasBvid ? (
+                        <div className="text-xs text-amber-700">
+                          当前任务没有BV号，将创建新投稿。
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
                 </div>
                 <div className="mt-4 rounded-lg border border-black/5 bg-white/80 p-3 text-sm text-[var(--ink)]">
                   <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">

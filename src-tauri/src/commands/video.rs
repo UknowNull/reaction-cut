@@ -1,10 +1,11 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, USER_AGENT};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use tauri::State;
-use chrono::Utc;
 
 use crate::api::ApiResponse;
 use crate::login_store::AuthInfo;
@@ -23,6 +24,17 @@ pub struct Collection {
   pub name: String,
   pub cover: Option<String>,
   pub description: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityTopic {
+  pub topic_id: i64,
+  pub mission_id: i64,
+  pub name: String,
+  pub description: Option<String>,
+  pub activity_text: Option<String>,
+  pub activity_description: Option<String>,
 }
 
 #[tauri::command]
@@ -264,6 +276,108 @@ pub async fn bilibili_partitions(
   } else {
     Ok(ApiResponse::success(partitions))
   }
+}
+
+#[tauri::command]
+pub async fn bilibili_topics(
+  state: State<'_, AppState>,
+  partition_id: Option<i64>,
+) -> Result<ApiResponse<Vec<ActivityTopic>>, String> {
+  let auth = load_auth(&state);
+  if auth.is_none() {
+    return Ok(ApiResponse::error("Login required"));
+  }
+
+  let url = "https://member.bilibili.com/x/vupre/web/topic/type";
+  let timestamp = Utc::now().timestamp_millis();
+  let mut page = 0;
+  let page_size = 50;
+  let mut max_page = 1;
+  let mut topics = Vec::new();
+  let mut seen = HashSet::new();
+
+  loop {
+    let mut params = vec![
+      ("pn".to_string(), page.to_string()),
+      ("ps".to_string(), page_size.to_string()),
+      ("t".to_string(), timestamp.to_string()),
+    ];
+    if let Some(partition_id) = partition_id {
+      if partition_id > 0 {
+        params.push(("type_id".to_string(), partition_id.to_string()));
+      }
+    }
+
+    let data = match state
+      .bilibili
+      .get_json(url, &params, auth.as_ref(), false)
+      .await
+    {
+      Ok(data) => data,
+      Err(err) => {
+        return Ok(ApiResponse::error(format!("Failed to load topics: {}", err)));
+      }
+    };
+
+    let next_max_page = data
+      .get("maxpage")
+      .and_then(|value| value.as_i64())
+      .unwrap_or(page + 1);
+    max_page = max_page.max(next_max_page);
+
+    if let Some(list) = data.get("topics").and_then(|value| value.as_array()) {
+      for item in list {
+        let topic_id = item
+          .get("topic_id")
+          .and_then(|value| value.as_i64())
+          .unwrap_or(0);
+        if topic_id <= 0 || !seen.insert(topic_id) {
+          continue;
+        }
+        let mission_id = item
+          .get("mission_id")
+          .and_then(|value| value.as_i64())
+          .unwrap_or(0);
+        let name = item
+          .get("topic_name")
+          .and_then(|value| value.as_str())
+          .unwrap_or_default()
+          .to_string();
+        let description = item
+          .get("description")
+          .and_then(|value| value.as_str())
+          .map(|value| value.to_string());
+        let activity_text = item
+          .get("activity_text")
+          .and_then(|value| value.as_str())
+          .map(|value| value.to_string());
+        let activity_description = item
+          .get("activity_description")
+          .and_then(|value| value.as_str())
+          .map(|value| value.to_string());
+
+        if mission_id <= 0 && activity_text.as_deref().unwrap_or("").is_empty() {
+          continue;
+        }
+
+        topics.push(ActivityTopic {
+          topic_id,
+          mission_id,
+          name,
+          description,
+          activity_text,
+          activity_description,
+        });
+      }
+    }
+
+    if page + 1 >= max_page {
+      break;
+    }
+    page += 1;
+  }
+
+  Ok(ApiResponse::success(topics))
 }
 
 fn default_partitions() -> Vec<Partition> {

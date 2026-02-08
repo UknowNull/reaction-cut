@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -67,7 +67,9 @@ pub struct LiveRoomInfo {
   pub live_status: i64,
   pub title: String,
   pub cover: Option<String>,
+  #[allow(dead_code)]
   pub area_name: Option<String>,
+  #[allow(dead_code)]
   pub parent_area_name: Option<String>,
 }
 
@@ -75,6 +77,10 @@ const INVALID_STREAM_TAG_LIMIT: usize = 300;
 const INVALID_STREAM_STALL_SECS: u64 = 10;
 const STREAM_URL_REFRESH_LEAD_SECS: u64 = 30;
 const MISSING_SEGMENT_WINDOW_SECS: u64 = 60;
+const TIMESTAMP_JUMP_THRESHOLD_MS: i64 = 500;
+const TIMESTAMP_AUDIO_FALLBACK_MS: i64 = 22;
+const TIMESTAMP_VIDEO_FALLBACK_MS: i64 = 33;
+const TIMESTAMP_MIN_STEP_MS: i64 = 1;
 
 pub fn new_live_runtime() -> LiveRuntime {
   LiveRuntime {
@@ -97,6 +103,7 @@ impl LiveRuntime {
     })
   }
 
+  #[allow(dead_code)]
   pub fn mark_split(&self, room_id: &str) {
     if let Ok(map) = self.records.lock() {
       if let Some(handle) = map.get(room_id) {
@@ -950,6 +957,12 @@ fn run_record_loop(
     let mut buf = vec![0u8; 8192];
     let mut parser = FlvStreamParser::new();
     let mut cache = FlvHeaderCache::new();
+    let enable_timestamp_fix =
+      settings.flv_fix_adjust_timestamp_jump || settings.flv_fix_split_on_timestamp_jump;
+    let mut timestamp_fixer = TimestampFixer::new(
+      enable_timestamp_fix,
+      settings.flv_fix_adjust_timestamp_jump,
+    );
     let mut last_tag_timestamp: Option<u32> = None;
     let mut stagnant_count: usize = 0;
     let mut last_progress_at = Instant::now();
@@ -1046,11 +1059,29 @@ fn run_record_loop(
                     nickname.as_deref(),
                   )?;
                   cache.write_preamble(&mut new_segment)?;
+                  timestamp_fixer.reset();
                   segment_start = Instant::now();
                   segment = Some(new_segment);
                 }
               }
-              FlvParsedItem::Tag(tag) => {
+              FlvParsedItem::Tag(mut tag) => {
+                if enable_timestamp_fix {
+                  let is_header_tag = tag.tag_type == 18
+                    || is_audio_header_tag(tag.data())
+                    || is_video_header_tag(tag.data());
+                  if let Some(jump) = timestamp_fixer.fix_tag(&mut tag, is_header_tag) {
+                    append_log(
+                      &context.app_log_path,
+                      &format!(
+                        "stream_timestamp_jump room={} diff={} original={} fixed={} offset={}",
+                        room_id, jump.diff, jump.original, jump.fixed, jump.offset
+                      ),
+                    );
+                    if settings.flv_fix_split_on_timestamp_jump {
+                      pending_split = true;
+                    }
+                  }
+                }
                 cache.update_from_tag(&tag);
                 let request_split = split_flag.swap(false, Ordering::SeqCst);
                 let title_split_requested = title_split_flag.swap(false, Ordering::SeqCst);
@@ -1122,6 +1153,7 @@ fn run_record_loop(
                       nickname.as_deref(),
                     )?;
                     cache.write_preamble(&mut new_segment)?;
+                    timestamp_fixer.reset();
                     segment_start = Instant::now();
                     segment = Some(new_segment);
                     pending_split = false;
@@ -1191,14 +1223,27 @@ fn run_record_loop(
           }
         }
         Err(err) => {
-          append_log(&context.app_log_path, &format!("stream_read_error room={} err={}", room_id, err));
-          mark_force_no_qn(
-            &mut force_no_qn_until,
-            &settings,
-            context.app_log_path.as_ref(),
-            room_id.as_str(),
-            "read_error",
-          );
+          let err_text = err.to_string();
+          let is_timeout = err.kind() == ErrorKind::TimedOut
+            || err_text.to_ascii_lowercase().contains("timed out");
+          if is_timeout {
+            append_log(
+              &context.app_log_path,
+              &format!("stream_read_timeout room={} err={}", room_id, err_text),
+            );
+          } else {
+            append_log(
+              &context.app_log_path,
+              &format!("stream_read_error room={} err={}", room_id, err_text),
+            );
+            mark_force_no_qn(
+              &mut force_no_qn_until,
+              &settings,
+              context.app_log_path.as_ref(),
+              room_id.as_str(),
+              "read_error",
+            );
+          }
           let missing_since = missing_started_at.get_or_insert_with(Instant::now);
           let missing_elapsed = missing_since.elapsed().as_secs();
           let should_split = settings.flv_fix_split_on_missing && !settings.flv_fix_disable_on_annexb;
@@ -1258,6 +1303,16 @@ impl FlvTag {
   }
 }
 
+fn write_flv_timestamp(tag: &mut FlvTag, timestamp: u32) {
+  if tag.bytes.len() < 8 {
+    return;
+  }
+  tag.bytes[4] = ((timestamp >> 16) & 0xff) as u8;
+  tag.bytes[5] = ((timestamp >> 8) & 0xff) as u8;
+  tag.bytes[6] = (timestamp & 0xff) as u8;
+  tag.bytes[7] = ((timestamp >> 24) & 0xff) as u8;
+}
+
 fn is_video_keyframe(tag: &FlvTag) -> bool {
   if tag.tag_type != 9 {
     return false;
@@ -1268,6 +1323,151 @@ fn is_video_keyframe(tag: &FlvTag) -> bool {
   }
   let frame_type = data[0] >> 4;
   frame_type == 1
+}
+
+fn is_audio_header_tag(data: &[u8]) -> bool {
+  if data.len() < 2 {
+    return false;
+  }
+  let sound_format = data[0] >> 4;
+  sound_format == 10 && data[1] == 0
+}
+
+fn is_video_header_tag(data: &[u8]) -> bool {
+  if data.len() < 2 {
+    return false;
+  }
+  let codec_id = data[0] & 0x0f;
+  let packet_type = data[1];
+  (codec_id == 7 || codec_id == 12) && packet_type == 0
+}
+
+fn clamp_timestamp(value: i64) -> u32 {
+  if value <= 0 {
+    return 0;
+  }
+  if value > u32::MAX as i64 {
+    return u32::MAX;
+  }
+  value as u32
+}
+
+struct TimestampJumpInfo {
+  diff: i64,
+  original: i64,
+  fixed: i64,
+  offset: i64,
+}
+
+struct TimestampFixer {
+  enabled: bool,
+  apply_fix: bool,
+  last_original: Option<i64>,
+  last_fixed: Option<i64>,
+  current_offset: i64,
+}
+
+impl TimestampFixer {
+  fn new(enabled: bool, apply_fix: bool) -> Self {
+    Self {
+      enabled,
+      apply_fix,
+      last_original: None,
+      last_fixed: None,
+      current_offset: 0,
+    }
+  }
+
+  fn reset(&mut self) {
+    self.last_original = None;
+    self.last_fixed = None;
+    self.current_offset = 0;
+  }
+
+  fn fix_tag(&mut self, tag: &mut FlvTag, is_header: bool) -> Option<TimestampJumpInfo> {
+    if !self.enabled {
+      return None;
+    }
+    let original = parse_flv_timestamp(tag) as i64;
+    if !self.apply_fix {
+      if is_header {
+        return None;
+      }
+      let last_original = match self.last_original {
+        Some(value) => value,
+        None => {
+          self.last_original = Some(original);
+          self.last_fixed = Some(original);
+          return None;
+        }
+      };
+      let diff = original - last_original;
+      self.last_original = Some(original);
+      self.last_fixed = Some(original);
+      if diff < -TIMESTAMP_JUMP_THRESHOLD_MS || diff > TIMESTAMP_JUMP_THRESHOLD_MS {
+        return Some(TimestampJumpInfo {
+          diff,
+          original,
+          fixed: original,
+          offset: 0,
+        });
+      }
+      return None;
+    }
+    let step = match tag.tag_type {
+      8 => TIMESTAMP_AUDIO_FALLBACK_MS,
+      9 => TIMESTAMP_VIDEO_FALLBACK_MS,
+      _ => TIMESTAMP_MIN_STEP_MS,
+    }
+    .max(TIMESTAMP_MIN_STEP_MS);
+
+    if is_header {
+      if let Some(last_fixed) = self.last_fixed {
+        write_flv_timestamp(tag, clamp_timestamp(last_fixed));
+      } else {
+        write_flv_timestamp(tag, 0);
+      }
+      return None;
+    }
+
+    let last_original = match self.last_original {
+      Some(value) => value,
+      None => {
+        self.current_offset = original;
+        let fixed = 0;
+        self.last_original = Some(original);
+        self.last_fixed = Some(fixed);
+        write_flv_timestamp(tag, fixed as u32);
+        return None;
+      }
+    };
+    let last_fixed = self.last_fixed.unwrap_or(0);
+    let diff = original - last_original;
+
+    if diff < -TIMESTAMP_JUMP_THRESHOLD_MS || diff > TIMESTAMP_JUMP_THRESHOLD_MS {
+      let fixed = last_fixed + step;
+      self.current_offset = original - fixed;
+      self.last_original = Some(original);
+      self.last_fixed = Some(fixed);
+      write_flv_timestamp(tag, clamp_timestamp(fixed));
+      return Some(TimestampJumpInfo {
+        diff,
+        original,
+        fixed,
+        offset: self.current_offset,
+      });
+    }
+
+    let mut fixed = original - self.current_offset;
+    if fixed <= last_fixed {
+      fixed = last_fixed + step;
+      self.current_offset = original - fixed;
+    }
+    self.last_original = Some(original);
+    self.last_fixed = Some(fixed);
+    write_flv_timestamp(tag, clamp_timestamp(fixed));
+    None
+  }
 }
 
 enum FlvParsedItem {
@@ -1466,6 +1666,7 @@ struct SegmentWriter {
   file_path: String,
   file: File,
   bytes_written: u64,
+  #[allow(dead_code)]
   title: String,
   metadata_path: Option<String>,
 }
@@ -2017,6 +2218,7 @@ fn record_hls_stream(
   });
 
   let mut stdin = child.stdin.take();
+  #[allow(unused_assignments)]
   let mut exit_status = None;
   loop {
     if stop_flag.load(Ordering::SeqCst) {
@@ -2598,6 +2800,7 @@ fn handle_danmaku_payload(
 
 struct DanmakuPacket {
   op: u32,
+  #[allow(dead_code)]
   version: u16,
   body: Vec<u8>,
 }

@@ -25,6 +25,7 @@ impl Db {
     }
 
     let conn = Connection::open(db_path)?;
+    let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN merged_id INTEGER", []);
     conn.execute_batch(include_str!("db/schema.sql"))?;
     let _ = conn.execute(
       "INSERT OR IGNORE INTO app_settings (key, value, updated_at) \
@@ -46,6 +47,18 @@ impl Db {
       "ALTER TABLE live_settings ADD COLUMN title_split_min_seconds INTEGER DEFAULT 1800",
       [],
     );
+    let _ = conn.execute(
+      "ALTER TABLE live_settings ADD COLUMN stream_read_timeout_ms INTEGER DEFAULT 15000",
+      [],
+    );
+    let _ = conn.execute(
+      "ALTER TABLE live_settings ADD COLUMN flv_fix_adjust_timestamp_jump INTEGER DEFAULT 1",
+      [],
+    );
+    let _ = conn.execute(
+      "ALTER TABLE live_settings ADD COLUMN flv_fix_split_on_timestamp_jump INTEGER DEFAULT 1",
+      [],
+    );
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN aid INTEGER", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN remote_state INTEGER", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN reject_reason TEXT", []);
@@ -55,6 +68,9 @@ impl Db {
     );
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN baidu_sync_path TEXT", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN baidu_sync_filename TEXT", []);
+    let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN topic_id INTEGER", []);
+    let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN mission_id INTEGER", []);
+    let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN activity_title TEXT", []);
     let _ = conn.execute("ALTER TABLE video_download ADD COLUMN cid INTEGER", []);
     let _ = conn.execute("ALTER TABLE video_download ADD COLUMN content TEXT", []);
     let _ = conn.execute(

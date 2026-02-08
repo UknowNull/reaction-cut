@@ -11,6 +11,7 @@ use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use rusqlite::params;
 use tauri::State;
 use tokio::time::sleep;
 use url::Url;
@@ -114,6 +115,9 @@ pub struct SubmissionRequest {
   pub description: Option<String>,
   pub partition_id: i64,
   pub tags: Option<String>,
+  pub topic_id: Option<i64>,
+  pub mission_id: Option<i64>,
+  pub activity_title: Option<String>,
   pub video_type: String,
   pub collection_id: Option<i64>,
   pub segment_prefix: Option<String>,
@@ -779,15 +783,18 @@ async fn handle_integration_download(
 
   let insert_result = context.db.with_conn(|conn| {
     conn.execute(
-      "INSERT INTO submission_task (task_id, status, title, description, cover_url, partition_id, tags, video_type, collection_id, bvid, aid, created_at, updated_at, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
-       VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11, ?12, ?13, ?14)",
-      (
+      "INSERT INTO submission_task (task_id, status, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
+       VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?13, ?14, ?15, ?16, ?17)",
+      params![
         &submission_id,
         "PENDING",
         submission.title,
         submission.description,
         submission.partition_id,
         submission.tags,
+        submission.topic_id,
+        submission.mission_id,
+        submission.activity_title.as_deref(),
         submission.video_type,
         submission.collection_id,
         &now,
@@ -800,7 +807,7 @@ async fn handle_integration_download(
         },
         submission.baidu_sync_path.as_deref(),
         submission.baidu_sync_filename.as_deref(),
-      ),
+      ],
     )?;
 
     for (index, part) in submission.video_parts.into_iter().enumerate() {
@@ -2389,6 +2396,7 @@ where
       ),
     );
   }
+  let _ = logged_rpc_not_ready;
 
   let mut last_error: Option<String> = None;
   let mut exit_status: Option<std::process::ExitStatus> = None;

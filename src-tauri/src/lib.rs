@@ -203,6 +203,7 @@ pub fn run() {
             commands::video::video_proxy_image,
             commands::video::bilibili_collections,
             commands::video::bilibili_partitions,
+            commands::video::bilibili_topics,
             commands::download::download_video,
             commands::download::download_get,
             commands::download::download_list_by_status,

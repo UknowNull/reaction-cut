@@ -30,10 +30,15 @@ pub fn clip_sources(
 ) -> Result<Vec<PathBuf>, String> {
   fs::create_dir_all(output_dir).map_err(|err| format!("Failed to create output dir: {}", err))?;
 
+  let transcode_profile = if use_copy {
+    None
+  } else {
+    build_transcode_profile(sources)?
+  };
   let mut outputs = Vec::new();
   for source in sources {
     let output_path = output_dir.join(format!("clip_{:03}.mp4", source.order));
-    clip_single(source, &output_path, use_copy)?;
+    clip_single(source, &output_path, use_copy, transcode_profile.as_ref())?;
     outputs.push(output_path);
   }
 
@@ -90,6 +95,12 @@ struct AudioProbeInfo {
 struct MediaProbeInfo {
   video: VideoProbeInfo,
   audio: Option<AudioProbeInfo>,
+}
+
+struct ClipTranscodeProfile {
+  width: i64,
+  height: i64,
+  normalize_video: bool,
 }
 
 fn parse_fraction(value: &str) -> Option<f64> {
@@ -190,6 +201,38 @@ fn probe_media_info(path: &Path) -> Result<MediaProbeInfo, String> {
 
   let video = video.ok_or_else(|| "缺少视频流".to_string())?;
   Ok(MediaProbeInfo { video, audio })
+}
+
+fn build_transcode_profile(sources: &[ClipSource]) -> Result<Option<ClipTranscodeProfile>, String> {
+  if sources.is_empty() {
+    return Ok(None);
+  }
+  let mut infos = Vec::with_capacity(sources.len());
+  for source in sources {
+    infos.push(probe_media_info(Path::new(&source.input_path))?);
+  }
+
+  let mut min_pixels = None;
+  let mut target = (0i64, 0i64);
+  for info in &infos {
+    if info.video.width <= 0 || info.video.height <= 0 {
+      return Err("无法读取视频分辨率".to_string());
+    }
+    let pixels = info.video.width.saturating_mul(info.video.height);
+    if min_pixels.map(|value| pixels < value).unwrap_or(true) {
+      min_pixels = Some(pixels);
+      target = (info.video.width, info.video.height);
+    }
+  }
+
+  let normalize_video = sources.len() > 1
+    && infos.iter().any(|info| info.video.width != target.0 || info.video.height != target.1);
+
+  Ok(Some(ClipTranscodeProfile {
+    width: target.0,
+    height: target.1,
+    normalize_video,
+  }))
 }
 
 fn can_concat_copy(files: &[PathBuf]) -> Result<bool, String> {
@@ -576,7 +619,12 @@ pub fn segment_file(
   Ok(outputs)
 }
 
-fn clip_single(source: &ClipSource, output_path: &Path, use_copy: bool) -> Result<(), String> {
+fn clip_single(
+  source: &ClipSource,
+  output_path: &Path,
+  use_copy: bool,
+  profile: Option<&ClipTranscodeProfile>,
+) -> Result<(), String> {
   let mut args = vec!["-i".to_string(), source.input_path.clone()];
 
   if let Some(start) = source.start_time.as_deref() {
@@ -596,20 +644,36 @@ fn clip_single(source: &ClipSource, output_path: &Path, use_copy: bool) -> Resul
   if use_copy {
     args.extend(["-c".to_string(), "copy".to_string()]);
   } else {
-    args.extend([
-      "-vf".to_string(),
-      "fps=60,pad=1920:1080:(ow-iw)/2:(oh-ih)/2".to_string(),
-      "-af".to_string(),
-      "aresample=48000:async=1:first_pts=0".to_string(),
-      "-c:v".to_string(),
-      "h264_videotoolbox".to_string(),
-      "-b:v".to_string(),
-      "5M".to_string(),
-      "-c:a".to_string(),
-      "aac".to_string(),
-      "-ar".to_string(),
-      "48000".to_string(),
-    ]);
+    if let Some(profile) = profile {
+      let mut filters = Vec::new();
+      filters.push("fps=60".to_string());
+      if profile.normalize_video && profile.width > 0 && profile.height > 0 {
+        filters.push(format!(
+          "scale={}:{}:force_original_aspect_ratio=decrease",
+          profile.width, profile.height
+        ));
+        filters.push(format!(
+          "pad={}:{}:(ow-iw)/2:(oh-ih)/2",
+          profile.width, profile.height
+        ));
+      }
+      if !filters.is_empty() {
+        args.push("-vf".to_string());
+        args.push(filters.join(","));
+      }
+      args.push("-af".to_string());
+      args.push("aresample=48000:async=1:first_pts=0".to_string());
+      args.extend([
+        "-c:v".to_string(),
+        "h264_videotoolbox".to_string(),
+        "-b:v".to_string(),
+        "5M".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-ar".to_string(),
+        "48000".to_string(),
+      ]);
+    }
   }
   args.push(output_path.to_string_lossy().to_string());
 

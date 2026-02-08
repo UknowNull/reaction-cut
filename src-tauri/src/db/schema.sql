@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS submission_task (
   cover_url TEXT,
   partition_id INTEGER NOT NULL,
   tags TEXT,
+  topic_id INTEGER,
+  mission_id INTEGER,
+  activity_title TEXT,
   video_type TEXT NOT NULL,
   collection_id INTEGER,
   bvid TEXT,
@@ -79,6 +82,7 @@ CREATE TABLE IF NOT EXISTS merged_video (
 CREATE TABLE IF NOT EXISTS task_output_segment (
   segment_id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL,
+  merged_id INTEGER,
   part_name TEXT NOT NULL,
   segment_file_path TEXT NOT NULL,
   part_order INTEGER NOT NULL,
@@ -99,6 +103,7 @@ CREATE TABLE IF NOT EXISTS task_output_segment (
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_output_segment_task_id ON task_output_segment (task_id);
+CREATE INDEX IF NOT EXISTS idx_task_output_segment_task_merged ON task_output_segment (task_id, merged_id);
 
 CREATE TABLE IF NOT EXISTS task_source_video (
   id TEXT PRIMARY KEY,
@@ -351,8 +356,11 @@ CREATE TABLE IF NOT EXISTS live_settings (
   stream_retry_ms INTEGER NOT NULL,
   stream_retry_no_qn_sec INTEGER NOT NULL,
   stream_connect_timeout_ms INTEGER NOT NULL,
+  stream_read_timeout_ms INTEGER NOT NULL DEFAULT 15000,
   check_interval_sec INTEGER NOT NULL,
   flv_fix_split_on_missing INTEGER NOT NULL,
+  flv_fix_adjust_timestamp_jump INTEGER NOT NULL DEFAULT 1,
+  flv_fix_split_on_timestamp_jump INTEGER NOT NULL DEFAULT 1,
   flv_fix_disable_on_annexb INTEGER NOT NULL,
   baidu_sync_enabled INTEGER NOT NULL DEFAULT 0,
   baidu_sync_path TEXT,

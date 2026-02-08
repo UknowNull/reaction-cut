@@ -14,6 +14,7 @@ pub const DEFAULT_UPLOAD_CONCURRENCY: i64 = 3;
 pub const MAX_UPLOAD_CONCURRENCY: i64 = 5;
 pub const DEFAULT_SUBMISSION_REMOTE_REFRESH_MINUTES: i64 = 10;
 pub const DEFAULT_BLOCK_PCDN: bool = true;
+#[allow(dead_code)]
 pub const DEFAULT_ENABLE_ARIA2C: bool = true;
 pub const DEFAULT_ARIA2C_CONNECTIONS: i64 = 4;
 pub const DEFAULT_ARIA2C_SPLIT: i64 = 4;
@@ -62,8 +63,11 @@ pub struct LiveSettings {
   pub stream_retry_ms: i64,
   pub stream_retry_no_qn_sec: i64,
   pub stream_connect_timeout_ms: i64,
+  pub stream_read_timeout_ms: i64,
   pub check_interval_sec: i64,
   pub flv_fix_split_on_missing: bool,
+  pub flv_fix_adjust_timestamp_jump: bool,
+  pub flv_fix_split_on_timestamp_jump: bool,
   pub flv_fix_disable_on_annexb: bool,
   pub baidu_sync_enabled: bool,
   pub baidu_sync_path: String,
@@ -221,8 +225,8 @@ pub fn update_live_settings(
   let now = Utc::now().to_rfc3339();
   let result = state.db.with_conn(|conn| {
     conn.execute(
-      "INSERT INTO live_settings (id, file_name_template, record_path, write_metadata, save_cover, recording_quality, record_mode, cutting_mode, cutting_number, cutting_by_title, title_split_min_seconds, danmaku_transport, record_danmaku, record_danmaku_raw, record_danmaku_superchat, record_danmaku_gift, record_danmaku_guard, stream_retry_ms, stream_retry_no_qn_sec, stream_connect_timeout_ms, check_interval_sec, flv_fix_split_on_missing, flv_fix_disable_on_annexb, baidu_sync_enabled, baidu_sync_path, create_time, update_time) \
-       VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26) \
+      "INSERT INTO live_settings (id, file_name_template, record_path, write_metadata, save_cover, recording_quality, record_mode, cutting_mode, cutting_number, cutting_by_title, title_split_min_seconds, danmaku_transport, record_danmaku, record_danmaku_raw, record_danmaku_superchat, record_danmaku_gift, record_danmaku_guard, stream_retry_ms, stream_retry_no_qn_sec, stream_connect_timeout_ms, stream_read_timeout_ms, check_interval_sec, flv_fix_split_on_missing, flv_fix_adjust_timestamp_jump, flv_fix_split_on_timestamp_jump, flv_fix_disable_on_annexb, baidu_sync_enabled, baidu_sync_path, create_time, update_time) \
+       VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29) \
        ON CONFLICT(id) DO UPDATE SET \
        file_name_template = excluded.file_name_template, \
        record_path = excluded.record_path, \
@@ -243,8 +247,11 @@ pub fn update_live_settings(
        stream_retry_ms = excluded.stream_retry_ms, \
        stream_retry_no_qn_sec = excluded.stream_retry_no_qn_sec, \
        stream_connect_timeout_ms = excluded.stream_connect_timeout_ms, \
+       stream_read_timeout_ms = excluded.stream_read_timeout_ms, \
        check_interval_sec = excluded.check_interval_sec, \
        flv_fix_split_on_missing = excluded.flv_fix_split_on_missing, \
+       flv_fix_adjust_timestamp_jump = excluded.flv_fix_adjust_timestamp_jump, \
+       flv_fix_split_on_timestamp_jump = excluded.flv_fix_split_on_timestamp_jump, \
        flv_fix_disable_on_annexb = excluded.flv_fix_disable_on_annexb, \
        baidu_sync_enabled = excluded.baidu_sync_enabled, \
        baidu_sync_path = excluded.baidu_sync_path, \
@@ -269,8 +276,11 @@ pub fn update_live_settings(
         payload.stream_retry_ms,
         payload.stream_retry_no_qn_sec,
         payload.stream_connect_timeout_ms,
+        payload.stream_read_timeout_ms,
         payload.check_interval_sec,
         payload.flv_fix_split_on_missing as i64,
+        payload.flv_fix_adjust_timestamp_jump as i64,
+        payload.flv_fix_split_on_timestamp_jump as i64,
         payload.flv_fix_disable_on_annexb as i64,
         payload.baidu_sync_enabled as i64,
         payload.baidu_sync_path.as_str(),
@@ -439,7 +449,7 @@ pub fn ensure_log_dir(db: &Db, download_dir: &std::path::Path) -> String {
 pub fn load_live_settings_from_db(db: &Db) -> Result<LiveSettings, crate::db::DbError> {
   db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT file_name_template, record_path, write_metadata, save_cover, recording_quality, record_mode, cutting_mode, cutting_number, cutting_by_title, title_split_min_seconds, danmaku_transport, record_danmaku, record_danmaku_raw, record_danmaku_superchat, record_danmaku_gift, record_danmaku_guard, stream_retry_ms, stream_retry_no_qn_sec, stream_connect_timeout_ms, check_interval_sec, flv_fix_split_on_missing, flv_fix_disable_on_annexb, baidu_sync_enabled, baidu_sync_path \
+      "SELECT file_name_template, record_path, write_metadata, save_cover, recording_quality, record_mode, cutting_mode, cutting_number, cutting_by_title, title_split_min_seconds, danmaku_transport, record_danmaku, record_danmaku_raw, record_danmaku_superchat, record_danmaku_gift, record_danmaku_guard, stream_retry_ms, stream_retry_no_qn_sec, stream_connect_timeout_ms, stream_read_timeout_ms, check_interval_sec, flv_fix_split_on_missing, flv_fix_adjust_timestamp_jump, flv_fix_split_on_timestamp_jump, flv_fix_disable_on_annexb, baidu_sync_enabled, baidu_sync_path \
        FROM live_settings WHERE id = 1",
     )?;
 
@@ -464,11 +474,14 @@ pub fn load_live_settings_from_db(db: &Db) -> Result<LiveSettings, crate::db::Db
         stream_retry_ms: row.get(16)?,
         stream_retry_no_qn_sec: row.get(17)?,
         stream_connect_timeout_ms: row.get(18)?,
-        check_interval_sec: row.get(19)?,
-        flv_fix_split_on_missing: row.get::<_, i64>(20)? != 0,
-        flv_fix_disable_on_annexb: row.get::<_, i64>(21)? != 0,
-        baidu_sync_enabled: row.get::<_, i64>(22)? != 0,
-        baidu_sync_path: row.get::<_, Option<String>>(23)?.unwrap_or_default(),
+        stream_read_timeout_ms: row.get(19)?,
+        check_interval_sec: row.get(20)?,
+        flv_fix_split_on_missing: row.get::<_, i64>(21)? != 0,
+        flv_fix_adjust_timestamp_jump: row.get::<_, i64>(22)? != 0,
+        flv_fix_split_on_timestamp_jump: row.get::<_, i64>(23)? != 0,
+        flv_fix_disable_on_annexb: row.get::<_, i64>(24)? != 0,
+        baidu_sync_enabled: row.get::<_, i64>(25)? != 0,
+        baidu_sync_path: row.get::<_, Option<String>>(26)?.unwrap_or_default(),
       })
     });
 
@@ -511,8 +524,11 @@ pub fn default_live_settings() -> LiveSettings {
     stream_retry_ms: 6000,
     stream_retry_no_qn_sec: 90,
     stream_connect_timeout_ms: 5000,
+    stream_read_timeout_ms: 15000,
     check_interval_sec: 180,
     flv_fix_split_on_missing: false,
+    flv_fix_adjust_timestamp_jump: true,
+    flv_fix_split_on_timestamp_jump: true,
     flv_fix_disable_on_annexb: false,
     baidu_sync_enabled: false,
     baidu_sync_path: "/录播".to_string(),

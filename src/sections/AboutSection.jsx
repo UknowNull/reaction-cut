@@ -1,4 +1,3 @@
-import { openUrl } from "@tauri-apps/plugin-opener";
 import pkg from "../../package.json";
 
 const actionLinks = [
@@ -45,6 +44,7 @@ const openExternal = async (url) => {
     return;
   }
   try {
+    const { openUrl } = await import("@tauri-apps/plugin-opener");
     await openUrl(url);
   } catch (_) {}
 };

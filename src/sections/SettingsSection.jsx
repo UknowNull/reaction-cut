@@ -36,8 +36,11 @@ export default function SettingsSection() {
     streamRetryMs: 6000,
     streamRetryNoQnSec: 90,
     streamConnectTimeoutMs: 5000,
+    streamReadTimeoutMs: 15000,
     checkIntervalSec: 180,
     flvFixSplitOnMissing: false,
+    flvFixAdjustTimestampJump: true,
+    flvFixSplitOnTimestampJump: true,
     flvFixDisableOnAnnexb: false,
     baiduSyncEnabled: false,
     baiduSyncPath: "/录播",
@@ -139,8 +142,11 @@ export default function SettingsSection() {
           streamRetryMs: Number(data.streamRetryMs || 0),
           streamRetryNoQnSec: Number(data.streamRetryNoQnSec || 0),
           streamConnectTimeoutMs: Number(data.streamConnectTimeoutMs || 0),
+          streamReadTimeoutMs: Number(data.streamReadTimeoutMs || 0),
           checkIntervalSec: Number(data.checkIntervalSec || 0),
           flvFixSplitOnMissing: Boolean(data.flvFixSplitOnMissing),
+          flvFixAdjustTimestampJump: Boolean(data.flvFixAdjustTimestampJump),
+          flvFixSplitOnTimestampJump: Boolean(data.flvFixSplitOnTimestampJump),
           flvFixDisableOnAnnexb: Boolean(data.flvFixDisableOnAnnexb),
           baiduSyncEnabled: Boolean(data.baiduSyncEnabled),
           baiduSyncPath: data.baiduSyncPath || "/录播",
@@ -264,8 +270,11 @@ export default function SettingsSection() {
           streamRetryMs: Number(liveSettings.streamRetryMs || 0),
           streamRetryNoQnSec: Number(liveSettings.streamRetryNoQnSec || 0),
           streamConnectTimeoutMs: Number(liveSettings.streamConnectTimeoutMs || 0),
+          streamReadTimeoutMs: Number(liveSettings.streamReadTimeoutMs || 0),
           checkIntervalSec: Number(liveSettings.checkIntervalSec || 0),
           flvFixSplitOnMissing: liveSettings.flvFixSplitOnMissing,
+          flvFixAdjustTimestampJump: liveSettings.flvFixAdjustTimestampJump,
+          flvFixSplitOnTimestampJump: liveSettings.flvFixSplitOnTimestampJump,
           flvFixDisableOnAnnexb: liveSettings.flvFixDisableOnAnnexb,
           baiduSyncEnabled: liveSettings.baiduSyncEnabled,
           baiduSyncPath: liveSettings.baiduSyncPath,
@@ -716,6 +725,32 @@ export default function SettingsSection() {
           <label className="flex items-center gap-2 text-sm text-[var(--muted)]">
             <input
               type="checkbox"
+              checked={liveSettings.flvFixAdjustTimestampJump}
+              onChange={(event) =>
+                setLiveSettings((prev) => ({
+                  ...prev,
+                  flvFixAdjustTimestampJump: event.target.checked,
+                }))
+              }
+            />
+            FLV 修复-时间戳跳变自动校准
+          </label>
+          <label className="flex items-center gap-2 text-sm text-[var(--muted)]">
+            <input
+              type="checkbox"
+              checked={liveSettings.flvFixSplitOnTimestampJump}
+              onChange={(event) =>
+                setLiveSettings((prev) => ({
+                  ...prev,
+                  flvFixSplitOnTimestampJump: event.target.checked,
+                }))
+              }
+            />
+            FLV 修复-时间戳跳变时分段
+          </label>
+          <label className="flex items-center gap-2 text-sm text-[var(--muted)]">
+            <input
+              type="checkbox"
               checked={liveSettings.flvFixDisableOnAnnexb}
               onChange={(event) =>
                 setLiveSettings((prev) => ({
@@ -888,6 +923,22 @@ export default function SettingsSection() {
                 setLiveSettings((prev) => ({
                   ...prev,
                   streamConnectTimeoutMs: event.target.value,
+                }))
+              }
+              className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+            />
+          </div>
+          <div>
+            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              录制读取超时（毫秒）
+            </div>
+            <input
+              type="number"
+              value={liveSettings.streamReadTimeoutMs}
+              onChange={(event) =>
+                setLiveSettings((prev) => ({
+                  ...prev,
+                  streamReadTimeoutMs: event.target.value,
                 }))
               }
               className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"

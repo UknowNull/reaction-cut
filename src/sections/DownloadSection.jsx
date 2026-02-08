@@ -145,6 +145,9 @@ export default function DownloadSection() {
     partitionId: "",
     videoType: "ORIGINAL",
     collectionId: "",
+    activityTopicId: "",
+    activityMissionId: "",
+    activityTitle: "",
     segmentPrefix: "",
     baiduSyncEnabled: false,
     baiduSyncPath: "",
@@ -152,6 +155,9 @@ export default function DownloadSection() {
   });
   const [partitions, setPartitions] = useState([]);
   const [collections, setCollections] = useState([]);
+  const [activityOptions, setActivityOptions] = useState([]);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityMessage, setActivityMessage] = useState("");
   const [quickFillOpen, setQuickFillOpen] = useState(false);
   const [quickFillTasks, setQuickFillTasks] = useState([]);
   const [quickFillPage, setQuickFillPage] = useState(1);
@@ -202,6 +208,27 @@ export default function DownloadSection() {
   const hasVideo = videoItems.length > 0;
   const hasSelection = selectedCount > 0;
   const isMultiVideo = videoItems.length > 1;
+  const activitySelectOptions = (() => {
+    const currentId = Number(submissionConfig.activityTopicId || 0);
+    if (!currentId) {
+      return activityOptions;
+    }
+    const exists = activityOptions.some((item) => item.topicId === currentId);
+    if (exists || !submissionConfig.activityTitle) {
+      return activityOptions;
+    }
+    return [
+      {
+        topicId: currentId,
+        missionId: Number(submissionConfig.activityMissionId || 0),
+        name: submissionConfig.activityTitle,
+        description: "",
+        activityText: "",
+        activityDescription: "",
+      },
+      ...activityOptions,
+    ];
+  })();
 
   const activeRecordStatus = useMemo(() => {
     const tab = recordTabs.find((item) => item.key === recordTab);
@@ -289,6 +316,21 @@ export default function DownloadSection() {
     loadPartitions();
     loadCollections();
   }, [integrationEnabled]);
+
+  useEffect(() => {
+    if (!integrationEnabled) {
+      setActivityOptions([]);
+      setActivityMessage("");
+      return;
+    }
+    const partitionId = Number(submissionConfig.partitionId || 0);
+    if (!partitionId) {
+      setActivityOptions([]);
+      clearActivitySelection();
+      return;
+    }
+    loadActivities(partitionId);
+  }, [integrationEnabled, submissionConfig.partitionId]);
 
   useEffect(() => {
     if (!quickFillOpen) {
@@ -640,6 +682,14 @@ export default function DownloadSection() {
 
   const removeTag = (target) => {
     setTags((prev) => prev.filter((tag) => tag !== target));
+    if (target === submissionConfig.activityTitle) {
+      setSubmissionConfig((prev) => ({
+        ...prev,
+        activityTopicId: "",
+        activityMissionId: "",
+        activityTitle: "",
+      }));
+    }
   };
 
   const handleTagKeyDown = (event) => {
@@ -649,6 +699,85 @@ export default function DownloadSection() {
     event.preventDefault();
     addTag(tagInput);
     setTagInput("");
+  };
+
+  const normalizeActivityOptions = (items) => {
+    return (items || [])
+      .map((item) => ({
+        topicId: Number(item?.topicId ?? item?.topic_id ?? 0),
+        missionId: Number(item?.missionId ?? item?.mission_id ?? 0),
+        name: item?.name || item?.topicName || item?.topic_name || "",
+        description: item?.description || "",
+        activityText: item?.activityText || item?.activity_text || "",
+        activityDescription: item?.activityDescription || item?.activity_description || "",
+      }))
+      .filter((item) => item.topicId > 0 && item.name);
+  };
+
+  const applyActivitySelection = (activity) => {
+    const previousTitle = submissionConfig.activityTitle || "";
+    const nextTitle = activity?.name || "";
+    setSubmissionConfig((prev) => ({
+      ...prev,
+      activityTopicId: activity ? String(activity.topicId) : "",
+      activityMissionId: activity ? String(activity.missionId || "") : "",
+      activityTitle: nextTitle,
+    }));
+    setTags((prev) => {
+      let next = prev.filter((tag) => tag !== previousTitle);
+      if (nextTitle && !next.includes(nextTitle)) {
+        next = [...next, nextTitle];
+      }
+      return next;
+    });
+  };
+
+  const clearActivitySelection = () => {
+    const previousTitle = submissionConfig.activityTitle || "";
+    setSubmissionConfig((prev) => ({
+      ...prev,
+      activityTopicId: "",
+      activityMissionId: "",
+      activityTitle: "",
+    }));
+    if (previousTitle) {
+      setTags((prev) => prev.filter((tag) => tag !== previousTitle));
+    }
+  };
+
+  const loadActivities = async (partitionId) => {
+    setActivityLoading(true);
+    setActivityMessage("");
+    try {
+      const data = await invokeCommand("bilibili_topics", {
+        partitionId: partitionId ? Number(partitionId) : null,
+      });
+      const mapped = normalizeActivityOptions(data);
+      setActivityOptions(mapped);
+      const currentId = Number(submissionConfig.activityTopicId || 0);
+      if (currentId > 0 && mapped.length > 0 && !mapped.some((item) => item.topicId === currentId)) {
+        clearActivitySelection();
+      }
+    } catch (error) {
+      setActivityOptions([]);
+      setActivityMessage(error.message);
+    } finally {
+      setActivityLoading(false);
+    }
+  };
+
+  const handleActivityChange = (event) => {
+    const value = event.target.value;
+    if (!value) {
+      applyActivitySelection(null);
+      return;
+    }
+    const target = activityOptions.find((item) => String(item.topicId) === value);
+    if (!target) {
+      applyActivitySelection(null);
+      return;
+    }
+    applyActivitySelection(target);
   };
 
   const loadQuickFillTasks = async (page = quickFillPage) => {
@@ -701,6 +830,9 @@ export default function DownloadSection() {
       description: task.description || "",
       partitionId: task.partitionId ? String(task.partitionId) : prev.partitionId,
       collectionId: task.collectionId ? String(task.collectionId) : "",
+      activityTopicId: task.topicId ? String(task.topicId) : "",
+      activityMissionId: task.missionId ? String(task.missionId) : "",
+      activityTitle: task.activityTitle || "",
       videoType: task.videoType || "ORIGINAL",
       segmentPrefix: task.segmentPrefix || "",
       baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
@@ -950,6 +1082,13 @@ export default function DownloadSection() {
           description: submissionConfig.description || null,
           partitionId: Number(submissionConfig.partitionId),
           tags: uniqueTags.join(","),
+          topicId: submissionConfig.activityTopicId
+            ? Number(submissionConfig.activityTopicId)
+            : null,
+          missionId: submissionConfig.activityMissionId
+            ? Number(submissionConfig.activityMissionId)
+            : null,
+          activityTitle: submissionConfig.activityTitle || null,
           videoType: submissionConfig.videoType,
           collectionId: submissionConfig.collectionId
             ? Number(submissionConfig.collectionId)
@@ -1665,6 +1804,39 @@ export default function DownloadSection() {
                             className="min-w-[120px] flex-1 bg-transparent text-sm text-[var(--content-color)] focus:outline-none"
                           />
                         </div>
+                      </div>
+                      <div className="mt-2 space-y-1">
+                        <div className="text-xs text-[var(--desc-color)]">活动话题（可选）</div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <select
+                            value={submissionConfig.activityTopicId}
+                            onChange={handleActivityChange}
+                            disabled={activityLoading || !submissionConfig.partitionId}
+                            className="min-w-[200px] flex-1 rounded-lg border border-[var(--split-color)] bg-white/70 px-3 py-2 text-sm"
+                          >
+                            <option value="">不参与活动</option>
+                            {activitySelectOptions.map((activity) => (
+                              <option key={activity.topicId} value={activity.topicId}>
+                                {activity.name}
+                                {activity.activityText ? ` · ${activity.activityText}` : ""}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            onClick={() => loadActivities(submissionConfig.partitionId)}
+                            disabled={activityLoading || !submissionConfig.partitionId}
+                            className="rounded-lg border border-[var(--split-color)] bg-white/70 px-3 py-2 text-xs text-[var(--desc-color)] hover:text-[var(--primary-color)] disabled:opacity-60"
+                          >
+                            刷新活动
+                          </button>
+                        </div>
+                        {activityLoading ? (
+                          <div className="text-xs text-[var(--desc-color)]">活动加载中...</div>
+                        ) : null}
+                        {activityMessage ? (
+                          <div className="text-xs text-rose-500">{activityMessage}</div>
+                        ) : null}
                       </div>
                     </div>
                     <div className="space-y-1">
