@@ -62,6 +62,7 @@ impl Db {
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN aid INTEGER", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN remote_state INTEGER", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN reject_reason TEXT", []);
+    let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN priority INTEGER DEFAULT 0", []);
     let _ = conn.execute(
       "ALTER TABLE submission_task ADD COLUMN baidu_sync_enabled INTEGER DEFAULT 0",
       [],
@@ -73,6 +74,10 @@ impl Db {
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN activity_title TEXT", []);
     let _ = conn.execute("ALTER TABLE video_download ADD COLUMN cid INTEGER", []);
     let _ = conn.execute("ALTER TABLE video_download ADD COLUMN content TEXT", []);
+    let _ = conn.execute(
+      "ALTER TABLE video_download ADD COLUMN source_type TEXT DEFAULT 'BILIBILI'",
+      [],
+    );
     let _ = conn.execute(
       "ALTER TABLE video_download ADD COLUMN progress_total INTEGER DEFAULT 0",
       [],
@@ -93,6 +98,8 @@ impl Db {
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN upload_uri TEXT", []);
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN upload_chunk_size INTEGER DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN upload_last_part_index INTEGER DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN remote_dir TEXT", []);
+    let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN remote_name TEXT", []);
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_progress REAL DEFAULT 0.0", []);
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_uploaded_bytes INTEGER DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_total_bytes INTEGER DEFAULT 0", []);

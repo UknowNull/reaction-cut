@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invokeCommand } from "../lib/tauri";
+import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
 
 export default function SettingsSection() {
   const [threads, setThreads] = useState(3);
@@ -12,9 +13,12 @@ export default function SettingsSection() {
   const [blockPcdn, setBlockPcdn] = useState(true);
   const [aria2cConnections, setAria2cConnections] = useState(4);
   const [aria2cSplit, setAria2cSplit] = useState(4);
+  const [baiduMaxParallel, setBaiduMaxParallel] = useState(3);
   const [message, setMessage] = useState("");
   const [syncConcurrency, setSyncConcurrency] = useState(3);
+  const [syncTargetPath, setSyncTargetPath] = useState("/录播");
   const [syncConfigMessage, setSyncConfigMessage] = useState("");
+  const [syncPickerOpen, setSyncPickerOpen] = useState(false);
   const [liveMessage, setLiveMessage] = useState("");
   const [liveSettings, setLiveSettings] = useState({
     fileNameTemplate: "live/{{ roomId }}/{{ liveDate }}/录制-{{ roomId }}-{{ now }}-{{ title }}.flv",
@@ -79,6 +83,8 @@ export default function SettingsSection() {
         const split = Math.min(32, Math.max(1, Number(data.aria2cSplit || 4)));
         setAria2cConnections(connections);
         setAria2cSplit(split);
+        const maxParallel = Math.min(100, Math.max(1, Number(data.baiduMaxParallel || 3)));
+        setBaiduMaxParallel(maxParallel);
         await logClient(`settings_load:ok:${data.downloadPath || ""}`);
       }
     } catch (error) {
@@ -93,6 +99,7 @@ export default function SettingsSection() {
       const data = await invokeCommand("baidu_sync_settings");
       const concurrency = Math.max(1, Number(data?.concurrency || 3));
       setSyncConcurrency(concurrency);
+      setSyncTargetPath(data?.targetPath || "/录播");
     } catch (error) {
       setSyncConfigMessage(error?.message || "加载同步配置失败");
     }
@@ -102,13 +109,33 @@ export default function SettingsSection() {
     setSyncConfigMessage("");
     try {
       await invokeCommand("baidu_sync_update_settings", {
-        request: { concurrency: Number(syncConcurrency || 1) },
+        request: {
+          concurrency: Number(syncConcurrency || 1),
+          targetPath: syncTargetPath,
+        },
       });
       setSyncConfigMessage("同步配置已保存");
       await loadBaiduSyncSettings();
     } catch (error) {
       setSyncConfigMessage(error?.message || "保存同步配置失败");
     }
+  };
+
+  const handleOpenSyncPicker = () => {
+    setSyncPickerOpen(true);
+  };
+
+  const handleCloseSyncPicker = () => {
+    setSyncPickerOpen(false);
+  };
+
+  const handleConfirmSyncPicker = (path) => {
+    setSyncTargetPath(path);
+    setSyncPickerOpen(false);
+  };
+
+  const handleSyncPathChange = (path) => {
+    setSyncTargetPath(path);
   };
 
   useEffect(() => {
@@ -206,8 +233,12 @@ export default function SettingsSection() {
         Math.max(1, Number(aria2cConnections) || 1),
       );
       const normalizedAria2cSplit = Math.min(32, Math.max(1, Number(aria2cSplit) || 1));
+      const normalizedBaiduMaxParallel = Math.min(
+        100,
+        Math.max(1, Number(baiduMaxParallel) || 3),
+      );
       await logClient(
-        `settings_save:start path=${downloadPath} logDir=${logDir} threads=${String(threads)} queue=${String(queueSize)} uploadConcurrency=${String(normalizedUploadConcurrency)} remoteRefreshMinutes=${String(normalizedRefreshMinutes)} blockPcdn=${String(blockPcdn)} aria2cConnections=${String(normalizedAria2cConnections)} aria2cSplit=${String(normalizedAria2cSplit)}`,
+        `settings_save:start path=${downloadPath} logDir=${logDir} threads=${String(threads)} queue=${String(queueSize)} uploadConcurrency=${String(normalizedUploadConcurrency)} remoteRefreshMinutes=${String(normalizedRefreshMinutes)} blockPcdn=${String(blockPcdn)} aria2cConnections=${String(normalizedAria2cConnections)} aria2cSplit=${String(normalizedAria2cSplit)} baiduMaxParallel=${String(normalizedBaiduMaxParallel)}`,
       );
       await logClient("settings_save:invoke_start");
       const data = await invokeCommand("update_download_settings", {
@@ -220,6 +251,7 @@ export default function SettingsSection() {
         blockPcdn: Boolean(blockPcdn),
         aria2cConnections: normalizedAria2cConnections,
         aria2cSplit: normalizedAria2cSplit,
+        baiduMaxParallel: normalizedBaiduMaxParallel,
         enableAria2c: true,
       });
       await logClient("settings_save:invoke_end");
@@ -237,6 +269,9 @@ export default function SettingsSection() {
           Math.min(32, Math.max(1, Number(data.aria2cConnections || 4))),
         );
         setAria2cSplit(Math.min(32, Math.max(1, Number(data.aria2cSplit || 4))));
+        setBaiduMaxParallel(
+          Math.min(100, Math.max(1, Number(data.baiduMaxParallel || 3))),
+        );
         await logClient(`settings_save:ok:${data.downloadPath || ""}`);
       }
       setMessage("设置已保存，日志目录需重启生效");
@@ -347,6 +382,25 @@ export default function SettingsSection() {
               onChange={(event) => setAria2cSplit(event.target.value)}
               min={1}
               max={32}
+              className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+            />
+          </div>
+          <div>
+            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              网盘 max_parallel
+              <span className="group relative ml-2 inline-flex h-4 w-4 items-center justify-center rounded-full border border-black/20 text-[10px] text-[var(--muted)]">
+                ?
+                <span className="pointer-events-none absolute left-1/2 top-full z-10 mt-2 w-64 -translate-x-1/2 rounded-md bg-black/80 px-2 py-1 text-[10px] text-white opacity-0 shadow transition group-hover:opacity-100">
+                  单个网盘下载任务的并发连接数。数值越大速度可能更快，但更易触发限速。非SVIP用户修改该配置可能不生效。
+                </span>
+              </span>
+            </div>
+            <input
+              type="number"
+              value={baiduMaxParallel}
+              onChange={(event) => setBaiduMaxParallel(event.target.value)}
+              min={1}
+              max={100}
               className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
             />
           </div>
@@ -476,6 +530,22 @@ export default function SettingsSection() {
               min={1}
               className="mt-2 w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
             />
+          </div>
+          <div>
+            <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+              默认网盘上传目录
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+              <div className="flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-[var(--content-color)]">
+                {syncTargetPath || "/录播"}
+              </div>
+              <button
+                className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--content-color)]"
+                onClick={handleOpenSyncPicker}
+              >
+                选择目录
+              </button>
+            </div>
           </div>
         </div>
         <div className="mt-4 flex flex-wrap gap-2">
@@ -966,6 +1036,13 @@ export default function SettingsSection() {
         ) : null}
       </div>
 
+      <BaiduSyncPathPicker
+        open={syncPickerOpen}
+        value={syncTargetPath}
+        onConfirm={handleConfirmSyncPicker}
+        onClose={handleCloseSyncPicker}
+        onChange={handleSyncPathChange}
+      />
     </div>
   );
 }

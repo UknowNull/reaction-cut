@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import {
+  confirm as dialogConfirm,
+  message as dialogMessage,
+  open as openDialog,
+} from "@tauri-apps/plugin-dialog";
+import LoadingButton from "../components/LoadingButton";
+import { showErrorDialog } from "../lib/dialog";
 import { invokeCommand } from "../lib/tauri";
 import { formatDateTime } from "../lib/format";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
@@ -45,6 +51,7 @@ export default function SubmissionSection() {
     activityTitle: "",
     videoType: "ORIGINAL",
     segmentPrefix: "",
+    priority: false,
     baiduSyncEnabled: false,
     baiduSyncPath: "",
     baiduSyncFilename: "",
@@ -71,6 +78,21 @@ export default function SubmissionSection() {
   const [submissionView, setSubmissionView] = useState("list");
   const [deleteTargetId, setDeleteTargetId] = useState("");
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deletePreview, setDeletePreview] = useState(null);
+  const [deleteTaskChecked, setDeleteTaskChecked] = useState(true);
+  const [deleteFilesChecked, setDeleteFilesChecked] = useState(false);
+  const [deleteFileSelections, setDeleteFileSelections] = useState(() => new Set());
+  const [deletePreviewLoading, setDeletePreviewLoading] = useState(false);
+  const [deleteConflictOpen, setDeleteConflictOpen] = useState(false);
+  const [deleteConflictFiles, setDeleteConflictFiles] = useState([]);
+  const [deletePendingPayload, setDeletePendingPayload] = useState(null);
+  const [deleteSubmitting, setDeleteSubmitting] = useState(false);
+  const [deleteMessage, setDeleteMessage] = useState("");
+  const [deleteMessageTone, setDeleteMessageTone] = useState("info");
+  const deleteMessageClass =
+    deleteMessageTone === "error"
+      ? "border-red-200 bg-red-50 text-red-700"
+      : "border-amber-200 bg-amber-50 text-amber-700";
   const [quickFillOpen, setQuickFillOpen] = useState(false);
   const [quickFillTasks, setQuickFillTasks] = useState([]);
   const [quickFillPage, setQuickFillPage] = useState(1);
@@ -85,11 +107,14 @@ export default function SubmissionSection() {
   const [resegmentMode, setResegmentMode] = useState("SPECIFIED");
   const [resegmentMergedVideos, setResegmentMergedVideos] = useState([]);
   const [resegmentMergedId, setResegmentMergedId] = useState("");
+  const [resegmentIntegrateCurrent, setResegmentIntegrateCurrent] = useState(false);
+  const [resegmentHasBvid, setResegmentHasBvid] = useState(false);
   const [repostOpen, setRepostOpen] = useState(false);
   const [repostTaskId, setRepostTaskId] = useState("");
   const [repostHasBvid, setRepostHasBvid] = useState(false);
   const [repostUseCurrentBvid, setRepostUseCurrentBvid] = useState(false);
   const [repostSubmitting, setRepostSubmitting] = useState(false);
+  const [createSubmitting, setCreateSubmitting] = useState(false);
   const [repostMode, setRepostMode] = useState("SPECIFIED");
   const [repostMergedVideos, setRepostMergedVideos] = useState([]);
   const [repostMergedId, setRepostMergedId] = useState("");
@@ -98,6 +123,7 @@ export default function SubmissionSection() {
     path: "",
     filename: "",
   });
+  const [defaultBaiduSyncPath, setDefaultBaiduSyncPath] = useState("/录播");
   const [updateTaskId, setUpdateTaskId] = useState("");
   const [updateSourceVideos, setUpdateSourceVideos] = useState([emptySource(0)]);
   const [updateSegmentationEnabled, setUpdateSegmentationEnabled] = useState(true);
@@ -127,6 +153,8 @@ export default function SubmissionSection() {
   const isEditView = submissionView === "edit";
   const isReadOnly = isDetailView;
   const quickFillPageSize = 10;
+  const deleteFiles = deletePreview?.files || [];
+  const deleteHasFiles = deleteFiles.length > 0;
   const activitySelectOptions = (() => {
     const currentId = Number(taskForm.activityTopicId || 0);
     if (!currentId) {
@@ -205,6 +233,22 @@ export default function SubmissionSection() {
     return /\.(mp4|mkv|mov|flv|avi|webm)$/i.test(path);
   };
 
+  const resetDeleteState = () => {
+    setDeleteTargetId("");
+    setDeleteConfirmOpen(false);
+    setDeletePreview(null);
+    setDeleteTaskChecked(true);
+    setDeleteFilesChecked(true);
+    setDeleteFileSelections(new Set());
+    setDeletePreviewLoading(false);
+    setDeleteConflictOpen(false);
+    setDeleteConflictFiles([]);
+    setDeletePendingPayload(null);
+    setDeleteSubmitting(false);
+    setDeleteMessage("");
+    setDeleteMessageTone("info");
+  };
+
   const resetFormState = () => {
     setTaskForm({
       title: "",
@@ -216,6 +260,7 @@ export default function SubmissionSection() {
       activityTitle: "",
       videoType: "ORIGINAL",
       segmentPrefix: "",
+      priority: false,
       baiduSyncEnabled: false,
       baiduSyncPath: "",
       baiduSyncFilename: "",
@@ -247,6 +292,7 @@ export default function SubmissionSection() {
     resetFormState();
     await loadPartitions();
     await loadCollections();
+    await loadBaiduSyncSettings();
   };
 
   const openUpdateModal = (task) => {
@@ -304,8 +350,13 @@ export default function SubmissionSection() {
     setResegmentMode("SPECIFIED");
     setResegmentMergedVideos([]);
     setResegmentMergedId("");
+    setResegmentIntegrateCurrent(false);
+    setResegmentHasBvid(false);
     try {
       const detail = await invokeCommand("submission_detail", { taskId: targetId });
+      const hasBvid = Boolean(detail?.task?.bvid);
+      setResegmentHasBvid(hasBvid);
+      setResegmentIntegrateCurrent(hasBvid);
       const seconds = Number(
         detail?.workflowConfig?.segmentationConfig?.segmentDurationSeconds,
       );
@@ -336,6 +387,8 @@ export default function SubmissionSection() {
     setResegmentMode("SPECIFIED");
     setResegmentMergedVideos([]);
     setResegmentMergedId("");
+    setResegmentIntegrateCurrent(false);
+    setResegmentHasBvid(false);
     setMessage("");
   };
 
@@ -473,6 +526,13 @@ export default function SubmissionSection() {
       }
       setMessage(error.message);
     }
+  };
+
+  const loadBaiduSyncSettings = async () => {
+    try {
+      const data = await invokeCommand("baidu_sync_settings");
+      setDefaultBaiduSyncPath(data?.targetPath || "/录播");
+    } catch (_) {}
   };
 
   const normalizeActivityOptions = (items) => {
@@ -629,13 +689,14 @@ export default function SubmissionSection() {
   };
 
   const resolveSyncPath = (target) => {
+    const fallbackPath = defaultBaiduSyncPath || "/录播";
     if (target === "update") {
-      return updateBaiduSync.path || "";
+      return updateBaiduSync.path || fallbackPath;
     }
     if (target === "repost") {
-      return repostBaiduSync.path || "";
+      return repostBaiduSync.path || fallbackPath;
     }
-    return taskForm.baiduSyncPath || "";
+    return taskForm.baiduSyncPath || fallbackPath;
   };
 
   const applySyncPath = (target, path) => {
@@ -678,6 +739,7 @@ export default function SubmissionSection() {
   useEffect(() => {
     loadPartitions();
     loadCollections();
+    loadBaiduSyncSettings();
   }, []);
 
   useEffect(() => {
@@ -952,6 +1014,9 @@ export default function SubmissionSection() {
   };
 
   const handleCreate = async () => {
+    if (createSubmitting) {
+      return;
+    }
     setMessage("");
     if (!taskForm.title.trim()) {
       setMessage("请输入投稿标题");
@@ -1019,6 +1084,7 @@ export default function SubmissionSection() {
       setMessage("时间范围不合法，请检查开始与结束时间");
       return;
     }
+    setCreateSubmitting(true);
     try {
       const payload = {
         request: {
@@ -1034,6 +1100,7 @@ export default function SubmissionSection() {
             activityTitle: taskForm.activityTitle || null,
             videoType: taskForm.videoType,
             segmentPrefix: taskForm.segmentPrefix || null,
+            priority: Boolean(taskForm.priority),
             baiduSyncEnabled: Boolean(taskForm.baiduSyncEnabled),
             baiduSyncPath: taskForm.baiduSyncPath || null,
             baiduSyncFilename: taskForm.baiduSyncFilename || null,
@@ -1053,6 +1120,9 @@ export default function SubmissionSection() {
       setMessage("");
     } catch (error) {
       setMessage(error.message);
+      await showErrorDialog(error);
+    } finally {
+      setCreateSubmitting(false);
     }
   };
 
@@ -1256,6 +1326,7 @@ export default function SubmissionSection() {
       activityMissionId: task.missionId ? String(task.missionId) : "",
       activityTitle: task.activityTitle || "",
       videoType: task.videoType || "ORIGINAL",
+      priority: Boolean(task.priority),
       baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
       baiduSyncPath: task.baiduSyncPath || "",
       baiduSyncFilename: task.baiduSyncFilename || "",
@@ -1300,6 +1371,7 @@ export default function SubmissionSection() {
       activityTitle: task.activityTitle || "",
       videoType: task.videoType || "ORIGINAL",
       segmentPrefix: task.segmentPrefix || "",
+      priority: Boolean(task.priority),
       baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
       baiduSyncPath: task.baiduSyncPath || "",
       baiduSyncFilename: task.baiduSyncFilename || "",
@@ -1527,6 +1599,10 @@ export default function SubmissionSection() {
       setMessage("分段时长必须大于0");
       return;
     }
+    if (resegmentIntegrateCurrent && !resegmentHasBvid) {
+      setMessage("当前任务暂无BVID，无法集成投稿，请选择新建BV");
+      return;
+    }
     if (resegmentMode === "SPECIFIED" && !resegmentMergedId) {
       setMessage("请选择合并视频");
       return;
@@ -1543,12 +1619,14 @@ export default function SubmissionSection() {
             resegmentMode === "SPECIFIED" && resegmentMergedId
               ? Number(resegmentMergedId)
               : null,
+          integrateCurrentBvid: resegmentIntegrateCurrent,
         },
       });
       closeResegmentModal();
       await loadTasks(statusFilter, currentPage, pageSize);
     } catch (error) {
       setMessage(error.message);
+      await showErrorDialog(error);
       setResegmentSubmitting(false);
     }
   };
@@ -1587,6 +1665,7 @@ export default function SubmissionSection() {
       await loadTasks(statusFilter, currentPage, pageSize);
     } catch (error) {
       setMessage(error.message);
+      await showErrorDialog(error);
       setRepostSubmitting(false);
     }
   };
@@ -1963,24 +2042,44 @@ export default function SubmissionSection() {
 
   const handleDeleteTask = async (taskId) => {
     setMessage("");
+    setDeleteMessage("");
+    setDeleteMessageTone("info");
     const targetId = String(taskId || "").trim();
     if (!targetId) {
       setMessage("任务ID无效，无法删除");
       return;
     }
     setDeleteTargetId(targetId);
+    setDeleteTaskChecked(true);
+    setDeleteFilesChecked(true);
+    setDeleteFileSelections(new Set());
+    setDeletePreview(null);
     setDeleteConfirmOpen(true);
+    setDeleteConflictOpen(false);
+    setDeleteConflictFiles([]);
+    setDeletePendingPayload(null);
+    setDeletePreviewLoading(true);
+    try {
+      const preview = await invokeCommand("submission_delete_preview", { taskId: targetId });
+      setDeletePreview(preview);
+      const defaultSelections = new Set(
+        (preview?.files || []).map((item) => item.path),
+      );
+      setDeleteFileSelections(defaultSelections);
+    } catch (error) {
+      setMessage(error.message);
+    }
     try {
       await invokeCommand("auth_client_log", {
         message: `submission_delete_prompt taskId=${targetId}`,
       });
     } catch (_) {}
+    setDeletePreviewLoading(false);
   };
 
   const handleDeleteCancel = async () => {
     const targetId = deleteTargetId;
-    setDeleteConfirmOpen(false);
-    setDeleteTargetId("");
+    resetDeleteState();
     try {
       await invokeCommand("auth_client_log", {
         message: `submission_delete_cancel taskId=${targetId}`,
@@ -1990,31 +2089,204 @@ export default function SubmissionSection() {
 
   const handleDeleteConfirm = async () => {
     const targetId = deleteTargetId;
+    setDeleteMessage("");
+    setDeleteMessageTone("info");
+    try {
+      await invokeCommand("auth_client_log", {
+        message: `submission_delete_confirm_click taskId=${targetId} deleteTask=${deleteTaskChecked ? "1" : "0"} deleteFiles=${deleteFilesChecked ? "1" : "0"}`,
+      });
+    } catch (_) {}
     if (!targetId) {
-      setDeleteConfirmOpen(false);
+      resetDeleteState();
       return;
     }
+    if (!deleteTaskChecked && !deleteFilesChecked) {
+      setDeleteMessage("请选择删除投稿任务或删除视频文件");
+      setDeleteMessageTone("error");
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_delete_validation_fail taskId=${targetId} reason=no_option`,
+        });
+      } catch (_) {}
+      return;
+    }
+    const deletePaths = deleteFilesChecked ? Array.from(deleteFileSelections) : [];
+    if (deleteFilesChecked && deletePaths.length === 0) {
+      setDeleteMessage("请选择要删除的视频文件");
+      setDeleteMessageTone("error");
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_delete_validation_fail taskId=${targetId} reason=no_paths`,
+        });
+      } catch (_) {}
+      return;
+    }
+    const payload = {
+      taskId: targetId,
+      deleteTask: deleteTaskChecked,
+      deleteFiles: deleteFilesChecked,
+      deletePaths,
+      forceDelete: false,
+    };
+    setDeleteSubmitting(true);
+    setDeleteMessage("正在删除...");
+    setDeleteMessageTone("info");
     try {
-      await invokeCommand("submission_delete", { taskId: targetId });
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_delete_invoke_start taskId=${targetId} deleteTask=${deleteTaskChecked ? "1" : "0"} deleteFiles=${deleteFilesChecked ? "1" : "0"} paths=${deletePaths.length}`,
+        });
+      } catch (_) {}
+      const result = await invokeCommand("submission_delete", { request: payload });
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_delete_invoke_ok taskId=${targetId} deleted=${result?.deletedPaths?.length || 0} missing=${result?.missingPaths?.length || 0} blocked=${result?.blocked ? "1" : "0"}`,
+        });
+      } catch (_) {}
+      if (result?.blocked) {
+        setDeletePendingPayload(payload);
+        setDeleteConflictFiles(result.conflicts || []);
+        setDeleteConflictOpen(true);
+        return;
+      }
+      const deletedPaths = result?.deletedPaths || [];
+      const missingPaths = result?.missingPaths || [];
       try {
         await invokeCommand("auth_client_log", {
           message: `submission_delete_ok taskId=${targetId}`,
         });
       } catch (_) {}
-      if (selectedTask?.task?.taskId === targetId) {
-        setSelectedTask(null);
+      if (deleteTaskChecked) {
+        if (selectedTask?.task?.taskId === targetId) {
+          setSelectedTask(null);
+        }
+        setTasks((prev) => prev.filter((item) => item.taskId !== targetId));
+        await loadTasks(statusFilter);
+        const summary = buildDeleteSummary(deletedPaths, missingPaths);
+        resetDeleteState();
+        await notifyDeleteSuccess(summary);
+        return;
       }
-      setTasks((prev) => prev.filter((item) => item.taskId !== targetId));
-      await loadTasks(statusFilter);
-      setDeleteConfirmOpen(false);
-      setDeleteTargetId("");
+      if (deleteFilesChecked) {
+        const summary = buildDeleteSummary(deletedPaths, missingPaths);
+        resetDeleteState();
+        await notifyDeleteSuccess(summary);
+      }
     } catch (error) {
       try {
         await invokeCommand("auth_client_log", {
           message: `submission_delete_fail taskId=${targetId} err=${error?.message || String(error || "")}`,
         });
       } catch (_) {}
-      setMessage(error.message);
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_delete_invoke_fail taskId=${targetId} err=${error?.message || String(error || "")}`,
+        });
+      } catch (_) {}
+      setDeleteMessage(`删除失败：${error?.message || "未知错误"}`);
+      setDeleteMessageTone("error");
+    } finally {
+      setDeleteSubmitting(false);
+    }
+  };
+
+  const handleDeleteFilesToggle = (checked) => {
+    setDeleteFilesChecked(checked);
+    if (checked && deleteFileSelections.size === 0) {
+      const defaultSelections = new Set(deleteFiles.map((item) => item.path));
+      setDeleteFileSelections(defaultSelections);
+    }
+  };
+
+  const toggleDeleteFileSelection = (path) => {
+    setDeleteFileSelections((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  };
+
+  const buildDeleteSummary = (deletedPaths, missingPaths) => {
+    const summaryParts = [];
+    if (deletedPaths.length > 0) {
+      summaryParts.push(`已删除 ${deletedPaths.length} 个`);
+    }
+    if (missingPaths.length > 0) {
+      summaryParts.push(`未找到 ${missingPaths.length} 个`);
+    }
+    return summaryParts.join("，");
+  };
+
+  const notifyDeleteSuccess = async (summary) => {
+    const text = summary ? `删除成功，${summary}` : "删除成功";
+    try {
+      await dialogMessage(text, {
+        title: "删除成功",
+        kind: "info",
+      });
+    } catch (_) {}
+  };
+
+  const handleDeleteConflictCancel = () => {
+    setDeleteConflictOpen(false);
+    setDeleteConflictFiles([]);
+    setDeletePendingPayload(null);
+    setDeleteMessage("");
+    setDeleteMessageTone("info");
+  };
+
+  const handleDeleteConflictConfirm = async () => {
+    const payload = deletePendingPayload;
+    if (!payload) {
+      handleDeleteConflictCancel();
+      return;
+    }
+    setDeleteSubmitting(true);
+    setDeleteMessage("正在删除...");
+    setDeleteMessageTone("info");
+    try {
+      const result = await invokeCommand("submission_delete", {
+        request: {
+          ...payload,
+          forceDelete: true,
+        },
+      });
+      try {
+        await invokeCommand("auth_client_log", {
+          message: `submission_delete_invoke_ok taskId=${payload.taskId} deleted=${result?.deletedPaths?.length || 0} missing=${result?.missingPaths?.length || 0} blocked=${result?.blocked ? "1" : "0"}`,
+        });
+      } catch (_) {}
+      if (result?.blocked) {
+        setDeleteConflictFiles(result.conflicts || []);
+        return;
+      }
+      const deletedPaths = result?.deletedPaths || [];
+      const missingPaths = result?.missingPaths || [];
+      if (payload.deleteTask) {
+        if (selectedTask?.task?.taskId === payload.taskId) {
+          setSelectedTask(null);
+        }
+        setTasks((prev) => prev.filter((item) => item.taskId !== payload.taskId));
+        await loadTasks(statusFilter);
+        const summary = buildDeleteSummary(deletedPaths, missingPaths);
+        resetDeleteState();
+        await notifyDeleteSuccess(summary);
+        return;
+      }
+      if (payload.deleteFiles) {
+        const summary = buildDeleteSummary(deletedPaths, missingPaths);
+        resetDeleteState();
+        await notifyDeleteSuccess(summary);
+      }
+    } catch (error) {
+      setDeleteMessage(`删除失败：${error?.message || "未知错误"}`);
+      setDeleteMessageTone("error");
+    } finally {
+      setDeleteSubmitting(false);
     }
   };
 
@@ -2043,6 +2315,27 @@ export default function SubmissionSection() {
     try {
       await invokeCommand("workflow_cancel", { task_id: taskId });
       await loadTasks(statusFilter);
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const handleQueuePrioritize = async (taskId) => {
+    setMessage("");
+    const confirmed = await dialogConfirm("确认将该任务置顶并优先投稿？", {
+      title: "优先投稿",
+      kind: "warning",
+    });
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await invokeCommand("submission_queue_prioritize", { taskId });
+      await loadTasks(statusFilter);
+      await dialogMessage("已设置为优先投稿", {
+        title: "操作成功",
+        kind: "info",
+      });
     } catch (error) {
       setMessage(error.message);
     }
@@ -2508,6 +2801,20 @@ export default function SubmissionSection() {
               />
             </div>
           </div>
+          <label className="flex items-center gap-2 text-sm text-[var(--muted)]">
+            <input
+              type="checkbox"
+              checked={taskForm.priority}
+              onChange={(event) =>
+                setTaskForm((prev) => ({
+                  ...prev,
+                  priority: event.target.checked,
+                }))
+              }
+              disabled={isReadOnly}
+            />
+            优先投稿（进入投稿队列时置顶）
+          </label>
           <div className="text-xs text-[var(--muted)]">
             分段前缀会作为分段文件名的前缀（可选）
           </div>
@@ -2535,7 +2842,7 @@ export default function SubmissionSection() {
                   <div className="text-xs text-[var(--muted)]">远端路径</div>
                   <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                     <div className="flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-[var(--ink)]">
-                      {taskForm.baiduSyncPath || "未配置"}
+                      {taskForm.baiduSyncPath || defaultBaiduSyncPath || "/录播"}
                     </div>
                     <button
                       className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
@@ -2725,12 +3032,14 @@ export default function SubmissionSection() {
         </div>
         {!isReadOnly ? (
           <div className="mt-4 flex flex-wrap gap-2">
-            <button
+            <LoadingButton
               className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:brightness-110"
               onClick={handleCreate}
+              loading={createSubmitting}
+              loadingLabel="处理中"
             >
               创建任务
-            </button>
+            </LoadingButton>
           </div>
         ) : null}
         {message ? (
@@ -2870,7 +3179,7 @@ export default function SubmissionSection() {
                           <div className="text-xs text-[var(--muted)]">远端路径</div>
                           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                             <div className="flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-[var(--ink)]">
-                              {updateBaiduSync.path || "未配置"}
+                              {updateBaiduSync.path || defaultBaiduSyncPath || "/录播"}
                             </div>
                             <button
                               className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
@@ -3125,6 +3434,11 @@ export default function SubmissionSection() {
                         onClick={() => handleOpenTaskFolder(task.taskId)}
                       >
                         {task.title || "-"}
+                        {task.priority ? (
+                          <span className="ml-2 rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-600">
+                            优先
+                          </span>
+                        ) : null}
                       </button>
                     </td>
                     <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
@@ -3264,6 +3578,15 @@ export default function SubmissionSection() {
                         >
                           重新分段
                         </button>
+                        {task.status === "WAITING_UPLOAD" ? (
+                          <button
+                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:opacity-60"
+                            onClick={() => handleQueuePrioritize(task.taskId)}
+                            disabled={task.priority}
+                          >
+                            {task.priority ? "已优先" : "优先投稿"}
+                          </button>
+                        ) : null}
                         {task.status === "FAILED" && task.hasIntegratedDownloads ? (
                           <button
                             className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
@@ -3396,6 +3719,33 @@ export default function SubmissionSection() {
                       </div>
                     ) : null}
                   </div>
+                  <div className="space-y-2">
+                    <div className="text-xs text-[var(--muted)]">投稿方式</div>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        checked={resegmentIntegrateCurrent}
+                        onChange={() => setResegmentIntegrateCurrent(true)}
+                        disabled={!resegmentHasBvid}
+                      />
+                      <span className={resegmentHasBvid ? "" : "text-[var(--muted)]"}>
+                        集成当前BV
+                      </span>
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        checked={!resegmentIntegrateCurrent}
+                        onChange={() => setResegmentIntegrateCurrent(false)}
+                      />
+                      <span>新建BV</span>
+                    </label>
+                    {!resegmentHasBvid ? (
+                      <div className="text-xs text-amber-700">
+                        当前任务暂无BVID，只能新建BV
+                      </div>
+                    ) : null}
+                  </div>
                   <div className="space-y-1">
                     <div className="text-xs text-[var(--muted)]">
                       当前分段时长（秒）
@@ -3434,13 +3784,15 @@ export default function SubmissionSection() {
                   >
                     取消
                   </button>
-                  <button
+                  <LoadingButton
                     className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
                     onClick={handleResegmentSubmit}
-                    disabled={resegmentSubmitting}
+                    loading={resegmentSubmitting}
+                    loadingLabel="处理中"
+                    spinnerClassName="h-3 w-3"
                   >
-                    {resegmentSubmitting ? "提交中" : "开始重新分段"}
-                  </button>
+                    开始重新分段
+                  </LoadingButton>
                 </div>
               </div>
             </div>
@@ -3587,7 +3939,7 @@ export default function SubmissionSection() {
                         <div className="text-xs text-[var(--muted)]">远端路径</div>
                         <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                           <div className="flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-[var(--ink)]">
-                            {repostBaiduSync.path || "未配置"}
+                            {repostBaiduSync.path || defaultBaiduSyncPath || "/录播"}
                           </div>
                           <button
                             className="rounded-full border border-black/10 bg-white px-3 py-1 font-semibold text-[var(--ink)]"
@@ -3621,34 +3973,187 @@ export default function SubmissionSection() {
                   >
                     取消
                   </button>
-                  <button
+                  <LoadingButton
                     className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
                     onClick={handleRepostSubmit}
-                    disabled={repostSubmitting}
+                    loading={repostSubmitting}
+                    loadingLabel="处理中"
+                    spinnerClassName="h-3 w-3"
                   >
-                    {repostSubmitting ? "提交中" : "开始重新投稿"}
-                  </button>
+                    开始重新投稿
+                  </LoadingButton>
                 </div>
               </div>
             </div>
           ) : null}
           {deleteConfirmOpen ? (
             <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
-              <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-lg">
-                <div className="text-sm font-semibold text-[var(--ink)]">确认删除投稿任务？</div>
-                <div className="mt-2 text-xs text-[var(--muted)]">删除后不可恢复。</div>
+              <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-lg">
+              <div className="text-sm font-semibold text-[var(--ink)]">删除投稿任务</div>
+              <div className="mt-2 text-xs text-[var(--muted)]">
+                请选择删除范围，删除后不可恢复。
+              </div>
+              {deleteMessage ? (
+                <div className={`mt-3 rounded-lg border px-3 py-2 text-xs ${deleteMessageClass}`}>
+                  {deleteMessage}
+                </div>
+              ) : null}
+              <div className="mt-4 space-y-3">
+                  <label className="flex items-start gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={deleteTaskChecked}
+                      onChange={(event) => setDeleteTaskChecked(event.target.checked)}
+                    />
+                    <div>
+                      <div className="font-semibold text-[var(--ink)]">删除投稿任务</div>
+                      <div className="text-xs text-[var(--muted)]">
+                        同步删除任务记录与任务目录。
+                      </div>
+                    </div>
+                  </label>
+                  <label className="flex items-start gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={deleteFilesChecked}
+                      onChange={(event) => handleDeleteFilesToggle(event.target.checked)}
+                    />
+                    <div>
+                      <div className="font-semibold text-[var(--ink)]">删除视频文件</div>
+                      <div className="text-xs text-[var(--muted)]">
+                        包含源视频与任务目录，默认全选。
+                      </div>
+                    </div>
+                  </label>
+                  {deleteFilesChecked ? (
+                    <div className="rounded-xl border border-black/10 bg-white/80 p-3">
+                      <div className="text-xs font-semibold text-[var(--ink)]">
+                        可删除文件
+                      </div>
+                      {deletePreviewLoading ? (
+                        <div className="mt-2 text-xs text-[var(--muted)]">
+                          正在读取文件列表...
+                        </div>
+                      ) : null}
+                      {!deletePreviewLoading && !deleteHasFiles ? (
+                        <div className="mt-2 text-xs text-[var(--muted)]">
+                          未发现可删除文件。
+                        </div>
+                      ) : null}
+                      {!deletePreviewLoading && deleteHasFiles ? (
+                        <div className="mt-3 max-h-52 space-y-2 overflow-auto">
+                          {deleteFiles.map((item) => {
+                            const checked = deleteFileSelections.has(item.path);
+                            const isVideo = isVideoFilePath(item.path);
+                            const conflicts = item.conflicts || [];
+                            return (
+                              <label
+                                key={item.path}
+                                className="flex items-start gap-2 text-xs"
+                              >
+                                <input
+                                  type="checkbox"
+                                  className="mt-0.5"
+                                  checked={checked}
+                                  onChange={() => toggleDeleteFileSelection(item.path)}
+                                />
+                                <div className="min-w-0">
+                                  <div className="truncate text-[var(--ink)]">
+                                    {item.path}
+                                  </div>
+                                  <div className="mt-0.5 text-[10px] text-[var(--muted)]">
+                                    {isVideo ? "源视频" : "任务目录"}
+                                  </div>
+                                  {conflicts.length > 0 ? (
+                                    <div className="mt-1 space-y-1 text-[10px] text-red-500">
+                                      {conflicts.map((conflict) => (
+                                        <div key={conflict.taskId}>
+                                          被任务《{conflict.title}》({conflict.status}) 使用中
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
                 <div className="mt-4 flex justify-end gap-2">
                   <button
                     className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                    type="button"
                     onClick={handleDeleteCancel}
+                    disabled={deleteSubmitting}
                   >
                     取消
                   </button>
                   <button
-                    className="rounded-full border border-red-200 bg-red-500 px-3 py-1 text-xs font-semibold text-white"
+                    className="rounded-full border border-red-200 bg-red-500 px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    type="button"
                     onClick={handleDeleteConfirm}
+                    disabled={deleteSubmitting}
                   >
-                    确认删除
+                    {deleteSubmitting ? "处理中" : "确认删除"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+          {deleteConflictOpen ? (
+            <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 px-4">
+              <div className="w-full max-w-md rounded-2xl bg-white p-5 shadow-lg">
+                <div className="text-sm font-semibold text-[var(--ink)]">
+                  文件正被其他任务使用
+                </div>
+                <div className="mt-2 text-xs text-[var(--muted)]">
+                  仍然删除将影响其他投稿任务，确认继续吗？
+                </div>
+                {deleteMessage ? (
+                  <div className={`mt-3 rounded-lg border px-3 py-2 text-xs ${deleteMessageClass}`}>
+                    {deleteMessage}
+                  </div>
+                ) : null}
+                <div className="mt-3 max-h-48 space-y-2 overflow-auto">
+                  {deleteConflictFiles.map((item) => (
+                    <div
+                      key={item.path}
+                      className="rounded-lg border border-red-100 bg-red-50/60 p-2 text-xs"
+                    >
+                      <div className="truncate text-[var(--ink)]">{item.path}</div>
+                      {item.conflicts && item.conflicts.length > 0 ? (
+                        <div className="mt-1 space-y-1 text-[10px] text-red-600">
+                          {item.conflicts.map((conflict) => (
+                            <div key={conflict.taskId}>
+                              任务：{conflict.title}（{conflict.status}）
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                    type="button"
+                    onClick={handleDeleteConflictCancel}
+                    disabled={deleteSubmitting}
+                  >
+                    取消
+                  </button>
+                  <button
+                    className="rounded-full border border-red-200 bg-red-500 px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    type="button"
+                    onClick={handleDeleteConflictConfirm}
+                    disabled={deleteSubmitting}
+                  >
+                    {deleteSubmitting ? "处理中" : "仍然删除"}
                   </button>
                 </div>
               </div>

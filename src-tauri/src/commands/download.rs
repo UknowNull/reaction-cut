@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,10 +13,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use rusqlite::params;
 use tauri::State;
-use tokio::time::sleep;
+use tokio::time::{interval, sleep};
 use url::Url;
 
 use crate::api::ApiResponse;
+use crate::baidu_sync;
 use crate::config::{default_download_dir, resolve_aria2c_candidates};
 use crate::commands::settings::load_download_settings_from_db;
 use crate::ffmpeg::{run_ffmpeg, run_ffmpeg_with_progress, run_ffprobe_json};
@@ -26,6 +27,10 @@ use crate::bilibili::client::BilibiliClient;
 use crate::db::Db;
 use crate::login_store::LoginStore;
 use crate::AppState;
+
+pub const DOWNLOAD_SOURCE_BILIBILI: &str = "BILIBILI";
+pub const DOWNLOAD_SOURCE_BAIDU: &str = "BAIDU";
+const BAIDU_DOWNLOAD_SUFFIX: &str = ".BaiduPCS-Go-downloading";
 
 #[derive(Clone)]
 struct DownloadContext {
@@ -59,6 +64,45 @@ impl DownloadContext {
       edit_upload_state: state.edit_upload_state.clone(),
     }
   }
+}
+
+fn register_baidu_download_process(
+  context: &DownloadContext,
+  record_id: i64,
+  child: Arc<Mutex<Child>>,
+) {
+  if let Ok(mut map) = context.download_runtime.baidu_children.lock() {
+    map.insert(record_id, child);
+  }
+}
+
+fn remove_baidu_download_process(context: &DownloadContext, record_id: i64) {
+  if let Ok(mut map) = context.download_runtime.baidu_children.lock() {
+    map.remove(&record_id);
+  }
+}
+
+fn cancel_baidu_download_process(
+  context: &DownloadContext,
+  record_id: i64,
+) -> Result<bool, String> {
+  let handle = {
+    let mut map = context
+      .download_runtime
+      .baidu_children
+      .lock()
+      .map_err(|_| "BaiduPCS-Go 进程锁失败".to_string())?;
+    map.remove(&record_id)
+  };
+  let Some(handle) = handle else {
+    return Ok(false);
+  };
+  let mut guard = handle
+    .lock()
+    .map_err(|_| "BaiduPCS-Go 进程锁失败".to_string())?;
+  let _ = guard.kill();
+  let _ = guard.wait();
+  Ok(true)
 }
 
 #[derive(Clone)]
@@ -121,6 +165,7 @@ pub struct SubmissionRequest {
   pub video_type: String,
   pub collection_id: Option<i64>,
   pub segment_prefix: Option<String>,
+  pub priority: Option<bool>,
   pub baidu_sync_enabled: Option<bool>,
   pub baidu_sync_path: Option<String>,
   pub baidu_sync_filename: Option<String>,
@@ -160,6 +205,7 @@ pub struct VideoDownloadRecord {
   pub progress_done: i64,
   pub create_time: String,
   pub update_time: String,
+  pub source_type: String,
 }
 
 struct PendingDownloadRecord {
@@ -174,6 +220,8 @@ struct PendingDownloadRecord {
   cid: Option<i64>,
   content: Option<String>,
   progress: i64,
+  download_url: Option<String>,
+  source_type: String,
 }
 
 #[derive(Clone)]
@@ -225,7 +273,7 @@ pub async fn download_video(
 pub fn download_get(state: State<'_, AppState>, task_id: i64) -> ApiResponse<VideoDownloadRecord> {
   match state.db.with_conn(|conn| {
     conn.query_row(
-      "SELECT id, bvid, aid, title, part_title, part_count, current_part, download_url, local_path, resolution, codec, format, status, progress, progress_total, progress_done, create_time, update_time \
+      "SELECT id, bvid, aid, title, part_title, part_count, current_part, download_url, local_path, resolution, codec, format, status, progress, progress_total, progress_done, create_time, update_time, source_type \
        FROM video_download WHERE id = ?1",
       [task_id],
       |row| {
@@ -248,6 +296,9 @@ pub fn download_get(state: State<'_, AppState>, task_id: i64) -> ApiResponse<Vid
           progress_done: row.get(15)?,
           create_time: row.get(16)?,
           update_time: row.get(17)?,
+          source_type: row
+            .get::<_, Option<String>>(18)?
+            .unwrap_or_else(|| DOWNLOAD_SOURCE_BILIBILI.to_string()),
         })
       },
     )
@@ -264,7 +315,7 @@ pub fn download_list_by_status(
 ) -> ApiResponse<Vec<VideoDownloadRecord>> {
   match state.db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT id, bvid, aid, title, part_title, part_count, current_part, download_url, local_path, resolution, codec, format, status, progress, progress_total, progress_done, create_time, update_time \
+      "SELECT id, bvid, aid, title, part_title, part_count, current_part, download_url, local_path, resolution, codec, format, status, progress, progress_total, progress_done, create_time, update_time, source_type \
        FROM video_download WHERE status = ?1 ORDER BY id DESC",
     )?;
     let list = stmt
@@ -288,6 +339,9 @@ pub fn download_list_by_status(
           progress_done: row.get(15)?,
           create_time: row.get(16)?,
           update_time: row.get(17)?,
+          source_type: row
+            .get::<_, Option<String>>(18)?
+            .unwrap_or_else(|| DOWNLOAD_SOURCE_BILIBILI.to_string()),
         })
       })?
       .collect::<Result<Vec<_>, _>>()?;
@@ -305,16 +359,35 @@ pub fn download_delete(
   delete_file: Option<bool>,
 ) -> ApiResponse<String> {
   let delete_file = delete_file.unwrap_or(false);
-  let local_path = match state.db.with_conn(|conn| {
+  let record = match state.db.with_conn(|conn| {
     conn.query_row(
-      "SELECT local_path FROM video_download WHERE id = ?1",
+      "SELECT local_path, status, source_type FROM video_download WHERE id = ?1",
       [task_id],
-      |row| row.get::<_, Option<String>>(0),
+      |row| {
+        Ok((
+          row.get::<_, Option<String>>(0)?,
+          row.get::<_, i64>(1)?,
+          row.get::<_, Option<String>>(2)?,
+        ))
+      },
     )
   }) {
     Ok(value) => value,
     Err(err) => return ApiResponse::error(format!("Failed to load download record: {}", err)),
   };
+  let (local_path, status, source_type) = record;
+  let source_type = source_type
+    .unwrap_or_else(|| DOWNLOAD_SOURCE_BILIBILI.to_string())
+    .to_ascii_uppercase();
+  if status == 1 && source_type != DOWNLOAD_SOURCE_BAIDU {
+    return ApiResponse::error("任务正在下载，暂不支持删除".to_string());
+  }
+  if status == 1 && source_type == DOWNLOAD_SOURCE_BAIDU {
+    let context = DownloadContext::new(&state);
+    if let Err(err) = cancel_baidu_download_process(&context, task_id) {
+      return ApiResponse::error(format!("取消网盘下载失败: {}", err));
+    }
+  }
 
   if delete_file {
     let local_path = match local_path {
@@ -323,6 +396,22 @@ pub fn download_delete(
     };
     let path = PathBuf::from(local_path);
     cleanup_download_outputs(&path);
+    if path.exists() {
+      let remove_result = if path.is_dir() {
+        std::fs::remove_dir_all(&path)
+      } else {
+        std::fs::remove_file(&path)
+      };
+      if let Err(err) = remove_result {
+        return ApiResponse::error(format!("删除文件失败: {}", err));
+      }
+    }
+    let baidu_temp = PathBuf::from(format!(
+      "{}{}",
+      path.to_string_lossy(),
+      BAIDU_DOWNLOAD_SUFFIX
+    ));
+    let _ = std::fs::remove_file(baidu_temp);
 
     if let Some(parent) = path.parent() {
       if is_dir_empty(parent) {
@@ -352,7 +441,7 @@ pub async fn download_retry(
     .db
     .with_conn(|conn| {
       conn.query_row(
-        "SELECT bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status \
+        "SELECT bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status, source_type, download_url \
          FROM video_download WHERE id = ?1",
         [task_id],
         |row| {
@@ -367,14 +456,65 @@ pub async fn download_retry(
             row.get::<_, Option<i64>>(7)?,
             row.get::<_, Option<String>>(8)?,
             row.get::<_, i64>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
           ))
         },
       )
     })
     .map_err(|err| format!("读取下载任务失败: {}", err))?;
 
-  let (bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status) =
-    record;
+  let (
+    bvid,
+    aid,
+    part_title,
+    local_path,
+    resolution,
+    codec,
+    format,
+    cid,
+    content,
+    status,
+    source_type,
+    download_url,
+  ) = record;
+  let source_type = source_type
+    .unwrap_or_else(|| DOWNLOAD_SOURCE_BILIBILI.to_string())
+    .to_ascii_uppercase();
+
+  if source_type == DOWNLOAD_SOURCE_BAIDU {
+    if status == 1 {
+      return Ok(ApiResponse::error("任务正在下载"));
+    }
+    if status == 0 {
+      return Ok(ApiResponse::error("任务已在队列中"));
+    }
+    if status == 4 {
+      return Ok(ApiResponse::error("任务已暂停，请使用继续下载"));
+    }
+    let local_path = match local_path {
+      Some(value) => value,
+      None => return Ok(ApiResponse::error("缺少本地路径，无法重试")),
+    };
+    let remote_path = match download_url {
+      Some(value) if !value.trim().is_empty() => value,
+      _ => return Ok(ApiResponse::error("缺少远端路径，无法重试")),
+    };
+    cleanup_download_outputs(&PathBuf::from(&local_path));
+    reset_download_record_progress(&context, task_id)?;
+    let started = try_start_baidu_download_job(
+      context.clone(),
+      task_id,
+      0,
+      remote_path,
+      PathBuf::from(local_path),
+    )?;
+    if !started {
+      let _ = update_download_status_only(&context, task_id, 0);
+    }
+    schedule_pending_downloads(context.clone()).await;
+    return Ok(ApiResponse::success("Retry started".to_string()));
+  }
 
   if status == 1 {
     return Ok(ApiResponse::error("任务正在下载"));
@@ -474,7 +614,7 @@ pub async fn download_resume(
     .db
     .with_conn(|conn| {
       conn.query_row(
-        "SELECT bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status, progress \
+        "SELECT bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status, progress, source_type, download_url \
          FROM video_download WHERE id = ?1",
         [task_id],
         |row| {
@@ -490,14 +630,64 @@ pub async fn download_resume(
             row.get::<_, Option<String>>(8)?,
             row.get::<_, i64>(9)?,
             row.get::<_, i64>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, Option<String>>(12)?,
           ))
         },
       )
     })
     .map_err(|err| format!("读取下载任务失败: {}", err))?;
 
-  let (bvid, aid, part_title, local_path, resolution, codec, format, cid, content, status, progress) =
-    record;
+  let (
+    bvid,
+    aid,
+    part_title,
+    local_path,
+    resolution,
+    codec,
+    format,
+    cid,
+    content,
+    status,
+    progress,
+    source_type,
+    download_url,
+  ) = record;
+  let source_type = source_type
+    .unwrap_or_else(|| DOWNLOAD_SOURCE_BILIBILI.to_string())
+    .to_ascii_uppercase();
+
+  if source_type == DOWNLOAD_SOURCE_BAIDU {
+    if status == 1 {
+      return Ok(ApiResponse::error("任务正在下载"));
+    }
+    if status == 0 {
+      return Ok(ApiResponse::error("任务已在队列中"));
+    }
+    if status != 4 {
+      return Ok(ApiResponse::error("任务未处于暂停状态"));
+    }
+    let local_path = match local_path {
+      Some(value) => value,
+      None => return Ok(ApiResponse::error("缺少本地路径，无法继续下载")),
+    };
+    let remote_path = match download_url {
+      Some(value) if !value.trim().is_empty() => value,
+      _ => return Ok(ApiResponse::error("缺少远端路径，无法继续下载")),
+    };
+    let started = try_start_baidu_download_job(
+      context.clone(),
+      task_id,
+      4,
+      remote_path,
+      PathBuf::from(local_path),
+    )?;
+    if !started {
+      let _ = update_download_status_only(&context, task_id, 0);
+    }
+    schedule_pending_downloads(context.clone()).await;
+    return Ok(ApiResponse::success("Resume started".to_string()));
+  }
 
   if status == 1 {
     return Ok(ApiResponse::error("任务正在下载"));
@@ -757,8 +947,20 @@ async fn handle_integration_download(
   let download_ids: Vec<i64> = download_results.iter().map(|record| record.id).collect();
   let submission_id = uuid::Uuid::new_v4().to_string();
   let now = now_rfc3339();
+  append_log(
+    context.app_log_path.as_ref(),
+    &format!(
+      "integration_submission_create_start task_id={} downloads={}",
+      submission_id,
+      download_ids.len()
+    ),
+  );
   let mut submission = request.submission_request;
   let workflow_config = request.workflow_config.clone();
+  let normalized_baidu_sync_filename =
+    crate::commands::submission::normalize_baidu_sync_filename(
+      submission.baidu_sync_filename.as_deref(),
+    );
   if !download_results.is_empty() {
     let mut path_by_cid: HashMap<i64, String> = HashMap::new();
     let mut path_by_expected: HashMap<String, String> = HashMap::new();
@@ -783,11 +985,12 @@ async fn handle_integration_download(
 
   let insert_result = context.db.with_conn(|conn| {
     conn.execute(
-      "INSERT INTO submission_task (task_id, status, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
-       VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?13, ?14, ?15, ?16, ?17)",
+      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
+       VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, ?13, ?14, ?15, ?16, ?17, ?18)",
       params![
         &submission_id,
         "PENDING",
+        if submission.priority.unwrap_or(false) { 1 } else { 0 },
         submission.title,
         submission.description,
         submission.partition_id,
@@ -806,7 +1009,7 @@ async fn handle_integration_download(
           0
         },
         submission.baidu_sync_path.as_deref(),
-        submission.baidu_sync_filename.as_deref(),
+        normalized_baidu_sync_filename.as_deref(),
       ],
     )?;
 
@@ -831,6 +1034,10 @@ async fn handle_integration_download(
   if let Err(err) = insert_result {
     return ApiResponse::error(format!("Failed to create submission task: {}", err));
   }
+  append_log(
+    context.app_log_path.as_ref(),
+    &format!("integration_submission_create_ok task_id={}", submission_id),
+  );
 
   let workflow_instance_id = match workflow_config.as_ref() {
     Some(config) => {
@@ -954,8 +1161,8 @@ async fn create_download_tasks(
       .db
       .with_conn(|conn| {
         conn.execute(
-          "INSERT INTO video_download (bvid, aid, title, part_title, part_count, current_part, download_url, local_path, status, progress, progress_total, progress_done, create_time, update_time, resolution, codec, format, cid, content) \
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+          "INSERT INTO video_download (bvid, aid, title, part_title, part_count, current_part, download_url, local_path, status, progress, progress_total, progress_done, create_time, update_time, resolution, codec, format, cid, content, source_type) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
           (
             bvid.as_deref(),
             aid.as_deref(),
@@ -972,6 +1179,7 @@ async fn create_download_tasks(
             request.config.format.as_deref(),
             part.cid,
             request.config.content.as_deref(),
+            DOWNLOAD_SOURCE_BILIBILI,
           ),
         )?;
         Ok(conn.last_insert_rowid())
@@ -1006,9 +1214,9 @@ fn find_reusable_download_record(
       let mut candidates: Vec<(i64, String, i64)> = Vec::new();
       if let Some(cid) = cid {
         let mut stmt = conn.prepare(
-          "SELECT id, local_path, status FROM video_download WHERE cid = ?1 ORDER BY id DESC",
+          "SELECT id, local_path, status FROM video_download WHERE cid = ?1 AND source_type = ?2 ORDER BY id DESC",
         )?;
-        let rows = stmt.query_map([cid], |row| {
+        let rows = stmt.query_map((cid, DOWNLOAD_SOURCE_BILIBILI), |row| {
           Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         for row in rows {
@@ -1016,9 +1224,9 @@ fn find_reusable_download_record(
         }
       } else {
         let mut stmt = conn.prepare(
-          "SELECT id, local_path, status FROM video_download WHERE download_url = ?1 AND part_title = ?2 ORDER BY id DESC",
+          "SELECT id, local_path, status FROM video_download WHERE download_url = ?1 AND part_title = ?2 AND source_type = ?3 ORDER BY id DESC",
         )?;
-        let rows = stmt.query_map([download_url, part_title], |row| {
+        let rows = stmt.query_map((download_url, part_title, DOWNLOAD_SOURCE_BILIBILI), |row| {
           Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         for row in rows {
@@ -1151,7 +1359,7 @@ fn load_pending_downloads(
     .db
     .with_conn(|conn| {
       let mut stmt = conn.prepare(
-        "SELECT id, bvid, aid, part_title, local_path, resolution, codec, format, cid, content, progress \
+        "SELECT id, bvid, aid, part_title, local_path, resolution, codec, format, cid, content, progress, download_url, source_type \
          FROM video_download WHERE status = 0 ORDER BY id ASC LIMIT ?1",
       )?;
       let rows = stmt.query_map([limit], |row| {
@@ -1167,6 +1375,10 @@ fn load_pending_downloads(
           cid: row.get(8)?,
           content: row.get(9)?,
           progress: row.get(10)?,
+          download_url: row.get(11)?,
+          source_type: row
+            .get::<_, Option<String>>(12)?
+            .unwrap_or_else(|| DOWNLOAD_SOURCE_BILIBILI.to_string()),
         })
       })?;
       Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1179,6 +1391,7 @@ fn start_pending_download(
   record: PendingDownloadRecord,
 ) -> Result<bool, String> {
   let resume_progress = record.progress.max(0);
+  let source_type = record.source_type.trim().to_ascii_uppercase();
   let local_path = match record.local_path {
     Some(value) => value,
     None => {
@@ -1197,6 +1410,33 @@ fn start_pending_download(
       return Ok(false);
     }
   };
+  if source_type == DOWNLOAD_SOURCE_BAIDU {
+    let remote_path = match record.download_url {
+      Some(value) if !value.trim().is_empty() => value,
+      _ => {
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "download_schedule_invalid record_id={} reason=missing_remote_path",
+            record.id
+          ),
+        );
+        let _ = update_download_status(&context, record.id, 3, 0);
+        let context_clone = context.clone();
+        tauri::async_runtime::spawn(async move {
+          let _ = handle_baidu_restore_after_download(&context_clone, record.id).await;
+        });
+        return Ok(false);
+      }
+    };
+    return try_start_baidu_download_job(
+      context,
+      record.id,
+      0,
+      remote_path,
+      PathBuf::from(local_path),
+    );
+  }
   let cid = match record.cid {
     Some(value) => value,
     None => {
@@ -1280,6 +1520,29 @@ fn try_start_download_job(
   Ok(true)
 }
 
+fn try_start_baidu_download_job(
+  context: DownloadContext,
+  record_id: i64,
+  expected_status: i64,
+  remote_path: String,
+  output_path: PathBuf,
+) -> Result<bool, String> {
+  if !try_acquire_download_slot(&context)? {
+    return Ok(false);
+  }
+  if !mark_download_running(&context, record_id, expected_status)? {
+    release_download_slot(&context);
+    return Ok(false);
+  }
+
+  let context_clone = context.clone();
+  tauri::async_runtime::spawn(async move {
+    run_baidu_download_job(context_clone, record_id, remote_path, output_path).await;
+  });
+
+  Ok(true)
+}
+
 fn mark_download_running(
   context: &DownloadContext,
   record_id: i64,
@@ -1302,29 +1565,47 @@ fn available_download_slots(context: &DownloadContext) -> Result<i64, String> {
   let settings = load_download_settings_from_db(&context.db)
     .map_err(|err| format!("Failed to load download settings: {}", err))?;
   let threads = settings.threads.max(1);
+  let running = load_running_download_count(context).unwrap_or(0);
   let active = context
     .download_runtime
     .active_count
     .lock()
     .map_err(|_| "Download state lock failed".to_string())?;
-  Ok((threads - *active).max(0))
+  let current_running = (*active).max(running);
+  Ok((threads - current_running).max(0))
 }
 
 fn try_acquire_download_slot(context: &DownloadContext) -> Result<bool, String> {
   let settings = load_download_settings_from_db(&context.db)
     .map_err(|err| format!("Failed to load download settings: {}", err))?;
   let threads = settings.threads.max(1);
+  let running = load_running_download_count(context).unwrap_or(0);
   let mut active = context
     .download_runtime
     .active_count
     .lock()
     .map_err(|_| "Download state lock failed".to_string())?;
-  if *active < threads {
-    *active += 1;
+  let current_running = (*active).max(running);
+  if current_running < threads {
+    *active = current_running + 1;
     Ok(true)
   } else {
     Ok(false)
   }
+}
+
+fn load_running_download_count(context: &DownloadContext) -> Result<i64, String> {
+  context
+    .db
+    .with_conn(|conn| {
+      let count: i64 = conn.query_row(
+        "SELECT COUNT(1) FROM video_download WHERE status = 1",
+        [],
+        |row| row.get(0),
+      )?;
+      Ok(count)
+    })
+    .map_err(|err| format!("Failed to load running downloads: {}", err))
 }
 
 async fn run_download_job(
@@ -1383,6 +1664,197 @@ async fn run_download_job(
       let _ = refresh_integration_status(&context, record_id).await;
     }
   }
+}
+
+fn extract_remote_name(remote_path: &str) -> String {
+  remote_path
+    .rsplit('/')
+    .find(|value| !value.is_empty())
+    .unwrap_or("")
+    .to_string()
+}
+
+fn find_file_by_name(dir: &Path, target: &str) -> Option<PathBuf> {
+  if target.trim().is_empty() {
+    return None;
+  }
+  let entries = std::fs::read_dir(dir).ok()?;
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path.is_dir() {
+      if let Some(found) = find_file_by_name(&path, target) {
+        return Some(found);
+      }
+    } else if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+      if name == target {
+        return Some(path);
+      }
+    }
+  }
+  None
+}
+
+fn resolve_baidu_download_size(output_path: &Path, output_dir: &Path, remote_name: &str) -> u64 {
+  if let Ok(meta) = output_path.metadata() {
+    return meta.len();
+  }
+  let temp_path = output_path
+    .file_name()
+    .and_then(|name| name.to_str())
+    .map(|name| output_dir.join(format!("{}{}", name, BAIDU_DOWNLOAD_SUFFIX)));
+  if let Some(temp_path) = temp_path {
+    if let Ok(meta) = temp_path.metadata() {
+      return meta.len();
+    }
+  }
+  if let Some(found) = find_file_by_name(output_dir, remote_name) {
+    return found.metadata().map(|meta| meta.len()).unwrap_or(0);
+  }
+  let temp_name = format!("{}{}", remote_name, BAIDU_DOWNLOAD_SUFFIX);
+  if let Some(found) = find_file_by_name(output_dir, &temp_name) {
+    return found.metadata().map(|meta| meta.len()).unwrap_or(0);
+  }
+  0
+}
+
+async fn run_baidu_download_job(
+  context: DownloadContext,
+  record_id: i64,
+  remote_path: String,
+  output_path: PathBuf,
+) {
+  clear_download_progress(&context, record_id);
+  let remote_name = extract_remote_name(&remote_path);
+  append_log(
+    &context.app_log_path,
+    &format!(
+      "baidu_download_job_start record_id={} remote={}",
+      record_id, remote_path
+    ),
+  );
+  let output_dir = match output_path.parent() {
+    Some(value) => value.to_path_buf(),
+    None => {
+      let _ = update_download_status(&context, record_id, 3, 0);
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "baidu_download_job_fail record_id={} err=missing_output_dir",
+          record_id
+        ),
+      );
+      let _ = handle_baidu_restore_after_download(&context, record_id).await;
+      release_download_slot(&context);
+      return;
+    }
+  };
+
+  let total_size =
+    baidu_sync::fetch_baidu_remote_file_size(context.db.as_ref(), &remote_path)
+      .ok()
+      .unwrap_or(0);
+
+  let db = context.db.clone();
+  let remote_path_clone = remote_path.clone();
+  let output_path_clone = output_path.clone();
+  let download_runtime = context.download_runtime.clone();
+  let record_id_clone = record_id;
+  let mut download_handle = tauri::async_runtime::spawn_blocking(move || {
+    baidu_sync::download_baidu_file_with_hook(
+      db.as_ref(),
+      &remote_path_clone,
+      &output_path_clone,
+      |child| {
+        if let Ok(mut map) = download_runtime.baidu_children.lock() {
+          map.insert(record_id_clone, child);
+        }
+      },
+    )
+  });
+
+  let mut ticker = interval(Duration::from_secs(1));
+  let download_result: Result<PathBuf, String> = loop {
+    tokio::select! {
+      result = &mut download_handle => {
+        break match result {
+          Ok(value) => value.map_err(|err| err.to_string()),
+          Err(_) => Err("网盘下载任务失败".to_string()),
+        };
+      }
+      _ = ticker.tick() => {
+        if total_size > 0 {
+          let current_size =
+            resolve_baidu_download_size(&output_path, &output_dir, remote_name.as_str());
+          let _ = update_download_bytes(&context, record_id, "baidu", total_size, current_size);
+        }
+      }
+    }
+  };
+
+  remove_baidu_download_process(&context, record_id);
+  release_download_slot(&context);
+  let context_clone = context.clone();
+  tauri::async_runtime::spawn(async move {
+    schedule_pending_downloads(context_clone).await;
+  });
+
+  match download_result {
+    Ok(path) => {
+      if total_size > 0 {
+        let current_size = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let _ = update_download_bytes(&context, record_id, "baidu", total_size, current_size);
+      }
+      let _ = update_download_status(&context, record_id, 2, 100);
+      clear_download_progress(&context, record_id);
+      append_log(
+        &context.app_log_path,
+        &format!("baidu_download_job_complete record_id={} status=completed", record_id),
+      );
+      let _ = handle_baidu_restore_after_download(&context, record_id).await;
+    }
+    Err(err) => {
+      let _ = update_download_status(&context, record_id, 3, 0);
+      clear_download_progress(&context, record_id);
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "baidu_download_job_fail record_id={} err={}",
+          record_id, err
+        ),
+      );
+      let _ = handle_baidu_restore_after_download(&context, record_id).await;
+    }
+  }
+}
+
+async fn handle_baidu_restore_after_download(
+  context: &DownloadContext,
+  record_id: i64,
+) -> Result<(), String> {
+  let task_id = context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT submission_task_id FROM task_relations \
+         WHERE download_task_id = ?1 AND relation_type = 'REMOTE_RESTORE' LIMIT 1",
+      )?;
+      let value: Option<String> = stmt.query_row([record_id], |row| row.get(0)).ok();
+      Ok(value)
+    })
+    .map_err(|err| err.to_string())?;
+  let task_id = match task_id {
+    Some(value) => value,
+    None => return Ok(()),
+  };
+  crate::commands::submission::resume_reprocess_after_baidu_restore(
+    context.db.clone(),
+    context.app_log_path.clone(),
+    context.edit_upload_state.clone(),
+    task_id,
+    record_id,
+  )
+  .await;
+  Ok(())
 }
 
 fn release_download_slot(context: &DownloadContext) {
@@ -2324,6 +2796,9 @@ fn cleanup_aria2c_files(path: &Path) {
 }
 
 fn cleanup_download_outputs(path: &Path) {
+  let _ = std::fs::remove_file(path);
+  let baidu_temp = PathBuf::from(format!("{}{}", path.to_string_lossy(), BAIDU_DOWNLOAD_SUFFIX));
+  let _ = std::fs::remove_file(baidu_temp);
   cleanup_aria2c_files(path);
   let temp_video = path.with_extension("video");
   let temp_audio = path.with_extension("audio");

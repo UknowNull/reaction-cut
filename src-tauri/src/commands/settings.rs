@@ -18,6 +18,7 @@ pub const DEFAULT_BLOCK_PCDN: bool = true;
 pub const DEFAULT_ENABLE_ARIA2C: bool = true;
 pub const DEFAULT_ARIA2C_CONNECTIONS: i64 = 4;
 pub const DEFAULT_ARIA2C_SPLIT: i64 = 4;
+pub const DEFAULT_BAIDU_MAX_PARALLEL: i64 = 3;
 pub const LOG_DIR_SETTING_KEY: &str = "log_dir";
 pub const LEGACY_LIVE_FILE_TEMPLATE: &str =
   "live/{{ roomId }}/录制-{{ roomId }}-{{ now }}-{{ title }}.flv";
@@ -39,6 +40,7 @@ pub struct DownloadSettings {
   pub enable_aria2c: bool,
   pub aria2c_connections: i64,
   pub aria2c_split: i64,
+  pub baidu_max_parallel: i64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -101,6 +103,7 @@ pub fn update_download_settings(
   block_pcdn: bool,
   aria2c_connections: i64,
   aria2c_split: i64,
+  baidu_max_parallel: i64,
   _enable_aria2c: bool,
 ) -> ApiResponse<DownloadSettings> {
   if threads <= 0
@@ -108,6 +111,7 @@ pub fn update_download_settings(
     || submission_remote_refresh_minutes <= 0
     || aria2c_connections <= 0
     || aria2c_split <= 0
+    || baidu_max_parallel <= 0
   {
     return ApiResponse::error("Values must be greater than 0");
   }
@@ -130,6 +134,7 @@ pub fn update_download_settings(
   };
   let normalized_aria2c_connections = aria2c_connections.clamp(1, 32);
   let normalized_aria2c_split = aria2c_split.clamp(1, 32);
+  let normalized_baidu_max_parallel = baidu_max_parallel.clamp(1, 100);
 
   let now = Utc::now().to_rfc3339();
   let enable_aria2c = true;
@@ -196,6 +201,15 @@ pub fn update_download_settings(
        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
       ("download_aria2c_split", normalized_aria2c_split.to_string(), &now),
     )?;
+    conn.execute(
+      "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+      (
+        "download_baidu_max_parallel",
+        normalized_baidu_max_parallel.to_string(),
+        &now,
+      ),
+    )?;
     Ok(())
   });
 
@@ -214,6 +228,7 @@ pub fn update_download_settings(
     enable_aria2c,
     aria2c_connections: normalized_aria2c_connections,
     aria2c_split: normalized_aria2c_split,
+    baidu_max_parallel: normalized_baidu_max_parallel,
   })
 }
 
@@ -363,6 +378,13 @@ pub fn load_download_settings_from_db(db: &Db) -> Result<DownloadSettings, crate
         |row| row.get(0),
       )
       .ok();
+    let baidu_max_parallel: Option<String> = conn
+      .query_row(
+        "SELECT value FROM app_settings WHERE key = 'download_baidu_max_parallel'",
+        [],
+        |row| row.get(0),
+      )
+      .ok();
     let log_dir: Option<String> = conn
       .query_row(
         "SELECT value FROM app_settings WHERE key = ?1",
@@ -410,6 +432,10 @@ pub fn load_download_settings_from_db(db: &Db) -> Result<DownloadSettings, crate
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(DEFAULT_ARIA2C_SPLIT)
         .clamp(1, 32),
+      baidu_max_parallel: baidu_max_parallel
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_BAIDU_MAX_PARALLEL)
+        .clamp(1, 100),
     })
   })
 }

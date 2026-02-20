@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::process::Child;
 use std::sync::{Arc, Mutex};
 
 use tokio::time::{sleep, Duration};
@@ -35,6 +36,7 @@ struct AppState {
 struct DownloadRuntime {
     active_count: Mutex<i64>,
     progress_state: Mutex<HashMap<i64, HashMap<String, (u64, u64)>>>,
+    baidu_children: Mutex<HashMap<i64, Arc<Mutex<Child>>>>,
 }
 
 impl DownloadRuntime {
@@ -42,6 +44,7 @@ impl DownloadRuntime {
         Self {
             active_count: Mutex::new(0),
             progress_state: Mutex::new(HashMap::new()),
+            baidu_children: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -213,6 +216,7 @@ pub fn run() {
             commands::process::process_create,
             commands::process::process_status,
             commands::toolbox::toolbox_remux,
+            commands::submission::submission_queue_prioritize,
             commands::baidu_sync::baidu_sync_settings,
             commands::baidu_sync::baidu_sync_status,
             commands::baidu_sync::baidu_sync_login,
@@ -238,6 +242,7 @@ pub fn run() {
             commands::submission::submission_list,
             commands::submission::submission_list_by_status,
             commands::submission::submission_task_dir,
+            commands::submission::submission_delete_preview,
             commands::submission::submission_detail,
             commands::submission::submission_edit_prepare,
             commands::submission::submission_edit_add_segment,

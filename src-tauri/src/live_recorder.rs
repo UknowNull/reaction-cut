@@ -79,7 +79,11 @@ const STREAM_URL_REFRESH_LEAD_SECS: u64 = 30;
 const MISSING_SEGMENT_WINDOW_SECS: u64 = 60;
 const TIMESTAMP_JUMP_THRESHOLD_MS: i64 = 500;
 const TIMESTAMP_AUDIO_FALLBACK_MS: i64 = 22;
+const TIMESTAMP_AUDIO_MIN_STEP_MS: i64 = 20;
+const TIMESTAMP_AUDIO_MAX_STEP_MS: i64 = 24;
 const TIMESTAMP_VIDEO_FALLBACK_MS: i64 = 33;
+const TIMESTAMP_VIDEO_MIN_STEP_MS: i64 = 15;
+const TIMESTAMP_VIDEO_MAX_STEP_MS: i64 = 50;
 const TIMESTAMP_MIN_STEP_MS: i64 = 1;
 
 pub fn new_live_runtime() -> LiveRuntime {
@@ -633,6 +637,21 @@ fn run_record_loop(
     settings.write_metadata = false;
     settings.flv_fix_split_on_missing = false;
   }
+  let enable_timestamp_fix =
+    settings.flv_fix_adjust_timestamp_jump || settings.flv_fix_split_on_timestamp_jump;
+  append_log(
+    &context.app_log_path,
+    &format!(
+      "record_settings room={} record_mode={} fix_enabled={} fix_adjust={} fix_split={} fix_split_missing={} fix_disable_annexb={}",
+      room_id,
+      settings.record_mode,
+      enable_timestamp_fix,
+      settings.flv_fix_adjust_timestamp_jump,
+      settings.flv_fix_split_on_timestamp_jump,
+      settings.flv_fix_split_on_missing,
+      settings.flv_fix_disable_on_annexb
+    ),
+  );
   let base_dir = if settings.record_path.trim().is_empty() {
     let download_dir = load_download_settings_from_db(&context.db)
       .map(|settings| settings.download_path)
@@ -957,8 +976,6 @@ fn run_record_loop(
     let mut buf = vec![0u8; 8192];
     let mut parser = FlvStreamParser::new();
     let mut cache = FlvHeaderCache::new();
-    let enable_timestamp_fix =
-      settings.flv_fix_adjust_timestamp_jump || settings.flv_fix_split_on_timestamp_jump;
     let mut timestamp_fixer = TimestampFixer::new(
       enable_timestamp_fix,
       settings.flv_fix_adjust_timestamp_jump,
@@ -1359,12 +1376,64 @@ struct TimestampJumpInfo {
   offset: i64,
 }
 
+struct TimestampChannelState {
+  last_original: Option<i64>,
+  last_fixed: Option<i64>,
+  last_step: i64,
+  fallback: i64,
+  min_step: i64,
+  max_step: i64,
+}
+
+impl TimestampChannelState {
+  fn new(fallback: i64, min_step: i64, max_step: i64) -> Self {
+    Self {
+      last_original: None,
+      last_fixed: None,
+      last_step: fallback,
+      fallback,
+      min_step,
+      max_step,
+    }
+  }
+
+  fn reset(&mut self) {
+    self.last_original = None;
+    self.last_fixed = None;
+    self.last_step = self.fallback;
+  }
+
+  fn update_step(&mut self, current: i64) -> i64 {
+    let step = match self.last_original {
+      Some(prev) => {
+        let diff = current - prev;
+        if diff >= self.min_step && diff <= self.max_step {
+          diff
+        } else {
+          self.fallback
+        }
+      }
+      None => self.fallback,
+    };
+    self.last_original = Some(current);
+    self.last_step = step;
+    step
+  }
+
+  fn update_fixed(&mut self, fixed: i64) {
+    self.last_fixed = Some(fixed);
+  }
+}
+
 struct TimestampFixer {
   enabled: bool,
   apply_fix: bool,
   last_original: Option<i64>,
   last_fixed: Option<i64>,
   current_offset: i64,
+  next_target: i64,
+  audio: TimestampChannelState,
+  video: TimestampChannelState,
 }
 
 impl TimestampFixer {
@@ -1375,6 +1444,17 @@ impl TimestampFixer {
       last_original: None,
       last_fixed: None,
       current_offset: 0,
+      next_target: 0,
+      audio: TimestampChannelState::new(
+        TIMESTAMP_AUDIO_FALLBACK_MS,
+        TIMESTAMP_AUDIO_MIN_STEP_MS,
+        TIMESTAMP_AUDIO_MAX_STEP_MS,
+      ),
+      video: TimestampChannelState::new(
+        TIMESTAMP_VIDEO_FALLBACK_MS,
+        TIMESTAMP_VIDEO_MIN_STEP_MS,
+        TIMESTAMP_VIDEO_MAX_STEP_MS,
+      ),
     }
   }
 
@@ -1382,6 +1462,9 @@ impl TimestampFixer {
     self.last_original = None;
     self.last_fixed = None;
     self.current_offset = 0;
+    self.next_target = 0;
+    self.audio.reset();
+    self.video.reset();
   }
 
   fn fix_tag(&mut self, tag: &mut FlvTag, is_header: bool) -> Option<TimestampJumpInfo> {
@@ -1414,21 +1497,22 @@ impl TimestampFixer {
       }
       return None;
     }
+    if is_header {
+      let stamp = if tag.tag_type == 18 {
+        self.next_target
+      } else {
+        self.last_fixed.unwrap_or(0)
+      };
+      write_flv_timestamp(tag, clamp_timestamp(stamp));
+      return None;
+    }
+
     let step = match tag.tag_type {
-      8 => TIMESTAMP_AUDIO_FALLBACK_MS,
-      9 => TIMESTAMP_VIDEO_FALLBACK_MS,
+      8 => self.audio.update_step(original),
+      9 => self.video.update_step(original),
       _ => TIMESTAMP_MIN_STEP_MS,
     }
     .max(TIMESTAMP_MIN_STEP_MS);
-
-    if is_header {
-      if let Some(last_fixed) = self.last_fixed {
-        write_flv_timestamp(tag, clamp_timestamp(last_fixed));
-      } else {
-        write_flv_timestamp(tag, 0);
-      }
-      return None;
-    }
 
     let last_original = match self.last_original {
       Some(value) => value,
@@ -1437,25 +1521,22 @@ impl TimestampFixer {
         let fixed = 0;
         self.last_original = Some(original);
         self.last_fixed = Some(fixed);
+        match tag.tag_type {
+          8 => self.audio.update_fixed(fixed),
+          9 => self.video.update_fixed(fixed),
+          _ => {}
+        }
+        self.recalculate_next_target();
         write_flv_timestamp(tag, fixed as u32);
         return None;
       }
     };
     let last_fixed = self.last_fixed.unwrap_or(0);
     let diff = original - last_original;
+    let mut jump_info = None;
 
     if diff < -TIMESTAMP_JUMP_THRESHOLD_MS || diff > TIMESTAMP_JUMP_THRESHOLD_MS {
-      let fixed = last_fixed + step;
-      self.current_offset = original - fixed;
-      self.last_original = Some(original);
-      self.last_fixed = Some(fixed);
-      write_flv_timestamp(tag, clamp_timestamp(fixed));
-      return Some(TimestampJumpInfo {
-        diff,
-        original,
-        fixed,
-        offset: self.current_offset,
-      });
+      self.current_offset = original - self.next_target;
     }
 
     let mut fixed = original - self.current_offset;
@@ -1465,8 +1546,36 @@ impl TimestampFixer {
     }
     self.last_original = Some(original);
     self.last_fixed = Some(fixed);
+    match tag.tag_type {
+      8 => self.audio.update_fixed(fixed),
+      9 => self.video.update_fixed(fixed),
+      _ => {}
+    }
+    self.recalculate_next_target();
     write_flv_timestamp(tag, clamp_timestamp(fixed));
-    None
+    if diff < -TIMESTAMP_JUMP_THRESHOLD_MS || diff > TIMESTAMP_JUMP_THRESHOLD_MS {
+      jump_info = Some(TimestampJumpInfo {
+        diff,
+        original,
+        fixed,
+        offset: self.current_offset,
+      });
+    }
+    jump_info
+  }
+
+  fn recalculate_next_target(&mut self) {
+    let audio_next = self
+      .audio
+      .last_fixed
+      .map(|value| value + self.audio.last_step)
+      .unwrap_or(0);
+    let video_next = self
+      .video
+      .last_fixed
+      .map(|value| value + self.video.last_step)
+      .unwrap_or(0);
+    self.next_target = audio_next.max(video_next);
   }
 }
 

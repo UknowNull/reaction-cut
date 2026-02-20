@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
+import LoadingButton from "../components/LoadingButton";
+import { showErrorDialog } from "../lib/dialog";
 import { invokeCommand } from "../lib/tauri";
 import { formatDateTime, formatDuration, formatNumber, parseVideoInput } from "../lib/format";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
@@ -133,6 +135,8 @@ export default function DownloadSection() {
   const [message, setMessage] = useState("");
   const [downloadList, setDownloadList] = useState([]);
   const [loadingDownloads, setLoadingDownloads] = useState(false);
+  const [submitSubmitting, setSubmitSubmitting] = useState(false);
+  const [defaultBaiduSyncPath, setDefaultBaiduSyncPath] = useState("/录播");
 
   const [integrationEnabled, setIntegrationEnabled] = useState(false);
   const [segmentationEnabled, setSegmentationEnabled] = useState(true);
@@ -149,6 +153,7 @@ export default function DownloadSection() {
     activityMissionId: "",
     activityTitle: "",
     segmentPrefix: "",
+    priority: false,
     baiduSyncEnabled: false,
     baiduSyncPath: "",
     baiduSyncFilename: "",
@@ -247,6 +252,16 @@ export default function DownloadSection() {
       }
     };
     loadDefaultPath();
+  }, []);
+
+  useEffect(() => {
+    const loadBaiduSyncSettings = async () => {
+      try {
+        const data = await invokeCommand("baidu_sync_settings");
+        setDefaultBaiduSyncPath(data?.targetPath || "/录播");
+      } catch (_) {}
+    };
+    loadBaiduSyncSettings();
   }, []);
 
   const loadDownloadList = async (status = activeRecordStatus) => {
@@ -835,6 +850,7 @@ export default function DownloadSection() {
       activityTitle: task.activityTitle || "",
       videoType: task.videoType || "ORIGINAL",
       segmentPrefix: task.segmentPrefix || "",
+      priority: Boolean(task.priority),
       baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
       baiduSyncPath: task.baiduSyncPath || "",
       baiduSyncFilename: task.baiduSyncFilename || "",
@@ -1034,17 +1050,18 @@ export default function DownloadSection() {
   const handleIntegrationDownload = async () => {
     await logClient(`download_submit:integration:start parts=${selectedCount}`);
     if (!integrationEnabled) {
-      return handleDownload();
+      const ok = await handleDownload();
+      return { ok, errorMessage: ok ? "" : "提交失败" };
     }
     const validation = validateIntegrationForm();
     if (!validation.valid) {
       setMessage(validation.message);
       await logClient(`download_submit:integration:invalid:${validation.message}`);
-      return false;
+      return { ok: false, errorMessage: validation.message };
     }
     if (!(await ensureDownloadPathReady())) {
       await logClient("download_submit:integration:invalid_path");
-      return false;
+      return { ok: false, errorMessage: "下载目录不可用" };
     }
     setMessage("");
     try {
@@ -1094,6 +1111,7 @@ export default function DownloadSection() {
             ? Number(submissionConfig.collectionId)
             : null,
           segmentPrefix: submissionConfig.segmentPrefix || null,
+          priority: Boolean(submissionConfig.priority),
           baiduSyncEnabled: Boolean(submissionConfig.baiduSyncEnabled),
           baiduSyncPath: submissionConfig.baiduSyncPath || null,
           baiduSyncFilename: submissionConfig.baiduSyncFilename || null,
@@ -1111,12 +1129,12 @@ export default function DownloadSection() {
       if (mainTab === "records") {
         await loadDownloadList();
       }
-      return true;
+      return { ok: true, errorMessage: "" };
     } catch (error) {
       const errorMessage = error?.message || String(error) || "请求失败";
       await logClient(`download_submit:integration:error:${errorMessage}`);
       setMessage(errorMessage);
-      return false;
+      return { ok: false, errorMessage };
     }
   };
 
@@ -1154,16 +1172,23 @@ export default function DownloadSection() {
   };
 
   const handleSubmitDownload = async () => {
+    if (submitSubmitting) {
+      return;
+    }
+    setSubmitSubmitting(true);
     await logClient("download_submit:integration_confirm");
-    const success = await handleIntegrationDownload();
-    if (success) {
+    const result = await handleIntegrationDownload();
+    if (result.ok) {
       await logClient("download_submit:integration_ok");
       setDownloadStep("select");
       setRecordTab("pending");
       setMainTab("records");
       await loadDownloadList(0);
+      setSubmitSubmitting(false);
     } else {
       await logClient("download_submit:integration_failed");
+      await showErrorDialog(result.errorMessage || "请求失败");
+      setSubmitSubmitting(false);
     }
   };
 
@@ -1853,6 +1878,19 @@ export default function DownloadSection() {
                         className="w-full"
                       />
                     </div>
+                    <label className="flex items-center gap-2 text-xs text-[var(--desc-color)]">
+                      <input
+                        type="checkbox"
+                        checked={submissionConfig.priority}
+                        onChange={(event) =>
+                          setSubmissionConfig((prev) => ({
+                            ...prev,
+                            priority: event.target.checked,
+                          }))
+                        }
+                      />
+                      优先投稿（进入投稿队列时置顶）
+                    </label>
                     <div className="text-xs text-[var(--desc-color)]">
                       分段前缀会作为分段文件名的前缀（可选）
                     </div>
@@ -1879,7 +1917,7 @@ export default function DownloadSection() {
                             <div className="text-xs text-[var(--desc-color)]">远端路径</div>
                             <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                               <div className="flex-1 rounded-lg border border-[var(--split-color)] bg-white/70 px-3 py-2 text-[var(--content-color)]">
-                                {submissionConfig.baiduSyncPath || "未配置"}
+                                {submissionConfig.baiduSyncPath || defaultBaiduSyncPath || "/录播"}
                               </div>
                               <button
                                 className="rounded-lg border border-[var(--split-color)] bg-white/70 px-3 py-1 font-semibold text-[var(--content-color)]"
@@ -2048,12 +2086,14 @@ export default function DownloadSection() {
               ) : null}
 
               <div className="flex justify-end">
-                <button
+                <LoadingButton
                   className="h-9 px-5 rounded-lg bg-[var(--primary-color)] text-[var(--primary-text)]"
                   onClick={handleSubmitDownload}
+                  loading={submitSubmitting}
+                  loadingLabel="处理中"
                 >
                   创建任务
-                </button>
+                </LoadingButton>
               </div>
             </>
           )}
@@ -2151,8 +2191,11 @@ export default function DownloadSection() {
                     const progressDone = Number(record.progressDone || 0);
                     const progressValue =
                       progressTotal > 0
-                        ? Math.min(100, Math.floor((progressDone / progressTotal) * 100))
+                        ? Math.min(100, (progressDone / progressTotal) * 100)
                         : Math.min(100, record.progress || 0);
+                    const progressLabel = Number(progressValue.toFixed(1));
+                    const sourceLabel =
+                      (record.sourceType || "").toUpperCase() === "BAIDU" ? "网盘" : "B站";
                     return (
                       <div
                         key={record.id}
@@ -2170,6 +2213,7 @@ export default function DownloadSection() {
                           <span>分辨率：{record.resolution || "-"}</span>
                           <span>编码：{record.codec || "-"}</span>
                           <span>格式：{record.format || "-"}</span>
+                          <span>来源：{sourceLabel}</span>
                         </div>
                         <div className="flex items-center gap-3">
                           <div className="flex-1">
@@ -2184,7 +2228,7 @@ export default function DownloadSection() {
                             </div>
                           </div>
                           <span className="w-12 text-xs text-[var(--desc-color)]">
-                            {progressValue}%
+                            {progressLabel.toFixed(1)}%
                           </span>
                           {record.status === 4 ? (
                             <button
@@ -2240,7 +2284,7 @@ export default function DownloadSection() {
       )}
       <BaiduSyncPathPicker
         open={syncPickerOpen}
-        value={submissionConfig.baiduSyncPath}
+        value={submissionConfig.baiduSyncPath || defaultBaiduSyncPath || "/录播"}
         onConfirm={handleConfirmSyncPicker}
         onClose={handleCloseSyncPicker}
         onChange={handleSyncPathChange}

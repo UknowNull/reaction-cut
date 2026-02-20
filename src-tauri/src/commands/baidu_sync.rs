@@ -69,6 +69,7 @@ pub struct BaiduRemoteListRequest {
 #[serde(rename_all = "camelCase")]
 pub struct BaiduSyncUpdateRequest {
   pub concurrency: Option<i64>,
+  pub target_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -314,13 +315,25 @@ pub fn baidu_sync_update_settings(
   state: State<'_, AppState>,
   request: Option<BaiduSyncUpdateRequest>,
 ) -> ApiResponse<String> {
-  let request = request.unwrap_or(BaiduSyncUpdateRequest { concurrency: None });
+  let request = request.unwrap_or(BaiduSyncUpdateRequest {
+    concurrency: None,
+    target_path: None,
+  });
   let mut settings = match baidu_sync::load_baidu_sync_settings(&state.db) {
     Ok(value) => value,
     Err(err) => return ApiResponse::error(err),
   };
   if let Some(concurrency) = request.concurrency {
     settings.concurrency = concurrency.max(1);
+  }
+  if let Some(target_path) = request.target_path {
+    let trimmed = target_path.trim();
+    let normalized = if trimmed.is_empty() {
+      "/录播"
+    } else {
+      trimmed
+    };
+    settings.target_path = baidu_sync::normalize_baidu_path(normalized);
   }
   match baidu_sync::update_baidu_sync_settings(&state.db, &settings) {
     Ok(()) => ApiResponse::success("ok".to_string()),

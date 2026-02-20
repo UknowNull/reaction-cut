@@ -1,12 +1,14 @@
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::time::{sleep, Duration};
 
+use crate::commands::settings::DEFAULT_BAIDU_MAX_PARALLEL;
 use crate::config::resolve_baidu_pcs_path;
 use crate::db::Db;
 use crate::utils::{append_log, now_rfc3339, sanitize_filename};
@@ -91,6 +93,8 @@ impl BaiduSyncRuntime {
 #[derive(Clone)]
 struct BaiduSyncTask {
   id: i64,
+  source_type: String,
+  source_id: Option<String>,
   local_path: String,
   remote_dir: String,
   remote_name: String,
@@ -243,6 +247,129 @@ pub fn list_baidu_remote_dirs(
   Ok(parse_baidu_ls_dirs(&content, &target_path))
 }
 
+pub fn check_baidu_remote_file_exists(db: &Db, remote_path: &str) -> Result<bool, String> {
+  let settings = load_baidu_sync_settings(db)?;
+  let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+  let target_path = normalize_baidu_path(remote_path);
+  match run_baidu_pcs_command(&exec_path, &["meta".to_string(), target_path]) {
+    Ok(_) => Ok(true),
+    Err(err) => {
+      if is_baidu_not_found_error(&err) {
+        Ok(false)
+      } else {
+        Err(err)
+      }
+    }
+  }
+}
+
+pub fn fetch_baidu_remote_file_size(db: &Db, remote_path: &str) -> Result<u64, String> {
+  let settings = load_baidu_sync_settings(db)?;
+  let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+  let target_path = normalize_baidu_path(remote_path);
+  let output = run_baidu_pcs_command(&exec_path, &["meta".to_string(), target_path])?;
+  Ok(parse_meta_size(&output.stdout).unwrap_or(0))
+}
+
+fn load_baidu_download_max_parallel(db: &Db) -> i64 {
+  db.with_conn(|conn| {
+    let value: Option<String> = conn
+      .query_row(
+        "SELECT value FROM app_settings WHERE key = 'download_baidu_max_parallel'",
+        [],
+        |row| row.get(0),
+      )
+      .ok();
+    Ok(
+      value
+        .and_then(|item| item.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_BAIDU_MAX_PARALLEL)
+        .clamp(1, 100),
+    )
+  })
+  .unwrap_or(DEFAULT_BAIDU_MAX_PARALLEL)
+}
+
+fn apply_baidu_download_max_parallel(db: &Db, exec_path: &Path) -> Result<(), String> {
+  let max_parallel = load_baidu_download_max_parallel(db);
+  run_baidu_pcs_command(
+    exec_path,
+    &[
+      "config".to_string(),
+      "set".to_string(),
+      "-max_parallel".to_string(),
+      max_parallel.to_string(),
+    ],
+  )?;
+  Ok(())
+}
+
+pub fn download_baidu_file(
+  db: &Db,
+  remote_path: &str,
+  local_path: &Path,
+) -> Result<PathBuf, String> {
+  download_baidu_file_with_hook(db, remote_path, local_path, |_| {})
+}
+
+pub fn download_baidu_file_with_hook<F>(
+  db: &Db,
+  remote_path: &str,
+  local_path: &Path,
+  on_spawn: F,
+) -> Result<PathBuf, String>
+where
+  F: FnOnce(Arc<Mutex<Child>>),
+{
+  let settings = load_baidu_sync_settings(db)?;
+  let exec_path = resolve_baidu_exec_path(&settings.exec_path);
+  let target_path = normalize_baidu_path(remote_path);
+  let local_dir = match local_path.parent() {
+    Some(value) => value,
+    None => return Err("下载目标目录无效".to_string()),
+  };
+  if let Err(err) = fs::create_dir_all(local_dir) {
+    return Err(format!("创建下载目录失败: {}", err));
+  }
+  apply_baidu_download_max_parallel(db, &exec_path)?;
+  let remote_name = target_path
+    .rsplit('/')
+    .find(|value| !value.is_empty())
+    .unwrap_or("")
+    .to_string();
+  if remote_name.is_empty() {
+    return Err("网盘文件名为空".to_string());
+  }
+  let _ = run_baidu_pcs_download_with_hook(&exec_path, &target_path, local_dir, on_spawn)?;
+  if local_path.exists() {
+    return Ok(local_path.to_path_buf());
+  }
+  let direct_path = local_dir.join(&remote_name);
+  if direct_path.exists() {
+    if direct_path == local_path {
+      return Ok(direct_path);
+    }
+    if local_path.exists() {
+      return Ok(local_path.to_path_buf());
+    }
+    fs::rename(&direct_path, local_path)
+      .map_err(|err| format!("重命名下载文件失败: {}", err))?;
+    return Ok(local_path.to_path_buf());
+  }
+  if let Some(found) = find_file_by_name(local_dir, &remote_name) {
+    if found == local_path {
+      return Ok(found);
+    }
+    if local_path.exists() {
+      return Ok(local_path.to_path_buf());
+    }
+    fs::rename(&found, local_path)
+      .map_err(|err| format!("重命名下载文件失败: {}", err))?;
+    return Ok(local_path.to_path_buf());
+  }
+  Err("网盘文件下载完成但未找到本地文件".to_string())
+}
+
 pub fn create_baidu_remote_dir(
   db: &Db,
   parent_path: &str,
@@ -390,6 +517,25 @@ pub fn enqueue_submission_sync(
     .filter(|name| !name.is_empty())
     .map(sanitize_filename)
     .unwrap_or_else(|| sanitize_filename(&local_name));
+  if let Err(err) =
+    bind_submission_merged_remote(db, task_id, &local_path, &remote_dir, &remote_name)
+  {
+    append_log(
+      app_log_path,
+      &format!(
+        "baidu_sync_bind_merged_pending_fail task_id={} local={} remote_dir={} remote_name={} err={}",
+        task_id, local_path, remote_dir, remote_name, err
+      ),
+    );
+  } else {
+    append_log(
+      app_log_path,
+      &format!(
+        "baidu_sync_bind_merged_pending_ok task_id={} remote_dir={} remote_name={}",
+        task_id, remote_dir, remote_name
+      ),
+    );
+  }
   append_log(
     app_log_path,
     &format!(
@@ -1039,6 +1185,25 @@ async fn run_baidu_sync_task(
         }
       }
       update_baidu_sync_status(context.db.as_ref(), task.id, "SUCCESS", 100.0, None)?;
+      if task.source_type == "submission_merged" {
+        if let Some(task_id) = task.source_id.as_deref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
+          if let Err(err) = bind_submission_merged_remote(
+            context.db.as_ref(),
+            task_id,
+            &task.local_path,
+            &task.remote_dir,
+            &task.remote_name,
+          ) {
+            append_log(
+              context.app_log_path.as_ref(),
+              &format!(
+                "baidu_sync_bind_merged_fail task_id={} err={}",
+                task_id, err
+              ),
+            );
+          }
+        }
+      }
       append_log(
         context.app_log_path.as_ref(),
         &format!("baidu_sync_task_ok id={} output={}", task.id, output.stdout.len()),
@@ -1140,11 +1305,35 @@ fn insert_baidu_sync_task(
   .map_err(|err| err.to_string())
 }
 
+fn bind_submission_merged_remote(
+  db: &Db,
+  task_id: &str,
+  local_path: &str,
+  remote_dir: &str,
+  remote_name: &str,
+) -> Result<(), String> {
+  let now = now_rfc3339();
+  let updated = db
+    .with_conn(|conn| {
+      conn.execute(
+        "UPDATE merged_video SET remote_dir = ?1, remote_name = ?2, update_time = ?3 \
+         WHERE task_id = ?4 AND video_path = ?5",
+        (remote_dir, remote_name, &now, task_id, local_path),
+      )
+    })
+    .map_err(|err| err.to_string())?;
+  if updated == 0 {
+    return Err("未找到合并视频记录".to_string());
+  }
+  Ok(())
+}
+
 fn load_next_pending_task(db: &Db) -> Result<Option<BaiduSyncTask>, String> {
   let now = now_rfc3339();
   db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT id, local_path, remote_dir, remote_name, retry_count, policy FROM baidu_sync_task WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1",
+      "SELECT id, source_type, source_id, local_path, remote_dir, remote_name, retry_count, policy \
+       FROM baidu_sync_task WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1",
     )?;
     let mut rows = stmt.query([])?;
     if let Some(row) = rows.next()? {
@@ -1155,11 +1344,13 @@ fn load_next_pending_task(db: &Db) -> Result<Option<BaiduSyncTask>, String> {
       )?;
       let task = BaiduSyncTask {
         id: task_id,
-        local_path: row.get(1)?,
-        remote_dir: row.get(2)?,
-        remote_name: row.get(3)?,
-        retry_count: row.get(4)?,
-        policy: row.get(5)?,
+        source_type: row.get(1)?,
+        source_id: row.get(2)?,
+        local_path: row.get(3)?,
+        remote_dir: row.get(4)?,
+        remote_name: row.get(5)?,
+        retry_count: row.get(6)?,
+        policy: row.get(7)?,
       };
       Ok(Some(task))
     } else {
@@ -1208,7 +1399,7 @@ fn upsert_setting(
   Ok(())
 }
 
-fn normalize_baidu_path(path: &str) -> String {
+pub fn normalize_baidu_path(path: &str) -> String {
   let trimmed = path.trim();
   if trimmed.is_empty() {
     return "/".to_string();
@@ -1225,7 +1416,7 @@ fn normalize_baidu_path(path: &str) -> String {
   }
 }
 
-fn join_baidu_path(base: &str, segment: &str) -> String {
+pub fn join_baidu_path(base: &str, segment: &str) -> String {
   let base = normalize_baidu_path(base);
   let segment = segment.trim().trim_matches('/');
   if segment.is_empty() {
@@ -1391,6 +1582,85 @@ fn run_baidu_pcs_command(exec_path: &Path, args: &[String]) -> Result<CommandOut
   Err(format!("BaiduPCS-Go 执行失败: {}", stderr.trim()))
 }
 
+fn run_baidu_pcs_download_with_hook<F>(
+  exec_path: &Path,
+  remote_path: &str,
+  local_dir: &Path,
+  on_spawn: F,
+) -> Result<CommandOutput, String>
+where
+  F: FnOnce(Arc<Mutex<Child>>),
+{
+  let save_dir = local_dir.to_string_lossy().to_string();
+  let mut child = Command::new(exec_path)
+    .current_dir(local_dir)
+    .args([
+      "download".to_string(),
+      "--saveto".to_string(),
+      save_dir,
+      remote_path.to_string(),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|err| format!("BaiduPCS-Go 执行失败: {}", err))?;
+
+  let stdout = child.stdout.take();
+  let stderr = child.stderr.take();
+  let child_handle = Arc::new(Mutex::new(child));
+  on_spawn(Arc::clone(&child_handle));
+
+  let stdout_handle = stdout.map(|mut reader| {
+    std::thread::spawn(move || {
+      let mut buffer = String::new();
+      let _ = reader.read_to_string(&mut buffer);
+      buffer
+    })
+  });
+  let stderr_handle = stderr.map(|mut reader| {
+    std::thread::spawn(move || {
+      let mut buffer = String::new();
+      let _ = reader.read_to_string(&mut buffer);
+      buffer
+    })
+  });
+
+  let status = loop {
+    let result = {
+      let mut guard = child_handle
+        .lock()
+        .map_err(|_| "BaiduPCS-Go 进程锁失败".to_string())?;
+      guard
+        .try_wait()
+        .map_err(|err| format!("BaiduPCS-Go 执行失败: {}", err))?
+    };
+    if let Some(status) = result {
+      break status;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+  };
+
+  let stdout = stdout_handle
+    .and_then(|handle| handle.join().ok())
+    .unwrap_or_default();
+  let stderr = stderr_handle
+    .and_then(|handle| handle.join().ok())
+    .unwrap_or_default();
+
+  if status.success() {
+    return Ok(CommandOutput { stdout, stderr });
+  }
+  Err(format!("BaiduPCS-Go 执行失败: {}", stderr.trim()))
+}
+
+fn run_baidu_pcs_download(
+  exec_path: &Path,
+  remote_path: &str,
+  local_dir: &Path,
+) -> Result<CommandOutput, String> {
+  run_baidu_pcs_download_with_hook(exec_path, remote_path, local_dir, |_| {})
+}
+
 fn run_baidu_pcs_upload<F>(
   exec_path: &Path,
   args: &[String],
@@ -1476,6 +1746,34 @@ where
     });
   }
   Err(format!("BaiduPCS-Go 执行失败: {}", stderr_output.trim()))
+}
+
+fn is_baidu_not_found_error(err: &str) -> bool {
+  let lower = err.to_lowercase();
+  lower.contains("not found")
+    || lower.contains("no such file")
+    || err.contains("未找到")
+    || err.contains("不存在")
+}
+
+fn find_file_by_name(base_dir: &Path, file_name: &str) -> Option<PathBuf> {
+  let entries = fs::read_dir(base_dir).ok()?;
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path.is_dir() {
+      if let Some(found) = find_file_by_name(&path, file_name) {
+        return Some(found);
+      }
+    } else if path
+      .file_name()
+      .and_then(|value| value.to_str())
+      .map(|value| value == file_name)
+      .unwrap_or(false)
+    {
+      return Some(path);
+    }
+  }
+  None
 }
 
 fn parse_progress_line(line: &str) -> Option<f64> {

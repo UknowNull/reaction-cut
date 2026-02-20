@@ -33,6 +33,7 @@ CREATE INDEX IF NOT EXISTS idx_login_info_expire_time ON login_info (expire_time
 CREATE TABLE IF NOT EXISTS submission_task (
   task_id TEXT PRIMARY KEY,
   status TEXT NOT NULL,
+  priority INTEGER DEFAULT 0,
   title TEXT NOT NULL,
   description TEXT,
   cover_url TEXT,
@@ -60,6 +61,8 @@ CREATE TABLE IF NOT EXISTS merged_video (
   task_id TEXT NOT NULL,
   file_name TEXT,
   video_path TEXT,
+  remote_dir TEXT,
+  remote_name TEXT,
   duration INTEGER,
   status INTEGER DEFAULT 0,
   upload_progress REAL DEFAULT 0.0,
@@ -117,6 +120,26 @@ CREATE TABLE IF NOT EXISTS task_source_video (
 
 CREATE INDEX IF NOT EXISTS idx_task_source_video_task_id ON task_source_video (task_id);
 
+CREATE TABLE IF NOT EXISTS merged_source_video (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  merged_id INTEGER NOT NULL,
+  source_id TEXT,
+  source_file_path TEXT NOT NULL,
+  sort_order INTEGER NOT NULL,
+  start_time TEXT,
+  end_time TEXT,
+  create_time TEXT NOT NULL,
+  update_time TEXT NOT NULL,
+  FOREIGN KEY (task_id) REFERENCES submission_task (task_id) ON DELETE CASCADE,
+  FOREIGN KEY (merged_id) REFERENCES merged_video (id) ON DELETE CASCADE,
+  FOREIGN KEY (source_id) REFERENCES task_source_video (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_merged_source_video_task_id ON merged_source_video (task_id);
+CREATE INDEX IF NOT EXISTS idx_merged_source_video_merged_id ON merged_source_video (merged_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_merged_source_video_unique ON merged_source_video (merged_id, source_file_path, sort_order);
+
 CREATE TABLE IF NOT EXISTS video_clip (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id TEXT NOT NULL,
@@ -152,7 +175,8 @@ CREATE TABLE IF NOT EXISTS video_download (
   part_count INTEGER,
   current_part INTEGER,
   cid INTEGER,
-  content TEXT
+  content TEXT,
+  source_type TEXT DEFAULT 'BILIBILI'
 );
 
 CREATE INDEX IF NOT EXISTS idx_video_download_status ON video_download (status);
@@ -402,6 +426,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
 INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES
   ('download_threads', '3', datetime('now')),
   ('download_queue_size', '10', datetime('now')),
+  ('download_baidu_max_parallel', '3', datetime('now')),
   ('submission_upload_concurrency', '3', datetime('now')),
   ('baidu_sync_enabled', '1', datetime('now')),
   ('baidu_sync_exec_path', '', datetime('now')),
